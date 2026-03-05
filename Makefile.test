@@ -1,0 +1,107 @@
+# immurok CH592F - UART1 + UART3 双串口测试 Makefile
+
+# Project name
+TARGET = test_uart_dual
+
+# Toolchain
+TOOLCHAIN_PATH ?= /opt/riscv-wch-gcc
+TOOLCHAIN_BIN = $(TOOLCHAIN_PATH)/bin
+CC = "$(TOOLCHAIN_BIN)/riscv-wch-elf-gcc"
+OBJCOPY = "$(TOOLCHAIN_BIN)/riscv-wch-elf-objcopy"
+SIZE = "$(TOOLCHAIN_BIN)/riscv-wch-elf-size"
+
+# SDK paths
+SDK_PATH = SDK/EVT/EXAM
+SRC_PATH = $(SDK_PATH)/SRC
+BLE_PATH = $(SDK_PATH)/BLE
+
+# Directories
+BUILD_DIR = build_test
+
+# Source files (minimal set for testing)
+C_SOURCES = \
+	APP/test_uart_dual.c \
+	$(SRC_PATH)/StdPeriphDriver/CH59x_gpio.c \
+	$(SRC_PATH)/StdPeriphDriver/CH59x_sys.c \
+	$(SRC_PATH)/StdPeriphDriver/CH59x_clk.c \
+	$(SRC_PATH)/StdPeriphDriver/CH59x_uart1.c \
+	$(SRC_PATH)/StdPeriphDriver/CH59x_uart3.c \
+	$(SRC_PATH)/RVMSIS/core_riscv.c
+
+ASM_SOURCES = \
+	$(SRC_PATH)/Startup/startup_CH592.S
+
+# Include paths
+C_INCLUDES = \
+	-I$(SRC_PATH)/StdPeriphDriver/inc \
+	-I$(SRC_PATH)/RVMSIS
+
+# Defines
+C_DEFS = \
+	-DDEBUG=1 \
+	-DCH592
+
+# Compiler flags
+MCU_FLAGS = -march=rv32imac_zicsr -mabi=ilp32 -msmall-data-limit=8
+
+CFLAGS = $(MCU_FLAGS) $(C_DEFS) $(C_INCLUDES)
+CFLAGS += -std=gnu99 -Os -ffunction-sections -fdata-sections -fno-common
+CFLAGS += -Wall
+CFLAGS += -g
+
+ASFLAGS = $(MCU_FLAGS) $(C_DEFS) $(C_INCLUDES)
+ASFLAGS += -x assembler-with-cpp
+
+# Linker flags
+LDSCRIPT = $(SRC_PATH)/Ld/Link.ld
+LIBS = -L$(SRC_PATH)/StdPeriphDriver -lISP592 -lm
+LDFLAGS = $(MCU_FLAGS)
+LDFLAGS += -T$(LDSCRIPT)
+LDFLAGS += -nostartfiles -Xlinker --gc-sections
+LDFLAGS += -Wl,-Map=$(BUILD_DIR)/$(TARGET).map,--cref
+LDFLAGS += --specs=nano.specs --specs=nosys.specs
+LDFLAGS += $(LIBS)
+
+# Object files
+OBJECTS = $(addprefix $(BUILD_DIR)/,$(notdir $(C_SOURCES:.c=.o)))
+vpath %.c $(sort $(dir $(C_SOURCES)))
+
+OBJECTS += $(addprefix $(BUILD_DIR)/,$(notdir $(ASM_SOURCES:.S=.o)))
+vpath %.S $(sort $(dir $(ASM_SOURCES)))
+
+# Build targets
+all: $(BUILD_DIR)/$(TARGET).elf $(BUILD_DIR)/$(TARGET).hex $(BUILD_DIR)/$(TARGET).bin size
+
+$(BUILD_DIR)/%.o: %.c Makefile.test | $(BUILD_DIR)
+	@echo "CC $<"
+	@$(CC) -c $(CFLAGS) $< -o $@
+
+$(BUILD_DIR)/%.o: %.S Makefile.test | $(BUILD_DIR)
+	@echo "AS $<"
+	@$(CC) -c $(ASFLAGS) $< -o $@
+
+$(BUILD_DIR)/$(TARGET).elf: $(OBJECTS) Makefile.test
+	@echo "LD $@"
+	@$(CC) $(OBJECTS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/$(TARGET).hex: $(BUILD_DIR)/$(TARGET).elf
+	@echo "HEX $@"
+	@$(OBJCOPY) -O ihex $< $@
+
+$(BUILD_DIR)/$(TARGET).bin: $(BUILD_DIR)/$(TARGET).elf
+	@echo "BIN $@"
+	@$(OBJCOPY) -O binary -S $< $@
+
+$(BUILD_DIR):
+	@mkdir -p $@
+
+size: $(BUILD_DIR)/$(TARGET).elf
+	@echo ""
+	@echo "=== Memory Usage ==="
+	@$(SIZE) $<
+
+clean:
+	@rm -rf $(BUILD_DIR)
+	@echo "Clean done"
+
+.PHONY: all clean size
