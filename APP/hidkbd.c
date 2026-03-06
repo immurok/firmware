@@ -610,10 +610,12 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 }
                 else
                 {
-                    // Send CTRL key immediately to wake host screen.
-                    // Screen wake overlaps with FP module power-up + fingerprint matching.
-                    hidEmuSendCtrlKey();
-                    PRINT("CTRL sent (early wake)\n");
+                    // Send CTRL key to wake host screen, but only when no
+                    // gated command is pending (KEY_SIGN, OTP, etc. don't need it)
+                    if(s_pending_cmd == 0 && !immurok_security_has_pending_auth()) {
+                        hidEmuSendCtrlKey();
+                        PRINT("CTRL sent (early wake)\n");
+                    }
 
                     if(!fp_is_powered())
                     {
@@ -997,11 +999,12 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 // Priority 2: Pending auth request
                 else if(immurok_security_has_pending_auth())
                 {
-                    s_fp_gate_last_verify = TMOS_GetSystemClock();
+                    // Do NOT set cooldown here — auth requests (sudo/PAM) should
+                    // not grant cooldown for gated commands (KEY_SIGN, etc.)
                     uint8_t rspBuf[1];
                     rspBuf[0] = SEC_OK;
                     ImmurokService_SendResponse(rspBuf, 1);
-                    PRINT("Auth OK response sent (cooldown set)\n");
+                    PRINT("Auth OK response sent\n");
                     immurok_security_auth_cancel();
                 }
                 // Priority 3: Proactive match - send signed 0x21 notification
