@@ -875,11 +875,11 @@ static void EccPoint_mult(uECC_word_t * result,
                           const uECC_word_t * initial_Z,
                           bitcount_t num_bits,
                           uECC_Curve curve) {
-    /* R0 and R1 */
-    uECC_word_t Rx[2][uECC_MAX_WORDS];
-    uECC_word_t Ry[2][uECC_MAX_WORDS];
-    uECC_word_t z[uECC_MAX_WORDS];
-    uECC_word_t sub[uECC_MAX_WORDS];
+    /* R0 and R1 — static to reduce stack depth at TMOS_SystemProcess() call point */
+    static uECC_word_t Rx[2][uECC_MAX_WORDS];
+    static uECC_word_t Ry[2][uECC_MAX_WORDS];
+    static uECC_word_t z[uECC_MAX_WORDS];
+    static uECC_word_t sub[uECC_MAX_WORDS];
     bitcount_t i;
     uECC_word_t nb;
     wordcount_t num_words = curve->num_words;

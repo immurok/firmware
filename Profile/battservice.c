@@ -3,7 +3,7 @@
  * Author             : WCH
  * Version            : V1.0
  * Date               : 2018/12/10
- * Description        : µç³Ø·þÎñ
+ * Description        : ï¿½ï¿½Ø·ï¿½ï¿½ï¿½
  *********************************************************************************
  * Copyright (c) 2021 Nanjing Qinheng Microelectronics Co., Ltd.
  * Attention: This software (modified or not) and binary are used for 
@@ -16,6 +16,7 @@
 #include "CONFIG.h"
 #include "hiddev.h"
 #include "battservice.h"
+#include "CH59x_adc.h"
 
 /*********************************************************************
  * MACROS
@@ -232,6 +233,17 @@ bStatus_t Batt_SetParameter(uint8_t param, uint8_t len, void *value)
             }
             break;
 
+        case BATT_PARAM_LEVEL:
+            {
+                uint8_t newLevel = *((uint8_t *)value);
+                if(newLevel != battLevel)
+                {
+                    battLevel = newLevel;
+                    battNotifyLevel();
+                }
+            }
+            break;
+
         default:
             ret = INVALIDPARAMETER;
             break;
@@ -308,13 +320,10 @@ bStatus_t Batt_MeasLevel(void)
 
     level = battMeasure();
 
-    // If level has gone down
-    if(level < battLevel)
+    // Update and notify on any change (supports both discharge and charge)
+    if(level != battLevel)
     {
-        // Update level
         battLevel = level;
-
-        // Send a notification
         battNotifyLevel();
     }
 
@@ -495,47 +504,47 @@ static void battNotifyCB(linkDBItem_t *pLinkItem)
  */
 static uint8_t battMeasure(void)
 {
-    uint16_t adc;
-    uint8_t  percent;
+    uint8_t percent;
 
-    // Call measurement setup callback
     if(battServiceSetupCB != NULL)
     {
+        // ADC-based measurement: setup configures the ADC channel
         battServiceSetupCB();
-    }
 
-    // Configure ADC and perform a read
-    adc = 300;
-    // Call measurement teardown callback
-    if(battServiceTeardownCB != NULL)
-    {
-        battServiceTeardownCB();
-    }
+        // Average 4 ADC samples for stability
+        uint32_t sum = 0;
+        for(int i = 0; i < 4; i++)
+        {
+            sum += ADC_ExcutSingleConver();
+        }
+        uint16_t adc = (uint16_t)(sum >> 2);
 
-    if(adc >= battMaxLevel)
-    {
-        percent = 100;
-    }
-    else if(adc <= battMinLevel)
-    {
-        percent = 0;
-    }
-    else
-    {
+        if(battServiceTeardownCB != NULL)
+        {
+            battServiceTeardownCB();
+        }
+
         if(battServiceCalcCB != NULL)
         {
             percent = battServiceCalcCB(adc);
         }
         else
         {
-            uint16_t range = battMaxLevel - battMinLevel + 1;
-
-            // optional if you want to keep it even, otherwise just take floor of divide
-            // range += (range & 1);
-            range >>= 2; // divide by 4
-
-            percent = (uint8_t)((((adc - battMinLevel) * 25) + (range - 1)) / range);
+            // Default linear mapping
+            if(adc >= battMaxLevel) percent = 100;
+            else if(adc <= battMinLevel) percent = 0;
+            else
+            {
+                uint16_t range = battMaxLevel - battMinLevel + 1;
+                range >>= 2;
+                percent = (uint8_t)((((adc - battMinLevel) * 25) + (range - 1)) / range);
+            }
         }
+    }
+    else
+    {
+        // No ADC configured â€” return current level unchanged
+        percent = battLevel;
     }
 
     return percent;

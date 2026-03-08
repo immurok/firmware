@@ -6,6 +6,8 @@
 
 #include "CH59x_common.h"
 #include "fingerprint.h"
+#include "hardware_pins.h"
+#include "ws2812.h"
 #include <string.h>
 
 // Use SDK PRINT macro (requires DEBUG defined)
@@ -13,12 +15,10 @@
 #define PRINT(...)
 #endif
 
-// GPIO pin definitions (direct values to avoid include order issues)
-// UART1: PA9 (TXD1), PA8 (RXD1)
-#define FP_PIN_TX       (0x00000200)    // PA9 - UART1 TX, GPIO_Pin_9
-#define FP_PIN_RX       (0x00000100)    // PA8 - UART1 RX, GPIO_Pin_8
-#define FP_PIN_PWR      (0x00001000)    // PA12 - Power control, GPIO_Pin_12
-#define FP_PIN_INT      (0x00002000)    // PA13 - Touch INT, GPIO_Pin_13
+// Pin definitions from hardware_pins.h:
+//   PIN_FP_TX, PIN_FP_RX  — UART1 (always GPIOA)
+//   PIN_FP_PWR             — Power control (port varies by HW version)
+//   FP_PWR_SetHigh/SetLow/SetMode macros handle port abstraction
 
 // ============================================================================
 // Protocol Constants
@@ -117,9 +117,9 @@ static void uart_init(void)
     R16_PIN_ALTERNATE &= ~RB_PIN_UART1;
 
     // Configure GPIO pins
-    GPIOA_SetBits(FP_PIN_TX);
-    GPIOA_ModeCfg(FP_PIN_TX, GPIO_ModeOut_PP_5mA);  // PA9 TX
-    GPIOA_ModeCfg(FP_PIN_RX, GPIO_ModeIN_PU);       // PA8 RX
+    GPIOA_SetBits(PIN_FP_TX);
+    GPIOA_ModeCfg(PIN_FP_TX, GPIO_ModeOut_PP_5mA);  // TX
+    GPIOA_ModeCfg(PIN_FP_RX, GPIO_ModeIN_PU);       // RX
 
     UART1_DefInit();
     UART1_BaudRateCfg(FP_UART_BAUD);
@@ -182,7 +182,7 @@ static uint16_t calc_checksum(const uint8_t *data, uint16_t len)
 
 int fp_send_cmd(uint8_t cmd, const uint8_t *params, uint16_t param_len)
 {
-    uint8_t packet[64];
+    static uint8_t packet[64];  // static: save 64B stack (only 512B total)
     uint16_t len = 0;
 
     // Header
@@ -364,8 +364,8 @@ void fp_power_on(void)
     sys_safe_access_disable();
     // Re-initialize UART1 pins (were set to pull-down in fp_power_off)
     uart_init();
-    GPIOA_ModeCfg(FP_PIN_PWR, GPIO_ModeOut_PP_5mA);
-    GPIOA_SetBits(FP_PIN_PWR);
+    FP_PWR_SetMode(GPIO_ModeOut_PP_5mA);
+    FP_PWR_SetHigh();
     s_powered_on = true;
     s_power_on_tick = RTC_GetCycle32k();
     PRINT("Fingerprint power ON\n");
@@ -375,10 +375,11 @@ void fp_power_off(void)
 {
     if (!s_powered_on) return;
 
-    GPIOA_ResetBits(FP_PIN_PWR);
+    FP_PWR_SetLow();
     // All FP pins to pull-down: prevent current leaking through
     // powered-off module's ESD protection diodes
-    GPIOA_ModeCfg(FP_PIN_PWR | FP_PIN_TX | FP_PIN_RX, GPIO_ModeIN_PD);
+    FP_PWR_SetMode(GPIO_ModeIN_PD);
+    GPIOA_ModeCfg(PIN_FP_TX | PIN_FP_RX, GPIO_ModeIN_PD);
     // Gate UART1 clock to eliminate peripheral static power
     sys_safe_access_enable();
     R8_SLP_CLK_OFF0 |= RB_SLP_CLK_UART1;
@@ -528,6 +529,7 @@ int fp_wake(void)
 
         // Wait for module initialization (100ms - reduced to avoid BLE timeout)
         DelayMs(100);
+        WWDG_SetCounter(0);  // Feed watchdog after blocking delay
 
         // Try to read ready signal (0x55)
         bool got_ready = false;
@@ -545,6 +547,7 @@ int fp_wake(void)
 
         // Flush any remaining data
         uart_flush();
+        WWDG_SetCounter(0);  // Feed watchdog after ready-signal polling
 
         if (got_ready) {
             PRINT("Module ready signal received\n");
@@ -554,6 +557,7 @@ int fp_wake(void)
     // Verify password if not yet verified
     if (!s_password_verified) {
         int ret = fp_verify_password(0x00000000);
+        WWDG_SetCounter(0);  // Feed watchdog after UART command
         if (ret == FP_OK) {
             PRINT("Default password OK (wake)\n");
             s_password_verified = true;
@@ -563,6 +567,7 @@ int fp_wake(void)
                 s_password_cached = true;
             }
             ret = fp_verify_password(s_cached_password);
+            WWDG_SetCounter(0);
             if (ret == FP_OK) {
                 PRINT("Device password OK, resetting to default...\n");
                 fp_set_password(0x00000000);
@@ -962,6 +967,7 @@ int fp_get_fingerprint_bitmap(uint8_t *bitmap)
 
     uint8_t ack;
     int ret = fp_recv_ack(&ack, NULL, NULL, UART_TIMEOUT_MS);
+    WWDG_SetCounter(0);  // Feed watchdog after UART command
     if (ret != FP_OK) {
         return ret;
     }
@@ -1414,6 +1420,19 @@ int fp_sleep(void)
 
 int fp_led_control(fp_led_mode_t mode, fp_led_color_t color, uint8_t speed, uint8_t cycles)
 {
+#if HAS_WS2812
+    // Sync WS2812 with FP LED — color bits: bit0=B, bit1=G, bit2=R
+    #define WS2812_BRIGHTNESS 51  // 20%
+    if (mode == FP_LED_OFF || mode == FP_LED_FADE_OUT) {
+        ws2812_set_rgb(0, 0, 0);
+    } else {
+        uint8_t r = (color & 0x04) ? WS2812_BRIGHTNESS : 0;
+        uint8_t g = (color & 0x02) ? WS2812_BRIGHTNESS : 0;
+        uint8_t b = (color & 0x01) ? WS2812_BRIGHTNESS : 0;
+        ws2812_set_rgb(r, g, b);
+    }
+#endif
+
     if (!s_powered_on) {
         return FP_ERR_FAIL;
     }

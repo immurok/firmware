@@ -43,7 +43,7 @@ extern void uECC_set_watchdog_cb(void (*cb)(void));
 // ============================================================================
 
 // 4KB work buffer for read-modify-write operations (also used by immurok_security.c)
-uint8_t immurok_keystore_work_buf[4096] __attribute__((aligned(4)));
+uint8_t immurok_keystore_work_buf[4096] __attribute__((section(".stack_guard"), aligned(4)));
 
 // Staging buffer for incoming entry data (largest entry = 160B for API)
 static uint8_t s_stage_buf[160] __attribute__((aligned(4)));
@@ -62,10 +62,20 @@ static uint8_t s_result_len = 0;
 static uint8_t s_ecc_privkey[32] __attribute__((aligned(4)));
 static uint8_t s_ecc_entry[112] __attribute__((aligned(4)));  // 16B name + 64B pubkey + 32B privkey
 
-// Watchdog kick callback for uECC long computations
+// Watchdog + TMOS kick during uECC long computations (~2s).
+// TMOS_SystemProcess() is required to keep BLE LL alive during blocking ECC.
+// Stack guard: immurok_keystore_work_buf[4096] sits between .bss and .stack,
+// so any overflow during TMOS processing goes into unused buffer, not BLE state.
+static volatile uint8_t s_in_tmos_kick = 0;
 static void keystore_watchdog_kick(void)
 {
     WWDG_SetCounter(0);
+    if(!s_in_tmos_kick)
+    {
+        s_in_tmos_kick = 1;
+        TMOS_SystemProcess();
+        s_in_tmos_kick = 0;
+    }
 }
 
 // RNG function for uECC
@@ -448,7 +458,7 @@ int immurok_keystore_sign(uint8_t idx, const uint8_t *hash32, uint8_t *sig64)
 
     // uECC with NATIVE_LITTLE_ENDIAN=1 expects hash in LE byte order,
     // but App sends standard BE SHA-256 hash — reverse it
-    uint8_t hash_le[32];
+    static uint8_t hash_le[32];
     for (int i = 0; i < 32; i++)
         hash_le[i] = hash32[31 - i];
 

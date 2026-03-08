@@ -13,11 +13,116 @@
 /******************************************************************************/
 #include "CONFIG.h"
 #include "HAL.h"
+#include <stdarg.h>
 #include "hiddev.h"
 #include "hidkbd.h"
 #include "fingerprint.h"
+#include "hardware_pins.h"
+#include "ws2812.h"
 
-// GPIO interrupt flags (defined in hidkbd.c, set in GPIOA_IRQHandler)
+#ifdef DEBUG
+// Lightweight printf replacement — minimal stack usage (~32 bytes vs ~128 for vsnprintf).
+// Handles: %d %u %x %X %02X %04X %08X %s %c %% %p and width/zero-pad for integers.
+// Stack-critical: called from deep BLE stack callbacks with only 512B total stack.
+
+static void _put(const char *s, int len)
+{
+    extern int _write(int, char *, int);
+    _write(1, (char *)s, len);
+}
+
+static void _putc(char c) { _put(&c, 1); }
+
+static void _puts(const char *s)
+{
+    const char *p = s;
+    while(*p) p++;
+    _put(s, p - s);
+}
+
+static void _putnum(unsigned long v, int base, int width, int zero, int upper)
+{
+    char tmp[12];  // max 10 digits for 32-bit + sign + null
+    int i = 0;
+    if(v == 0) { tmp[i++] = '0'; }
+    else {
+        while(v) {
+            int d = v % base;
+            tmp[i++] = d < 10 ? '0' + d : (upper ? 'A' : 'a') + d - 10;
+            v /= base;
+        }
+    }
+    while(i < width) tmp[i++] = zero ? '0' : ' ';
+    // reverse
+    for(int j = i - 1; j >= 0; j--) _putc(tmp[j]);
+}
+
+int dbg_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = 0;
+
+    while(*fmt)
+    {
+        if(*fmt != '%') { _putc(*fmt++); n++; continue; }
+        fmt++;  // skip '%'
+
+        // Parse flags and width
+        int zero = 0, width = 0;
+        if(*fmt == '0') { zero = 1; fmt++; }
+        while(*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+        // Skip 'l' modifier
+        if(*fmt == 'l') fmt++;
+
+        switch(*fmt)
+        {
+        case 'd': {
+            int v = va_arg(ap, int);
+            if(v < 0) { _putc('-'); n++; v = -v; }
+            _putnum((unsigned long)v, 10, width, zero, 0);
+            break;
+        }
+        case 'u':
+            _putnum(va_arg(ap, unsigned int), 10, width, zero, 0);
+            break;
+        case 'x':
+            _putnum(va_arg(ap, unsigned int), 16, width, zero, 0);
+            break;
+        case 'X':
+            _putnum(va_arg(ap, unsigned int), 16, width, zero, 1);
+            break;
+        case 'p':
+            _puts("0x");
+            _putnum(va_arg(ap, unsigned int), 16, 8, 1, 0);
+            break;
+        case 's': {
+            const char *s = va_arg(ap, const char *);
+            _puts(s ? s : "(null)");
+            break;
+        }
+        case 'c':
+            _putc((char)va_arg(ap, int));
+            break;
+        case '%':
+            _putc('%');
+            break;
+        case '\0':
+            goto done;
+        default:
+            _putc('%'); _putc(*fmt);
+            break;
+        }
+        fmt++;
+        n++;
+    }
+done:
+    va_end(ap);
+    return n;
+}
+#endif
+
+// GPIO interrupt flags (defined in hidkbd.c, set in BTN_TOUCH_IRQHandler)
 extern volatile uint8_t g_touch_irq_flag;
 extern volatile uint8_t g_btn_irq_flag;
 // hidEmu task ID (needed to fire events from main loop)
@@ -85,15 +190,23 @@ int main(void)
     // UART3: PA5 TX, PA4 RX, 115200 baud (debug output)
     GPIOA_SetBits(GPIO_Pin_5);
     GPIOA_ModeCfg(GPIO_Pin_5, GPIO_ModeOut_PP_5mA);  // TX
+    R32_PA_PU &= ~GPIO_Pin_5;  // Clear pull-up on TX (left over from sleep all-pin-pullup)
     GPIOA_ModeCfg(GPIO_Pin_4, GPIO_ModeIN_PU);       // RX
     UART3_DefInit();
 
 #endif
 
-    // Initialize fingerprint module (PA12=PWR, PA13=INT, UART1: PA9 TX, PA8 RX)
+#if HAS_WS2812
+    ws2812_init();
+#endif
+
+    // Initialize fingerprint module
+    extern uint8_t g_cached_fp_bitmap;
     int fp_ret = fp_init();
     if(fp_ret == FP_OK) {
         PRINT("Fingerprint module OK\n");
+        // Cache bitmap before power off (used by GET_STATUS without blocking)
+        fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
         // Power off after init - will be powered on when needed (touch detected)
         fp_power_off();
         PRINT("Fingerprint power management enabled\n");
@@ -101,8 +214,8 @@ int main(void)
         PRINT("Fingerprint init failed: %d\n", fp_ret);
     }
 
-    // PA13 = touch INT input (active high) - for button scan
-    GPIOA_ModeCfg(GPIO_Pin_13, GPIO_ModeIN_PD);
+    // Touch INT input (active high) - for button scan
+    TOUCH_SetMode(GPIO_ModeIN_PD);
     PRINT("%s\n", VER_LIB);
     CH59x_BLEInit();
     HAL_Init();

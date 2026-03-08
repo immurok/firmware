@@ -37,6 +37,7 @@ C_SOURCES = \
 	$(APP_DIR)/fingerprint.c \
 	$(APP_DIR)/immurok_security.c \
 	$(APP_DIR)/immurok_keystore.c \
+	$(APP_DIR)/ws2812.c \
 	LIB/sha1.c \
 	LIB/sha256.c \
 	LIB/aes128.c \
@@ -85,8 +86,16 @@ C_INCLUDES = \
 	-I$(SRC_PATH)/StdPeriphDriver/inc \
 	-I$(SRC_PATH)/RVMSIS
 
+# Hardware version (default: 0)
+# Usage: make VER=0 or make VER=1
+ifdef VER
+HW_VER = $(VER)
+endif
+HW_VER ?= 0
+
 # Common defines
 C_DEFS_COMMON = \
+	-DHARDWARE_VER$(HW_VER) \
 	-DCH592 \
 	-DBLE_MAC=FALSE \
 	-DDCDC_ENABLE=TRUE \
@@ -160,7 +169,7 @@ ifdef OTA_V2
 else ifdef OTA
     LDSCRIPT = Ld/Link_OTA.ld
 else
-    LDSCRIPT = $(SRC_PATH)/Ld/Link.ld
+    LDSCRIPT = Ld/Link.ld
 endif
 LIBS = -L$(BLE_PATH)/LIB -L$(SRC_PATH)/StdPeriphDriver -lCH59xBLE -lISP592 -lm
 LDFLAGS = $(MCU_FLAGS)
@@ -177,9 +186,18 @@ vpath %.c $(sort $(dir $(C_SOURCES)))
 OBJECTS += $(addprefix $(BUILD_DIR)/,$(notdir $(ASM_SOURCES:.S=.o)))
 vpath %.S $(sort $(dir $(ASM_SOURCES)))
 
+# Track build flags — auto-clean when flags change
+BUILD_FLAGS_FILE = $(BUILD_DIR)/.build_flags
+CURRENT_FLAGS = $(BUILD_MODE) HW_VER=$(HW_VER)
+$(shell mkdir -p $(BUILD_DIR))
+$(shell if [ ! -f $(BUILD_FLAGS_FILE) ] || [ "$$(cat $(BUILD_FLAGS_FILE))" != "$(CURRENT_FLAGS)" ]; then \
+	rm -f $(BUILD_DIR)/*.o; \
+	echo "$(CURRENT_FLAGS)" > $(BUILD_FLAGS_FILE); \
+fi)
+
 # Build targets
 all: $(BUILD_DIR)/$(TARGET).elf $(BUILD_DIR)/$(TARGET).hex $(BUILD_DIR)/$(TARGET).bin size
-	@echo "Build mode: $(BUILD_MODE)"
+	@echo "Build mode: $(BUILD_MODE), HW: VER$(HW_VER)"
 
 $(BUILD_DIR)/%.o: %.c Makefile | $(BUILD_DIR)
 	@echo "CC $<"
@@ -215,33 +233,33 @@ clean:
 
 # Release build target
 release:
-	@$(MAKE) RELEASE=1 clean all
+	@$(MAKE) RELEASE=1 HW_VER=$(HW_VER) clean all
 
 # Release-debug build target (sleep + serial output for diagnostics)
 release-debug:
-	@$(MAKE) RELEASE_DEBUG=1 clean all
+	@$(MAKE) RELEASE_DEBUG=1 HW_VER=$(HW_VER) clean all
 
 # OTA V1 build targets (application starts at 0x1000)
 ota:
-	@$(MAKE) OTA=1 clean all
+	@$(MAKE) OTA=1 HW_VER=$(HW_VER) clean all
 	@echo ""
 	@echo "=== OTA V1 Build Complete ==="
 	@echo "Flash layout: 0x1000 - 0x37000 (216KB max)"
 
 ota-release:
-	@$(MAKE) OTA=1 RELEASE=1 clean all
+	@$(MAKE) OTA=1 RELEASE=1 HW_VER=$(HW_VER) clean all
 	@echo ""
 	@echo "=== OTA V1 Release Build Complete ==="
 
 # OTA V2 build targets (application starts at 0x4000, IAP at 0x0000)
 ota-v2:
-	@$(MAKE) OTA_V2=1 clean all
+	@$(MAKE) OTA_V2=1 HW_VER=$(HW_VER) clean all
 	@echo ""
 	@echo "=== OTA V2 Build Complete ==="
 	@echo "Flash layout: 0x4000 - 0x3A000 (216KB max)"
 
 ota-v2-release:
-	@$(MAKE) OTA_V2=1 RELEASE=1 clean all
+	@$(MAKE) OTA_V2=1 RELEASE=1 HW_VER=$(HW_VER) clean all
 	@echo ""
 	@echo "=== OTA V2 Release Build Complete ==="
 

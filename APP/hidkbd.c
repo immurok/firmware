@@ -25,6 +25,10 @@
 #include "immurok_keystore.h"
 #include "otaprofile.h"
 #include "ota.h"
+#include "hardware_pins.h"
+#if HAS_VBAT_ADC
+#include "CH59x_adc.h"
+#endif
 
 /*********************************************************************
  * MACROS
@@ -89,9 +93,7 @@
 // Battery level is critical when it is less than this %
 #define DEFAULT_BATT_CRITICAL_LEVEL          6
 
-// Button pin (directly use hex value)
-#define PIN_BTN1    0x00004000  // PA14 - GPIO_Pin_14
-#define PIN_TOUCH   0x00002000  // PA13 - GPIO_Pin_13, touch INT (active high)
+// Pin definitions from hardware_pins.h: PIN_BTN, PIN_TOUCH
 
 // Button scan interval (in 625us units, 160 = 100ms)
 #define BUTTON_SCAN_INTERVAL    160
@@ -153,6 +155,10 @@ static uint32_t s_pending_cmd_start = 0;    // TMOS tick when gate started
 #define FP_GATE_TIMEOUT_MS  25000           // 25s overall gate timeout (App has 30s)
 static uint32_t s_fp_gate_last_verify = 0;  // TMOS tick of last FP verification
 #define FP_GATE_COOLDOWN_MS 10000           // 10s cooldown after FP verify (batch ops)
+
+// Cached fingerprint bitmap (updated at init/enroll/delete, used by GET_STATUS)
+// Extern: set from main.c after fp_init, avoids blocking in GATT callback
+uint8_t g_cached_fp_bitmap = 0;
 
 // GPIO interrupt flags (set in ISR, consumed in TMOS event loop)
 volatile uint8_t g_touch_irq_flag = 0;
@@ -283,6 +289,9 @@ static uint16_t hidEmuConnHandle = GAP_CONNHANDLE_INIT;
 static uint8_t s_param_update_retries = 0;
 // Whether our desired latency has been accepted (extern'd by hiddev.c)
 uint8_t s_latency_accepted = 0;
+// Long op param wait state (reset on disconnect)
+static uint8_t s_long_op_param_requested = 0;
+static uint32_t s_long_op_wait_start = 0;
 
 /*********************************************************************
  * LOCAL FUNCTIONS
@@ -311,6 +320,51 @@ static hidDevCB_t hidEmuHidCBs = {
  */
 
 /*********************************************************************
+ * BATTERY ADC CALLBACKS (VER1 only)
+ */
+#if HAS_VBAT_ADC
+
+static void battSetupCB(void)
+{
+    GPIOA_ModeCfg(PIN_VBAT, GPIO_ModeIN_Floating);
+    ADC_ExtSingleChSampInit(SampleFreq_3_2, ADC_PGA_0);
+    ADC_ChannelCfg(VBAT_ADC_CH);
+}
+
+static void battTeardownCB(void)
+{
+    ADC_DisablePower();
+}
+
+// Li-ion discharge curve: voltage (mV) → percentage
+static uint8_t battCalcCB(uint16_t adc)
+{
+    // PGA_0 (1x), Vref≈1.05V, full-scale≈2.1V → 4096 counts
+    // With 1/2 divider: battery_mv = adc * 4200 / 4096
+    uint32_t mv = (uint32_t)adc * 4200 / 4096;
+
+    static const uint16_t curve_mv[]  = {4200, 4100, 4000, 3900, 3800, 3700, 3600, 3500, 3300, 3000};
+    static const uint8_t  curve_pct[] = { 100,   90,   80,   60,   40,   30,   20,   10,    5,    0};
+    #define CURVE_LEN 10
+
+    if(mv >= curve_mv[0]) return 100;
+    if(mv <= curve_mv[CURVE_LEN - 1]) return 0;
+
+    for(int i = 0; i < CURVE_LEN - 1; i++)
+    {
+        if(mv >= curve_mv[i + 1])
+        {
+            uint32_t dv = curve_mv[i] - curve_mv[i + 1];
+            uint32_t dp = curve_pct[i] - curve_pct[i + 1];
+            return curve_pct[i + 1] + (uint8_t)((mv - curve_mv[i + 1]) * dp / dv);
+        }
+    }
+    return 0;
+}
+
+#endif // HAS_VBAT_ADC
+
+/*********************************************************************
  * @fn      HidEmu_Init
  *
  * @brief   Initialization function for the HidEmuKbd App Task.
@@ -328,18 +382,18 @@ void HidEmu_Init()
 {
     hidEmuTaskId = TMOS_ProcessEventRegister(HidEmu_ProcessEvent);
 
-    // Initialize button GPIO (PA14 with pull-up, active low)
-    GPIOA_ModeCfg(PIN_BTN1, GPIO_ModeIN_PU);
+    // Initialize button GPIO (pull-up, active low)
+    BTN_SetMode(GPIO_ModeIN_PU);
 
-    // Initialize touch detection GPIO (PA13, active high)
-    GPIOA_ModeCfg(PIN_TOUCH, GPIO_ModeIN_PD);
+    // Initialize touch detection GPIO (active high)
+    TOUCH_SetMode(GPIO_ModeIN_PD);
 
     // Configure GPIO interrupts for fast wake detection
     // Touch: rising edge (finger down), Button: falling edge (press)
-    GPIOA_ITModeCfg(PIN_TOUCH, GPIO_ITMode_RiseEdge);
-    GPIOA_ITModeCfg(PIN_BTN1, GPIO_ITMode_FallEdge);
-    PFIC_EnableIRQ(GPIO_A_IRQn);
-    PRINT("GPIO interrupts enabled (PA13 rise, PA14 fall)\n");
+    TOUCH_SetITMode(GPIO_ITMode_RiseEdge);
+    BTN_SetITMode(GPIO_ITMode_FallEdge);
+    PFIC_EnableIRQ(BTN_TOUCH_IRQn);
+    PRINT("GPIO interrupts enabled\n");
 
     // Initialize security module
     immurok_security_init();
@@ -387,6 +441,17 @@ void HidEmu_Init()
     {
         uint8_t critical = DEFAULT_BATT_CRITICAL_LEVEL;
         Batt_SetParameter(BATT_PARAM_CRITICAL_LEVEL, sizeof(uint8_t), &critical);
+
+#if HAS_VBAT_ADC
+        // Register ADC battery measurement callbacks
+        Batt_Setup(VBAT_ADC_CH, 0, 0, battSetupCB, battTeardownCB, battCalcCB);
+        // Initial battery measurement at boot
+        Batt_MeasLevel();
+#else
+        // No battery ADC — fixed 20%
+        uint8_t fixedLevel = 20;
+        Batt_SetParameter(BATT_PARAM_LEVEL, sizeof(uint8_t), &fixedLevel);
+#endif
     }
 
     // Set serial number from chip MAC address
@@ -536,7 +601,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
     {
         if(s_ota_active) return (events ^ BUTTON_SCAN_EVT);
 
-        uint8_t btn = ((GPIOA_ReadPortPin(PIN_BTN1) & PIN_BTN1) == 0);  // Active low
+        uint8_t btn = (BTN_ReadPin() == 0);  // Active low
 
         static uint8_t lastBtn = 0;
         static uint32_t pressStart = 0;
@@ -592,7 +657,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         if(s_ota_active) return (events ^ TOUCH_SCAN_EVT);
 
         static uint8_t touchDebounce = 0;
-        uint8_t touch = (GPIOA_ReadPortPin(PIN_TOUCH) & PIN_TOUCH) ? 1 : 0;
+        uint8_t touch = TOUCH_ReadPin() ? 1 : 0;
 
         if(touch)
         {
@@ -893,6 +958,8 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                         int del_ret = fp_ensure_ready();
                         if(del_ret == FP_OK) {
                             del_ret = fp_delete(s_pending_payload[0], 1);
+                            if(del_ret == FP_OK)
+                                fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
                         }
                         rspBuf[0] = (del_ret == FP_OK) ? IMMUROK_RSP_OK : SEC_ERR_INTERNAL;
                         ImmurokService_SendResponse(rspBuf, 1);
@@ -904,6 +971,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                         if(fp_ensure_ready() == FP_OK) {
                             fp_clear_all();
                         }
+                        g_cached_fp_bitmap = 0;
                         // Clear password
                         immurok_security_factory_reset();
                         // Clear BLE bonds
@@ -935,25 +1003,19 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                         // Notify App: fingerprint approved, now signing
                         uint8_t fpApproved[1] = { 0x10 };  // FP_APPROVED
                         ImmurokService_SendResponse(fpApproved, 1);
-                        // Defer sign to let BLE transmit the 0x10 notification first.
-                        // The watchdog callback calls TMOS_SystemProcess() during the
-                        // ~1.9s ECDSA computation to keep the BLE link alive.
+                        // Defer sign to TMOS event (watchdog callback calls
+                        // TMOS_SystemProcess during ~2s ECC to keep BLE alive)
+                        s_pending_cmd = IMMUROK_CMD_KEY_SIGN;  // restore (cleared above)
                         tmos_start_task(hidEmuTaskId, FP_GATE_EXEC_EVT, 128);  // 80ms
                         break;
                     }
                     case IMMUROK_CMD_KEY_GENERATE:
                     {
-                        uint8_t *name = &s_pending_payload[1];  // skip cat byte
-                        // Generate directly into result buffer
-                        int new_idx = immurok_keystore_generate(name, immurok_keystore_result_buf());
-                        if(new_idx >= 0) {
-                            immurok_keystore_set_result(immurok_keystore_result_buf(), 64);
-                            uint8_t rsp3[3] = { IMMUROK_RSP_OK, 64, (uint8_t)new_idx };
-                            ImmurokService_SendResponse(rsp3, 3);
-                        } else {
-                            rspBuf[0] = SEC_ERR_INTERNAL;
-                            ImmurokService_SendResponse(rspBuf, 1);
-                        }
+                        // Defer keygen to TMOS event (~2s ECC computation)
+                        uint8_t fpApproved[1] = { 0x10 };
+                        ImmurokService_SendResponse(fpApproved, 1);
+                        s_pending_cmd = IMMUROK_CMD_KEY_GENERATE;  // restore
+                        tmos_start_task(hidEmuTaskId, FP_GATE_EXEC_EVT, 128);
                         break;
                     }
                     case IMMUROK_CMD_KEY_OTP_GET:
@@ -1091,6 +1153,8 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         // Check if we need to send final success response
         if(s_enroll_send_done) {
             s_enroll_send_done = 0;
+            // Update cached bitmap after successful enroll
+            fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
             uint8_t rspBuf[2];
             rspBuf[0] = IMMUROK_RSP_OK;
             rspBuf[1] = (uint8_t)s_enroll_page_id;
@@ -1337,21 +1401,36 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         if(!s_ota_active)
         {
             // All long computations (~2s) need supervision timeout > 2s.
-            // Initial conn params have 720ms timeout — must request update first.
+            // Initial conn params have 720ms timeout — must update first.
+            // Wait for s_latency_accepted before proceeding.
             if(!s_latency_accepted)
             {
-                static uint8_t s_long_op_waited = 0;
-                if(!s_long_op_waited)
+                if(!s_long_op_param_requested)
                 {
-                    s_long_op_waited = 1;
-                    PRINT("Long op deferred: requesting param update first\n");
+                    s_long_op_param_requested = 1;
+                    s_long_op_wait_start = TMOS_GetSystemClock();
+                    PRINT("Long op deferred: waiting for param update\n");
                     tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
-                    tmos_start_task(hidEmuTaskId, FP_GATE_EXEC_EVT, 3200);  // 2s
+                }
+                uint32_t elapsed_ms = (TMOS_GetSystemClock() - s_long_op_wait_start) * 625 / 1000;
+                if(elapsed_ms > 10000)
+                {
+                    PRINT("Long op: param update timeout (%dms), aborting\n", (int)elapsed_ms);
+                    s_long_op_param_requested = 0;
+                    s_long_op_wait_start = 0;
+                    if(s_pending_cmd == IMMUROK_CMD_KEY_SIGN || s_pending_cmd == IMMUROK_CMD_KEY_GENERATE) {
+                        uint8_t rspErr[1] = { SEC_ERR_INTERNAL };
+                        ImmurokService_SendResponse(rspErr, 1);
+                    }
+                    s_pending_cmd = 0;
                     return (events ^ OTA_FLASH_ERASE_EVT);
                 }
-                s_long_op_waited = 0;
-                PRINT("Long op: proceeding (param update may not be accepted yet)\n");
+                tmos_start_task(hidEmuTaskId, FP_GATE_EXEC_EVT, 320);  // poll 200ms
+                return (events ^ OTA_FLASH_ERASE_EVT);
             }
+            s_long_op_param_requested = 0;
+            s_long_op_wait_start = 0;
+            PRINT("Long op: param accepted, proceeding\n");
 
             // Check if this is an ECDH computation
             immurok_ecdh_state_t ecdh_state = immurok_security_get_ecdh_state();
@@ -1387,20 +1466,39 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 return (events ^ OTA_FLASH_ERASE_EVT);
             }
 
-            uint8_t kidx = s_pending_payload[1];
-            uint8_t *hash = &s_pending_payload[2];
-            uint8_t rspBuf[2];
-            if(immurok_keystore_sign(kidx, hash, immurok_keystore_result_buf()) == 0) {
-                immurok_keystore_set_result(immurok_keystore_result_buf(), 64);
-                rspBuf[0] = IMMUROK_RSP_OK;
-                rspBuf[1] = 64;
-                PRINT("ECDSA sign done\n");
-                ImmurokService_SendResponse(rspBuf, 2);
-            } else {
-                rspBuf[0] = SEC_ERR_INTERNAL;
-                PRINT("ECDSA sign failed\n");
-                ImmurokService_SendResponse(rspBuf, 1);
+            if(s_pending_cmd == IMMUROK_CMD_KEY_SIGN)
+            {
+                uint8_t kidx = s_pending_payload[1];
+                uint8_t *hash = &s_pending_payload[2];
+                uint8_t rspBuf[2];
+                if(immurok_keystore_sign(kidx, hash, immurok_keystore_result_buf()) == 0) {
+                    immurok_keystore_set_result(immurok_keystore_result_buf(), 64);
+                    rspBuf[0] = IMMUROK_RSP_OK;
+                    rspBuf[1] = 64;
+                    PRINT("ECDSA sign done\n");
+                    ImmurokService_SendResponse(rspBuf, 2);
+                } else {
+                    rspBuf[0] = SEC_ERR_INTERNAL;
+                    PRINT("ECDSA sign failed\n");
+                    ImmurokService_SendResponse(rspBuf, 1);
+                }
             }
+            else if(s_pending_cmd == IMMUROK_CMD_KEY_GENERATE)
+            {
+                uint8_t *name = &s_pending_payload[1];  // skip cat byte
+                int new_idx = immurok_keystore_generate(name, immurok_keystore_result_buf());
+                if(new_idx >= 0) {
+                    immurok_keystore_set_result(immurok_keystore_result_buf(), 64);
+                    uint8_t rsp3[3] = { IMMUROK_RSP_OK, 64, (uint8_t)new_idx };
+                    PRINT("KEY_GENERATE done: idx=%d\n", new_idx);
+                    ImmurokService_SendResponse(rsp3, 3);
+                } else {
+                    uint8_t rspErr[1] = { SEC_ERR_INTERNAL };
+                    PRINT("KEY_GENERATE failed\n");
+                    ImmurokService_SendResponse(rspErr, 1);
+                }
+            }
+            s_pending_cmd = 0;
             return (events ^ OTA_FLASH_ERASE_EVT);
         }
 
@@ -1576,6 +1674,8 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 // Reset param update state for next connection
                 s_param_update_retries = 0;
                 s_latency_accepted = 0;
+                s_long_op_param_requested = 0;
+                s_long_op_wait_start = 0;
                 tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
                 // Start fast advertising, schedule switch to slow after 30s
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_FAST_INT);
@@ -1716,11 +1816,8 @@ static void hidEmuEvtCB(uint8_t evt)
 // Fixed window: timer only set on actual FP verification, not on pass-through
 static int fp_gate_needed(void)
 {
-    uint8_t bitmap = 0;
-    if(fp_ensure_ready() == FP_OK) {
-        fp_get_fingerprint_bitmap(&bitmap);
-    }
-    if(bitmap == 0) return 0;
+    // Use cached bitmap — avoids blocking fp_wake() (~300ms) in GATT callback
+    if(g_cached_fp_bitmap == 0) return 0;
     uint32_t ms_since = (TMOS_GetSystemClock() - s_fp_gate_last_verify) * 625 / 1000;
     if(ms_since > FP_GATE_COOLDOWN_MS) return 1;
     return 0;
@@ -1728,7 +1825,7 @@ static int fp_gate_needed(void)
 
 static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t len)
 {
-    uint8_t rspBuf[IMMUROK_RSP_MAX_LEN];
+    static uint8_t rspBuf[IMMUROK_RSP_MAX_LEN];  // static: save 64B stack (only 512B total)
     uint8_t rspLen = 1;
 
     if(len < 2) {
@@ -1757,20 +1854,12 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
     case IMMUROK_CMD_GET_STATUS:
         PRINT("  GET_STATUS\n");
         {
-            // Response: [OK][fp_bitmap:1B][paired:1B]
-            if(fp_ensure_ready() == FP_OK) {
-                uint8_t bitmap = 0;
-                fp_get_fingerprint_bitmap(&bitmap);
-                rspBuf[0] = IMMUROK_RSP_OK;
-                rspBuf[1] = bitmap;
-                rspBuf[2] = immurok_security_is_paired() ? 1 : 0;
-                rspLen = 3;
-            } else {
-                rspBuf[0] = IMMUROK_RSP_OK;
-                rspBuf[1] = 0;  // bitmap unknown
-                rspBuf[2] = immurok_security_is_paired() ? 1 : 0;
-                rspLen = 3;
-            }
+            // Use cached bitmap — no blocking UART ops in GATT callback
+            // (fp_wake blocks ~300ms which overflows the 512B stack in sleep mode)
+            rspBuf[0] = IMMUROK_RSP_OK;
+            rspBuf[1] = g_cached_fp_bitmap;
+            rspBuf[2] = immurok_security_is_paired() ? 1 : 0;
+            rspLen = 3;
         }
         break;
 
@@ -2187,26 +2276,22 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             // Only proceed when we have the complete hash (off=0 with 32B is single-shot)
             if(hash_off == 0 && data_len >= 32) {
                 // Fingerprint gate (with cooldown for batch ops)
+                // Always defer ECDSA sign to TMOS event (~2s blocks BLE if done here)
+                s_pending_cmd = IMMUROK_CMD_KEY_SIGN;
+                s_pending_cmd_start = TMOS_GetSystemClock();
+                s_pending_payload[0] = 0;  // cat (SSH)
+                s_pending_payload[1] = idx;
+                memcpy(&s_pending_payload[2], &pData[5], 32);
+                s_pending_payload_len = 34;
+
                 if(fp_gate_needed()) {
                     PRINT("  FP gate: caching KEY_SIGN\n");
-                    s_pending_cmd = IMMUROK_CMD_KEY_SIGN;
-                    s_pending_cmd_start = TMOS_GetSystemClock();
-                    s_pending_payload[0] = 0;  // cat (SSH)
-                    s_pending_payload[1] = idx;
-                    // hash is at s_pending_payload[2..33]
-                    memcpy(&s_pending_payload[2], &pData[5], 32);
-                    s_pending_payload_len = 34;
                     rspBuf[0] = IMMUROK_RSP_WAIT_FP;
                 } else {
-                    // No fingerprints enrolled, sign directly into result buffer
-                    if(immurok_keystore_sign(idx, &pData[5], immurok_keystore_result_buf()) == 0) {
-                        immurok_keystore_set_result(immurok_keystore_result_buf(), 64);
-                        rspBuf[0] = IMMUROK_RSP_OK;
-                        rspBuf[1] = 64;
-                        rspLen = 2;
-                    } else {
-                        rspBuf[0] = SEC_ERR_INTERNAL;
-                    }
+                    // No FP enrolled — sign immediately via TMOS event
+                    PRINT("  KEY_SIGN deferred to TMOS\n");
+                    tmos_set_event(hidEmuTaskId, FP_GATE_EXEC_EVT);
+                    return;  // Response sent from TMOS event handler
                 }
             } else {
                 // Partial hash received, ACK
@@ -2245,25 +2330,19 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
         {
             PRINT("  KEY_GENERATE\n");
 
-            // Fingerprint gate (with cooldown for batch ops)
+            // Always defer ECC keygen to TMOS event (~2s blocks BLE if done here)
+            s_pending_cmd = IMMUROK_CMD_KEY_GENERATE;
+            s_pending_cmd_start = TMOS_GetSystemClock();
+            memcpy(s_pending_payload, &pData[2], 17);  // cat + 16B name
+            s_pending_payload_len = 17;
+
             if(fp_gate_needed()) {
                 PRINT("  FP gate: caching KEY_GENERATE\n");
-                s_pending_cmd = IMMUROK_CMD_KEY_GENERATE;
-                s_pending_cmd_start = TMOS_GetSystemClock();
-                memcpy(s_pending_payload, &pData[2], 17);  // cat + 16B name
-                s_pending_payload_len = 17;
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
             } else {
-                int new_idx = immurok_keystore_generate(&pData[3], immurok_keystore_result_buf());
-                if(new_idx >= 0) {
-                    immurok_keystore_set_result(immurok_keystore_result_buf(), 64);
-                    rspBuf[0] = IMMUROK_RSP_OK;
-                    rspBuf[1] = 64;
-                    rspBuf[2] = (uint8_t)new_idx;
-                    rspLen = 3;
-                } else {
-                    rspBuf[0] = SEC_ERR_INTERNAL;
-                }
+                PRINT("  KEY_GENERATE deferred to TMOS\n");
+                tmos_set_event(hidEmuTaskId, FP_GATE_EXEC_EVT);
+                return;  // Response sent from TMOS event handler
             }
         }
         break;
@@ -2683,25 +2762,36 @@ static void OTA_IAPWriteData(uint8_t paramID, uint8_t *pData, uint8_t len)
 }
 
 /*********************************************************************
- * @fn      GPIOA_IRQHandler
+ * @fn      BTN_TOUCH_IRQHandler
  * @brief   GPIO interrupt - set flags for TMOS event loop to consume.
  *          MUST NOT call tmos_set_event() here (race with TMOS_SystemProcess).
  */
 __INTERRUPT
 __HIGH_CODE
-void GPIOA_IRQHandler(void)
+void BTN_TOUCH_IRQHandler(void)
 {
-    if(GPIOA_ReadITFlagBit(PIN_TOUCH))
+    if(TOUCH_ReadITFlag())
     {
-        GPIOA_ClearITFlagBit(PIN_TOUCH);
+        TOUCH_ClearITFlag();
         g_touch_irq_flag = 1;
     }
-    if(GPIOA_ReadITFlagBit(PIN_BTN1))
+    if(BTN_ReadITFlag())
     {
-        GPIOA_ClearITFlagBit(PIN_BTN1);
+        BTN_ClearITFlag();
         g_btn_irq_flag = 1;
     }
 }
 
+
+#if defined(HARDWARE_VER1)
+// VER1: BTN/TOUCH on GPIOB - stub GPIOA handler prevents
+// stray GPIOA interrupts hitting default infinite-loop -> watchdog reset
+__INTERRUPT
+__HIGH_CODE
+void GPIOA_IRQHandler(void)
+{
+    R16_PA_INT_IF = R16_PA_INT_IF;  // clear all flags
+}
+#endif
 /*********************************************************************
 *********************************************************************/

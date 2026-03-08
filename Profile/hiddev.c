@@ -26,7 +26,9 @@
  */
 
 // Battery measurement period in (625us)
-#define DEFAULT_BATT_PERIOD               15000
+// 60000 * 625us = 37.5s per tick, measure every 16th tick = 10 min
+#define DEFAULT_BATT_PERIOD               60000
+#define BATT_MEASURE_INTERVAL             16
 
 // TRUE to run scan parameters refresh notify test
 #define DEFAULT_SCAN_PARAM_NOTIFY_TEST    TRUE
@@ -955,8 +957,14 @@ static void hidDevScanParamCB(uint8_t event)
  */
 static void hidDevBattPeriodicTask(void)
 {
-    // perform battery level check
-    Batt_MeasLevel();
+    static uint8_t battTickCount = 0;
+
+    battTickCount++;
+    if(battTickCount >= BATT_MEASURE_INTERVAL)
+    {
+        battTickCount = 0;
+        Batt_MeasLevel();
+    }
 
     // Restart timer
     tmos_start_task(hidDevTaskId, BATT_PERIODIC_EVT, DEFAULT_BATT_PERIOD);
