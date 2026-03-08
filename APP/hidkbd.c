@@ -136,6 +136,7 @@ static uint32_t s_fp_power_on_tick = 0;  // RTC tick when fp_power_on() called
 static uint8_t s_search_active = 0;
 static uint8_t s_search_state = 0;   // 0=GET_IMAGE, 1=GEN_CHAR, 2=SEARCH
 static uint32_t s_search_start_time = 0;
+static uint8_t s_wait_finger_lift = 0;  // Block new search until finger lifted
 
 #define FP_SEARCH_TIMEOUT_MS    500   // 0.5 second timeout
 
@@ -154,7 +155,7 @@ static uint8_t s_pending_payload_len = 0;   // Length of cached payload
 static uint32_t s_pending_cmd_start = 0;    // TMOS tick when gate started
 #define FP_GATE_TIMEOUT_MS  25000           // 25s overall gate timeout (App has 30s)
 static uint32_t s_fp_gate_last_verify = 0;  // TMOS tick of last FP verification
-#define FP_GATE_COOLDOWN_MS 10000           // 10s cooldown after FP verify (batch ops)
+#define FP_GATE_COOLDOWN_MS 10000           // 10s idle timeout — rolling, refreshed on each pass
 
 // Cached fingerprint bitmap (updated at init/enroll/delete, used by GET_STATUS)
 // Extern: set from main.c after fp_init, avoids blocking in GATT callback
@@ -292,6 +293,8 @@ uint8_t s_latency_accepted = 0;
 // Long op param wait state (reset on disconnect)
 static uint8_t s_long_op_param_requested = 0;
 static uint32_t s_long_op_wait_start = 0;
+// Busy flag: set during ECC/ECDH computation to reject concurrent commands
+static volatile uint8_t s_long_op_busy = 0;
 
 /*********************************************************************
  * LOCAL FUNCTIONS
@@ -673,6 +676,10 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 else if(s_search_active) {
                     // Skip - search already in progress
                 }
+                else if(s_wait_finger_lift) {
+                    // Wait for finger to be lifted before allowing new search
+                    tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 160);  // poll 100ms
+                }
                 else
                 {
                     // Send CTRL key to wake host screen, but only when no
@@ -711,6 +718,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         {
             // No touch (IRQ was noise or finger already lifted)
             touchDebounce = 0;
+            s_wait_finger_lift = 0;
         }
 
         return (events ^ TOUCH_SCAN_EVT);
@@ -822,6 +830,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         if(elapsed > FP_SEARCH_TIMEOUT_MS)
         {
             s_search_active = 0;
+            s_wait_finger_lift = 1;
             if(s_pending_cmd != 0)
             {
                 uint32_t gate_elapsed = (TMOS_GetSystemClock() - s_pending_cmd_start) * 625 / 1000;
@@ -906,6 +915,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             uint16_t result_len = 4;
             ret = fp_recv_ack(&ack, search_result, &result_len, 200);
             s_search_active = 0;
+            s_wait_finger_lift = 1;
             WWDG_SetCounter(0);
 
             if(ret == FP_OK && ack == 0x00)
@@ -1128,6 +1138,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
         default:
             s_search_active = 0;
+            s_wait_finger_lift = 1;
             break;
         }
 
@@ -1432,6 +1443,9 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             s_long_op_wait_start = 0;
             PRINT("Long op: param accepted, proceeding\n");
 
+            // Lock out concurrent commands during ECC (~2s)
+            s_long_op_busy = 1;
+
             // Check if this is an ECDH computation
             immurok_ecdh_state_t ecdh_state = immurok_security_get_ecdh_state();
             if(ecdh_state == ECDH_STATE_MAKE_KEY)
@@ -1448,6 +1462,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     rspBuf[1] = SEC_ERR_INTERNAL;
                     ImmurokService_SendResponse(rspBuf, 2);
                 }
+                s_long_op_busy = 0;
                 return (events ^ OTA_FLASH_ERASE_EVT);
             }
             if(ecdh_state == ECDH_STATE_SHARED_SECRET)
@@ -1463,6 +1478,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     PRINT("ECDH PAIR_CONFIRM response sent (failed)\n");
                 }
                 ImmurokService_SendResponse(rspBuf, 2);
+                s_long_op_busy = 0;
                 return (events ^ OTA_FLASH_ERASE_EVT);
             }
 
@@ -1499,6 +1515,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 }
             }
             s_pending_cmd = 0;
+            s_long_op_busy = 0;
             return (events ^ OTA_FLASH_ERASE_EVT);
         }
 
@@ -1676,6 +1693,7 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 s_latency_accepted = 0;
                 s_long_op_param_requested = 0;
                 s_long_op_wait_start = 0;
+                s_long_op_busy = 0;
                 tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
                 // Start fast advertising, schedule switch to slow after 30s
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_FAST_INT);
@@ -1813,13 +1831,15 @@ static void hidEmuEvtCB(uint8_t evt)
  */
 // Check if fingerprint gate is needed (0 = no gate, 1 = need FP verification)
 // Returns 0 if no fingerprints enrolled or recently verified (within cooldown)
-// Fixed window: timer only set on actual FP verification, not on pass-through
+// Rolling window: each pass-through refreshes the timer for batch operations
 static int fp_gate_needed(void)
 {
     // Use cached bitmap — avoids blocking fp_wake() (~300ms) in GATT callback
     if(g_cached_fp_bitmap == 0) return 0;
-    uint32_t ms_since = (TMOS_GetSystemClock() - s_fp_gate_last_verify) * 625 / 1000;
+    uint32_t now = TMOS_GetSystemClock();
+    uint32_t ms_since = (now - s_fp_gate_last_verify) * 625 / 1000;
     if(ms_since > FP_GATE_COOLDOWN_MS) return 1;
+    s_fp_gate_last_verify = now;  // rolling: refresh on pass-through
     return 0;
 }
 
@@ -1839,9 +1859,9 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
 
     PRINT("immurok CMD: 0x%02X, len=%d\n", cmd, payloadLen);
 
-    // Reject all immurok commands during OTA
-    if(s_ota_active) {
-        PRINT("  Rejected (OTA in progress)\n");
+    // Reject all immurok commands during OTA or long ECC operation
+    if(s_ota_active || s_long_op_busy) {
+        PRINT("  Rejected (%s)\n", s_ota_active ? "OTA" : "ECC busy");
         rspBuf[0] = IMMUROK_RSP_BUSY;
         ImmurokService_SendResponse(rspBuf, rspLen);
         return;
@@ -1859,7 +1879,10 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             rspBuf[0] = IMMUROK_RSP_OK;
             rspBuf[1] = g_cached_fp_bitmap;
             rspBuf[2] = immurok_security_is_paired() ? 1 : 0;
-            rspLen = 3;
+            uint8_t batt = 0;
+            Batt_GetParameter(BATT_PARAM_LEVEL, &batt);
+            rspBuf[3] = batt;
+            rspLen = 4;
         }
         break;
 
