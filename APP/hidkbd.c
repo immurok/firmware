@@ -678,10 +678,13 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 }
                 else if(s_wait_finger_lift) {
                     // Wait for finger to be lifted before allowing new search
-                    tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 160);  // poll 100ms
+                    tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 48);  // poll 30ms
                 }
                 else
                 {
+                    // Block further touch events until finger is lifted
+                    s_wait_finger_lift = 1;
+
                     // Send CTRL key to wake host screen, but only when no
                     // gated command is pending (KEY_SIGN, OTP, etc. don't need it)
                     if(s_pending_cmd == 0 && !immurok_security_has_pending_auth()) {
@@ -802,8 +805,8 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             s_search_state = 0;  // Start from GET_IMAGE
             s_search_start_time = TMOS_GetSystemClock();
 
-            // Use tmos_start_task to break event chain and let main loop feed watchdog
-            tmos_start_task(hidEmuTaskId, FP_SEARCH_EVT, 1);  // 625us delay
+            // Use tmos_start_task to break event chain and let main loop process BLE
+            tmos_start_task(hidEmuTaskId, FP_SEARCH_EVT, 16);  // 10ms yield for BLE
         }
 
         return (events ^ FP_AUTH_EVT);
@@ -831,6 +834,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         {
             s_search_active = 0;
             s_wait_finger_lift = 1;
+            tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 48);  // poll finger lift
             if(s_pending_cmd != 0)
             {
                 uint32_t gate_elapsed = (TMOS_GetSystemClock() - s_pending_cmd_start) * 625 / 1000;
@@ -873,7 +877,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             {
                 WWDG_SetCounter(0);
                 s_search_state = 1;
-                tmos_start_task(hidEmuTaskId, FP_SEARCH_EVT, 1);  // yield then GEN_CHAR
+                tmos_start_task(hidEmuTaskId, FP_SEARCH_EVT, 16);  // 10ms yield for BLE
             }
             else
             {
@@ -890,7 +894,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             if(ret == FP_OK && ack == 0x00)
             {
                 s_search_state = 2;
-                tmos_start_task(hidEmuTaskId, FP_SEARCH_EVT, 1);  // yield then SEARCH
+                tmos_start_task(hidEmuTaskId, FP_SEARCH_EVT, 16);  // 10ms yield for BLE
             }
             else
             {
@@ -916,6 +920,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             ret = fp_recv_ack(&ack, search_result, &result_len, 200);
             s_search_active = 0;
             s_wait_finger_lift = 1;
+            tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 48);  // poll finger lift
             WWDG_SetCounter(0);
 
             if(ret == FP_OK && ack == 0x00)
@@ -965,14 +970,10 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                         break;
                     case IMMUROK_CMD_DELETE_FP:
                     {
-                        int del_ret = fp_ensure_ready();
-                        if(del_ret == FP_OK) {
-                            del_ret = fp_delete(s_pending_payload[0], 1);
-                            if(del_ret == FP_OK)
-                                fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
-                        }
-                        rspBuf[0] = (del_ret == FP_OK) ? IMMUROK_RSP_OK : SEC_ERR_INTERNAL;
-                        ImmurokService_SendResponse(rspBuf, 1);
+                        // Defer to FP_GATE_EXEC_EVT — avoid blocking ~400ms
+                        // (fp_delete + fp_get_fingerprint_bitmap) in search callback
+                        s_pending_cmd = IMMUROK_CMD_DELETE_FP;  // restore
+                        tmos_start_task(hidEmuTaskId, FP_GATE_EXEC_EVT, 16);  // 10ms yield
                         break;
                     }
                     case IMMUROK_CMD_FACTORY_RESET:
@@ -1139,6 +1140,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         default:
             s_search_active = 0;
             s_wait_finger_lift = 1;
+            tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 48);  // poll finger lift
             break;
         }
 
@@ -1217,8 +1219,8 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             rspBuf[2] = capture_num;
             rspBuf[3] = 6;
             ImmurokService_SendResponse(rspBuf, 4);
-            // Wait for finger lift
-            tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 1600);  // 1s
+            // Wait for finger lift — keep under watchdog period (559ms)
+            tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 768);  // 480ms
         }
         else if(enroll_step >= 1 && enroll_step <= 6) {
             // Try to capture finger N
@@ -1228,6 +1230,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             fp_send_cmd(0x01, NULL, 0);  // CMD_GET_IMAGE
             uint8_t ack;
             int ret = fp_recv_ack(&ack, NULL, NULL, 50);
+            WWDG_SetCounter(0);
 
             if(ret == FP_OK && ack == 0x00) {
                 // Image captured, generate char
@@ -1235,6 +1238,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 uint8_t params[1] = { buf_id };
                 fp_send_cmd(0x02, params, 1);  // CMD_IMAGE2TZ
                 ret = fp_recv_ack(&ack, NULL, NULL, 100);
+                WWDG_SetCounter(0);
 
                 if(ret == FP_OK && ack == 0x00) {
                     PRINT("ENROLL_EVT: captured %d/6\n", capture_num);
@@ -1291,6 +1295,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             fp_send_cmd(0x05, NULL, 0);  // CMD_REG_MODEL
             uint8_t ack;
             int ret = fp_recv_ack(&ack, NULL, NULL, 500);
+            WWDG_SetCounter(0);
 
             if(ret == FP_OK && ack == 0x00) {
                 enroll_step = 8;
@@ -1317,6 +1322,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             fp_send_cmd(0x06, params, 3);  // CMD_STORE
             uint8_t ack;
             int ret = fp_recv_ack(&ack, NULL, NULL, 500);
+            WWDG_SetCounter(0);
 
             if(ret == FP_OK && ack == 0x00) {
                 PRINT("ENROLL_EVT: SUCCESS!\n");
@@ -1411,6 +1417,23 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         // Shared event bit: deferred KEY_SIGN or ECDH compute (when not in OTA mode)
         if(!s_ota_active)
         {
+            // DELETE_FP / FACTORY_RESET: short ops (~400ms), no need to wait for param update
+            if(s_pending_cmd == IMMUROK_CMD_DELETE_FP)
+            {
+                int del_ret = fp_ensure_ready();
+                if(del_ret == FP_OK) {
+                    del_ret = fp_delete(s_pending_payload[0], 1);
+                    if(del_ret == FP_OK)
+                        fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
+                }
+                uint8_t rspDel[1];
+                rspDel[0] = (del_ret == FP_OK) ? IMMUROK_RSP_OK : SEC_ERR_INTERNAL;
+                ImmurokService_SendResponse(rspDel, 1);
+                s_pending_cmd = 0;
+                fp_reset_power_timer();
+                return (events ^ OTA_FLASH_ERASE_EVT);
+            }
+
             // All long computations (~2s) need supervision timeout > 2s.
             // Initial conn params have 720ms timeout — must update first.
             // Wait for s_latency_accepted before proceeding.
@@ -1888,34 +1911,11 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
 
     case IMMUROK_CMD_FP_LIST:
         {
-            // Wake up fingerprint module
-            if(fp_ensure_ready() != FP_OK) {
-                rspBuf[0] = 0xFF;  // Error
-                break;
-            }
-            // Get bitmap of which slots have fingerprints
-            uint8_t bitmap = 0;
-            if(fp_get_fingerprint_bitmap(&bitmap) == FP_OK) {
-                rspBuf[0] = IMMUROK_RSP_OK;
-                rspBuf[1] = bitmap;  // Bitmap: bit 0-4 for slots 0-4
-                rspLen = 2;
-                // Count bits for logging
-                uint8_t count = 0;
-                for(int i = 0; i < 5; i++) {
-                    if(bitmap & (1 << i)) count++;
-                }
-                PRINT("  FP_LIST: bitmap=0x%02X (%d templates)\n", bitmap, count);
-            } else {
-                // Fallback to count-based response
-                uint16_t count = 0;
-                fp_get_template_count(&count);
-                // Generate bitmap from count (assumes sequential slots)
-                bitmap = (1 << count) - 1;
-                rspBuf[0] = IMMUROK_RSP_OK;
-                rspBuf[1] = bitmap;
-                rspLen = 2;
-                PRINT("  FP_LIST: fallback bitmap=0x%02X (%d templates)\n", bitmap, count);
-            }
+            // Use cached bitmap — no blocking fp_wake() in GATT callback
+            rspBuf[0] = IMMUROK_RSP_OK;
+            rspBuf[1] = g_cached_fp_bitmap;
+            rspLen = 2;
+            PRINT("  FP_LIST: bitmap=0x%02X\n", g_cached_fp_bitmap);
         }
         break;
 
@@ -1934,15 +1934,12 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             } else if(slotId >= 5) {
                 rspBuf[0] = IMMUROK_RSP_INVALID_PARAM;
             } else {
-                // Check if slot already has fingerprint
-                uint8_t bitmap = 0;
-                fp_ensure_ready();
-                if(fp_get_fingerprint_bitmap(&bitmap) == FP_OK) {
-                    if(bitmap & (1 << slotId)) {
-                        PRINT("  Slot %d already occupied (bitmap=0x%02X)\n", slotId, bitmap);
-                        rspBuf[0] = IMMUROK_RSP_INVALID_PARAM;
-                        break;
-                    }
+                // Use cached bitmap — no blocking fp_wake() in GATT callback
+                uint8_t bitmap = g_cached_fp_bitmap;
+                if(bitmap & (1 << slotId)) {
+                    PRINT("  Slot %d already occupied (bitmap=0x%02X)\n", slotId, bitmap);
+                    rspBuf[0] = IMMUROK_RSP_INVALID_PARAM;
+                    break;
                 }
 
                 // Fingerprint gate: if any fingerprint exists, require verification
@@ -1974,10 +1971,8 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             uint8_t slotId = pData[2];
             PRINT("  DELETE_FP slot=%d\n", slotId);
 
-            // Fingerprint gate: if any fingerprint exists, require verification
-            uint8_t bitmap = 0;
-            fp_ensure_ready();
-            fp_get_fingerprint_bitmap(&bitmap);
+            // Use cached bitmap — no blocking fp_wake() in GATT callback
+            uint8_t bitmap = g_cached_fp_bitmap;
             if(bitmap != 0) {
                 PRINT("  FP gate: caching DELETE_FP, waiting for FP verify\n");
                 s_pending_cmd = IMMUROK_CMD_DELETE_FP;
@@ -1986,13 +1981,8 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 s_pending_payload_len = 1;
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
             } else {
-                // No fingerprints, delete directly (shouldn't normally happen)
-                if(fp_ensure_ready() != FP_OK) {
-                    rspBuf[0] = SEC_ERR_INTERNAL;
-                    break;
-                }
-                int ret = fp_delete(slotId, 1);
-                rspBuf[0] = (ret == FP_OK) ? IMMUROK_RSP_OK : SEC_ERR_INTERNAL;
+                // No fingerprints exist — nothing to delete
+                rspBuf[0] = IMMUROK_RSP_OK;
             }
         }
         break;
@@ -2022,12 +2012,8 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
     case IMMUROK_CMD_PAIR_INIT:
         PRINT("  PAIR_INIT\n");
         {
-            // Fingerprint gate: require verification if fingerprints enrolled
-            uint8_t bitmap = 0;
-            if(fp_ensure_ready() == FP_OK) {
-                fp_get_fingerprint_bitmap(&bitmap);
-            }
-            if(bitmap != 0 && fp_gate_needed()) {
+            // Use cached bitmap — no blocking fp_wake() in GATT callback
+            if(g_cached_fp_bitmap != 0 && fp_gate_needed()) {
                 PRINT("  FP gate: caching PAIR_INIT, waiting for FP verify\n");
                 s_pending_cmd = IMMUROK_CMD_PAIR_INIT;
                 s_pending_cmd_start = TMOS_GetSystemClock();
@@ -2094,11 +2080,8 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
     case IMMUROK_CMD_FACTORY_RESET:
         PRINT("  FACTORY_RESET\n");
         {
-            // Fingerprint gate: if any fingerprint exists, require verification
-            uint8_t bitmap = 0;
-            if(fp_ensure_ready() == FP_OK) {
-                fp_get_fingerprint_bitmap(&bitmap);
-            }
+            // Use cached bitmap — no blocking fp_wake() in GATT callback
+            uint8_t bitmap = g_cached_fp_bitmap;
             if(bitmap != 0) {
                 PRINT("  FP gate: caching FACTORY_RESET, waiting for FP verify\n");
                 s_pending_cmd = IMMUROK_CMD_FACTORY_RESET;
@@ -2631,6 +2614,16 @@ static void OTA_IAP_DataDeal(void)
                 PRINT("OTA mode active - all other functions suppressed\n");
                 // Power off fingerprint if running
                 fp_power_off();
+                // Stop param update timer so it won't override OTA latency
+                tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                // Request latency 0 for fast OTA data transfer
+                GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
+                    DEFAULT_DESIRED_MIN_CONN_INTERVAL,
+                    DEFAULT_DESIRED_MAX_CONN_INTERVAL,
+                    0,  // latency 0 during OTA
+                    DEFAULT_DESIRED_CONN_TIMEOUT,
+                    hidEmuTaskId);
+                PRINT("OTA: requested latency 0\n");
             }
 
             // Start async erase
@@ -2668,6 +2661,13 @@ static void OTA_IAP_DataDeal(void)
             {
                 PRINT("OTA END: rejected - no HEADER\n");
                 s_ota_active = 0;
+                // Restore original latency
+                GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
+                    DEFAULT_DESIRED_MIN_CONN_INTERVAL,
+                    DEFAULT_DESIRED_MAX_CONN_INTERVAL,
+                    DEFAULT_DESIRED_SLAVE_LATENCY,
+                    DEFAULT_DESIRED_CONN_TIMEOUT,
+                    hidEmuTaskId);
                 OTA_IAP_SendStatus(0xFE);
                 break;
             }
@@ -2683,6 +2683,12 @@ static void OTA_IAP_DataDeal(void)
                     PRINT("OTA END: SHA256 mismatch!\n");
                     s_ota_sec.active = 0;
                     s_ota_active = 0;
+                    GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
+                        DEFAULT_DESIRED_MIN_CONN_INTERVAL,
+                        DEFAULT_DESIRED_MAX_CONN_INTERVAL,
+                        DEFAULT_DESIRED_SLAVE_LATENCY,
+                        DEFAULT_DESIRED_CONN_TIMEOUT,
+                        hidEmuTaskId);
                     OTA_IAP_SendStatus(OTA_ERR_SHA256_MISMATCH);
                     break;
                 }
@@ -2698,6 +2704,12 @@ static void OTA_IAP_DataDeal(void)
                     PRINT("OTA END: HMAC mismatch!\n");
                     s_ota_sec.active = 0;
                     s_ota_active = 0;
+                    GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
+                        DEFAULT_DESIRED_MIN_CONN_INTERVAL,
+                        DEFAULT_DESIRED_MAX_CONN_INTERVAL,
+                        DEFAULT_DESIRED_SLAVE_LATENCY,
+                        DEFAULT_DESIRED_CONN_TIMEOUT,
+                        hidEmuTaskId);
                     OTA_IAP_SendStatus(OTA_ERR_HMAC_MISMATCH);
                     break;
                 }

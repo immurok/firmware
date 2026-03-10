@@ -19,10 +19,9 @@ static void hmac_sha256(const uint8_t *key, size_t key_len,
                         const uint8_t *data, size_t data_len,
                         uint8_t *out)
 {
-    uint8_t k_ipad[SHA256_BLOCK_SIZE];
-    uint8_t k_opad[SHA256_BLOCK_SIZE];
+    static sha256_ctx_t ctx;           // 104B → BSS (stack-critical path)
+    uint8_t k_pad[SHA256_BLOCK_SIZE];  // reuse for ipad then opad
     uint8_t tk[SHA256_DIGEST_SIZE];
-    sha256_ctx_t ctx;
 
     if (key_len > SHA256_BLOCK_SIZE) {
         sha256(key, key_len, tk);
@@ -30,20 +29,23 @@ static void hmac_sha256(const uint8_t *key, size_t key_len,
         key_len = SHA256_DIGEST_SIZE;
     }
 
-    memset(k_ipad, 0x36, SHA256_BLOCK_SIZE);
-    memset(k_opad, 0x5c, SHA256_BLOCK_SIZE);
-    for (size_t i = 0; i < key_len; i++) {
-        k_ipad[i] ^= key[i];
-        k_opad[i] ^= key[i];
-    }
+    // Inner hash: H((K ^ ipad) || data)
+    memset(k_pad, 0x36, SHA256_BLOCK_SIZE);
+    for (size_t i = 0; i < key_len; i++)
+        k_pad[i] ^= key[i];
 
     sha256_init(&ctx);
-    sha256_update(&ctx, k_ipad, SHA256_BLOCK_SIZE);
+    sha256_update(&ctx, k_pad, SHA256_BLOCK_SIZE);
     sha256_update(&ctx, data, data_len);
     sha256_final(&ctx, tk);
 
+    // Outer hash: H((K ^ opad) || inner)
+    memset(k_pad, 0x5c, SHA256_BLOCK_SIZE);
+    for (size_t i = 0; i < key_len; i++)
+        k_pad[i] ^= key[i];
+
     sha256_init(&ctx);
-    sha256_update(&ctx, k_opad, SHA256_BLOCK_SIZE);
+    sha256_update(&ctx, k_pad, SHA256_BLOCK_SIZE);
     sha256_update(&ctx, tk, SHA256_DIGEST_SIZE);
     sha256_final(&ctx, out);
 }

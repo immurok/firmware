@@ -1,6 +1,6 @@
 /*
  * ZW3021 Fingerprint Module Driver for CH592F
- * UART1 protocol implementation (PA9 TX, PA8 RX, 57600 8N2)
+ * UART1 protocol implementation (PA9 TX, PA8 RX, 57600 8N1)
  * Ported from ESP32H2 implementation
  */
 
@@ -81,6 +81,7 @@
 // ============================================================================
 
 static bool s_powered_on = false;
+volatile uint8_t g_sleep_inhibit = 0;  // Non-zero: suppress HAL_SLEEP (set while FP module active)
 static uint32_t s_power_on_tick = 0;  // RTC tick at power-on (for timing measurement)
 static bool s_initialized = false;
 static bool s_password_verified = false;
@@ -123,10 +124,9 @@ static void uart_init(void)
 
     UART1_DefInit();
     UART1_BaudRateCfg(FP_UART_BAUD);
-    // 8N2: 1 start bit, 8 data bits, no parity, 2 stop bits
-    R8_UART1_LCR |= RB_LCR_STOP_BIT;
+    // 8N1: 1 start bit, 8 data bits, no parity, 1 stop bit
 
-    PRINT("UART1 initialized: %d baud, 8N2\n", FP_UART_BAUD);
+    PRINT("UART1 initialized: %d baud, 8N1\n", FP_UART_BAUD);
 }
 
 static void uart_send(const uint8_t *data, uint16_t len)
@@ -150,6 +150,11 @@ static int uart_recv(uint8_t *data, uint16_t max_len, uint32_t timeout_ms)
             idle_count = 0;
         } else {
             idle_count++;
+            // Feed watchdog every ~40ms to prevent reset during long UART waits
+            // (WWDG period ≈ 559ms at 60MHz)
+            if ((idle_count & 0x3FFFF) == 0) {
+                WWDG_SetCounter(0);
+            }
             uint32_t limit = (count > 0) ? gap_timeout_loops : timeout_loops;
             if (idle_count >= limit) {
                 break;
@@ -358,15 +363,19 @@ void fp_power_on(void)
 {
     if (s_powered_on) return;
 
+    // Power on module FIRST, then configure UART
+    // (ZW0905 requires MCU_3.3V before UART init)
+    FP_PWR_SetMode(GPIO_ModeOut_PP_5mA);
+    FP_PWR_SetHigh();
+
     // Re-enable UART1 clock (was gated in fp_power_off)
     sys_safe_access_enable();
     R8_SLP_CLK_OFF0 &= ~RB_SLP_CLK_UART1;
     sys_safe_access_disable();
     // Re-initialize UART1 pins (were set to pull-down in fp_power_off)
     uart_init();
-    FP_PWR_SetMode(GPIO_ModeOut_PP_5mA);
-    FP_PWR_SetHigh();
     s_powered_on = true;
+    g_sleep_inhibit = 1;  // Suppress sleep while FP module is active
     s_power_on_tick = RTC_GetCycle32k();
     PRINT("Fingerprint power ON\n");
 }
@@ -385,6 +394,7 @@ void fp_power_off(void)
     R8_SLP_CLK_OFF0 |= RB_SLP_CLK_UART1;
     sys_safe_access_disable();
     s_powered_on = false;
+    g_sleep_inhibit = 0;  // Allow sleep again
     s_password_verified = false;  // Need to re-verify after power on
     PRINT("Fingerprint power OFF\n");
 }
@@ -652,11 +662,8 @@ int fp_init(void)
 
     PRINT("Initializing fingerprint module...\n");
 
-    // Power on module BEFORE configuring UART
+    // Power on module (includes UART init)
     fp_power_on();
-
-    // Initialize UART
-    uart_init();
 
     // Wait for module initialization signal (0x55)
     DelayMs(100);

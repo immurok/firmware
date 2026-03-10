@@ -163,6 +163,16 @@ SECTIONS
     PROVIDE( _end = _ebss);
     PROVIDE( end = . );
 
+    /* Stack guard: large buffers placed between BSS and stack.
+     * Stack overflow goes into this area rather than corrupting .bss. */
+    .stack_guard :
+    {
+        . = ALIGN(4);
+        *(.stack_guard)
+        *(.stack_guard.*)
+        . = ALIGN(4);
+    } >RAM
+
     .stack ORIGIN(RAM) + LENGTH(RAM) - __stack_size :
     {
         PROVIDE( _heap_end = . );

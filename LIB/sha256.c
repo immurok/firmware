@@ -46,7 +46,7 @@ static const uint32_t H0[8] = {
 // Process a single 512-bit block
 static void sha256_transform(sha256_ctx_t *ctx, const uint8_t *block)
 {
-    uint32_t W[64];
+    static uint32_t W[64];  // 256B → BSS (stack only 512B, can't afford on stack)
     uint32_t a, b, c, d, e, f, g, h;
     uint32_t t1, t2;
     int i;

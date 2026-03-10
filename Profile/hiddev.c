@@ -26,9 +26,9 @@
  */
 
 // Battery measurement period in (625us)
-// 60000 * 625us = 37.5s per tick, measure every 16th tick = 10 min
+// 60000 * 625us = 37.5s per tick, measure every 2nd tick ≈ 75s
 #define DEFAULT_BATT_PERIOD               60000
-#define BATT_MEASURE_INTERVAL             16
+#define BATT_MEASURE_INTERVAL             2
 
 // TRUE to run scan parameters refresh notify test
 #define DEFAULT_SCAN_PARAM_NOTIFY_TEST    TRUE

@@ -93,13 +93,22 @@ HW_VER = $(VER)
 endif
 HW_VER ?= 0
 
+# BLE memory heap size (OTA mode needs less to fit stack_guard in RAM)
+ifdef OTA
+    BLE_MEMHEAP = 5632
+else ifdef OTA_V2
+    BLE_MEMHEAP = 5632
+else
+    BLE_MEMHEAP = 6144
+endif
+
 # Common defines
 C_DEFS_COMMON = \
 	-DHARDWARE_VER$(HW_VER) \
 	-DCH592 \
 	-DBLE_MAC=FALSE \
 	-DDCDC_ENABLE=TRUE \
-	-DBLE_MEMHEAP_SIZE=6144 \
+	-DBLE_MEMHEAP_SIZE=$(BLE_MEMHEAP) \
 	-DBLE_BUFF_MAX_LEN=251 \
 	-DCLK_OSC32K=0 \
 	-DWAKE_UP_RTC_MAX_TIME=164 \
