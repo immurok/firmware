@@ -93,14 +93,7 @@ HW_VER = $(VER)
 endif
 HW_VER ?= 0
 
-# BLE memory heap size (OTA mode needs less to fit stack_guard in RAM)
-ifdef OTA
-    BLE_MEMHEAP = 5632
-else ifdef OTA_V2
-    BLE_MEMHEAP = 5632
-else
-    BLE_MEMHEAP = 6144
-endif
+BLE_MEMHEAP = 5632
 
 # Common defines
 C_DEFS_COMMON = \

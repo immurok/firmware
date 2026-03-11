@@ -172,6 +172,7 @@ static uint32_t s_ota_erase_blocks = 0;
 static uint32_t s_ota_erase_count = 0;
 static uint8_t s_ota_verify_status = 0;
 static uint8_t s_ota_active = 0;  // OTA mode: suppress all non-OTA functionality
+static uint8_t s_ota_reboot_pending = 0;  // Deferred reboot after OTA verification
 
 // OTA secure context (for encrypted .imfw upgrades)
 #include "ota_keys.h"
@@ -219,7 +220,7 @@ static void OTA_IAPReadDataComplete(uint8_t paramID);
 static void OTA_IAPWriteData(uint8_t paramID, uint8_t *pData, uint8_t len);
 static void OTA_IAP_DataDeal(void);
 static void OTA_IAP_SendStatus(uint8_t status);
-static void SwitchImageFlag(uint8_t new_flag);
+
 
 /*********************************************************************
  * LOCAL VARIABLES
@@ -1542,6 +1543,38 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             return (events ^ OTA_FLASH_ERASE_EVT);
         }
 
+        // Deferred OTA reboot: write IAP flag to DataFlash EEPROM, then reset
+        if(s_ota_reboot_pending)
+        {
+            s_ota_reboot_pending = 0;
+
+            __attribute__((aligned(8))) uint8_t block_buf[16];
+            uint8_t ret;
+
+            PRINT("OTA REBOOT: writing ImageFlag to EEPROM @ 0x%x\n", OTA_DATAFLASH_ADD);
+
+            ret = EEPROM_READ(OTA_DATAFLASH_ADD, (uint32_t *)block_buf, 4);
+            PRINT("  read: ret=%d, cur=0x%02X\n", ret, block_buf[0]);
+
+            ret = EEPROM_ERASE(OTA_DATAFLASH_ADD, EEPROM_PAGE_SIZE);
+            PRINT("  erase: ret=%d\n", ret);
+
+            block_buf[0] = IMAGE_IAP_FLAG;
+            ret = EEPROM_WRITE(OTA_DATAFLASH_ADD, (uint32_t *)block_buf, 4);
+            PRINT("  write: ret=%d\n", ret);
+
+            // Verify
+            block_buf[0] = 0xFF;
+            EEPROM_READ(OTA_DATAFLASH_ADD, (uint32_t *)block_buf, 4);
+            PRINT("  verify: 0x%02X %s\n", block_buf[0],
+                  (block_buf[0] == IMAGE_IAP_FLAG) ? "OK" : "FAIL!");
+
+            PRINT("OTA REBOOT: resetting...\n");
+            DelayMs(10);
+            SYS_DisableAllIrq(NULL);
+            SYS_ResetExecute();
+        }
+
         uint8_t status;
 
         PRINT("OTA ERASE: %08x block %d/%d\n",
@@ -2421,6 +2454,17 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
         }
         break;
 
+    case IMMUROK_CMD_GATE_CANCEL:
+        PRINT("  GATE_CANCEL\n");
+        if(s_pending_cmd != 0) {
+            PRINT("  Clearing pending cmd 0x%02X\n", s_pending_cmd);
+            s_pending_cmd = 0;
+            s_pending_payload_len = 0;
+            fp_power_off();
+        }
+        rspBuf[0] = IMMUROK_RSP_OK;
+        break;
+
     default:
         PRINT("  Unknown command\n");
         rspBuf[0] = IMMUROK_RSP_UNKNOWN_CMD;
@@ -2445,29 +2489,6 @@ static void OTA_IAP_SendStatus(uint8_t status)
     buf[0] = status;
     buf[1] = 0;
     OTAProfile_SendData(OTAPROFILE_CHAR, buf, 2);
-}
-
-/*********************************************************************
- * @fn      SwitchImageFlag
- * @brief   Switch image flag in DataFlash
- */
-static void SwitchImageFlag(uint8_t new_flag)
-{
-    __attribute__((aligned(8))) uint8_t block_buf[16];
-
-    // Read current data
-    EEPROM_READ(OTA_DATAFLASH_ADD, (uint32_t *)block_buf, 4);
-
-    // Erase page
-    EEPROM_ERASE(OTA_DATAFLASH_ADD, EEPROM_PAGE_SIZE);
-
-    // Update image flag
-    block_buf[0] = new_flag;
-
-    // Write back
-    EEPROM_WRITE(OTA_DATAFLASH_ADD, (uint32_t *)block_buf, 4);
-
-    PRINT("Image flag switched to 0x%02X\n", new_flag);
 }
 
 /*********************************************************************
@@ -2674,7 +2695,8 @@ static void OTA_IAP_DataDeal(void)
 
             {
                 // Verify SHA256 + HMAC before accepting
-                uint8_t computed[32];
+                // Static to avoid stack overflow (BLE callback chain ~200B + HMAC ~112B = ~500B/512B)
+                static uint8_t computed[32];
 
                 // Step 1: Verify SHA256 of decrypted firmware
                 sha256_final(&s_ota_sec.sha256_ctx, computed);
@@ -2695,7 +2717,7 @@ static void OTA_IAP_DataDeal(void)
                 PRINT("OTA END: SHA256 OK\n");
 
                 // Step 2: Verify HMAC-SHA256 of header[0:0x40]
-                uint8_t computed_hmac[32];
+                static uint8_t computed_hmac[32];
                 immurok_hmac_sha256(OTA_SIGNING_KEY, sizeof(OTA_SIGNING_KEY),
                                     (const uint8_t *)&s_ota_sec.header, 0x40,
                                     computed_hmac);
@@ -2718,17 +2740,11 @@ static void OTA_IAP_DataDeal(void)
                 s_ota_sec.active = 0;
             }
 
-            PRINT("OTA END - switching to IAP\n");
+            PRINT("OTA END - scheduling reboot\n");
 
-            // Disable all interrupts
-            SYS_DisableAllIrq(NULL);
-
-            // Switch image flag to IAP (will trigger copy on next boot)
-            SwitchImageFlag(IMAGE_IAP_FLAG);
-
-            // Wait for print to complete, then reset
-            DelayMs(10);
-            SYS_ResetExecute();
+            // Defer EEPROM write + reset to TMOS event (not safe in GATT callback)
+            s_ota_reboot_pending = 1;
+            tmos_set_event(hidEmuTaskId, OTA_FLASH_ERASE_EVT);
             break;
         }
 

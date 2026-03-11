@@ -20,8 +20,8 @@ static void hmac_sha256(const uint8_t *key, size_t key_len,
                         uint8_t *out)
 {
     static sha256_ctx_t ctx;           // 104B → BSS (stack-critical path)
-    uint8_t k_pad[SHA256_BLOCK_SIZE];  // reuse for ipad then opad
-    uint8_t tk[SHA256_DIGEST_SIZE];
+    static uint8_t k_pad[SHA256_BLOCK_SIZE];  // 64B → BSS (called from BLE callback, 512B stack)
+    static uint8_t tk[SHA256_DIGEST_SIZE];    // 32B → BSS
 
     if (key_len > SHA256_BLOCK_SIZE) {
         sha256(key, key_len, tk);

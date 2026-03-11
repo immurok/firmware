@@ -35,6 +35,7 @@ extern "C" {
 #define IMMUROK_CMD_PAIR_STATUS     0x32
 #define IMMUROK_CMD_AUTH_REQUEST    0x33
 #define IMMUROK_CMD_FACTORY_RESET   0x36
+#define IMMUROK_CMD_GATE_CANCEL    0x37
 
 // Keystore commands
 #define IMMUROK_CMD_KEY_COUNT      0x60

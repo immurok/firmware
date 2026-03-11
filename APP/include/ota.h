@@ -49,9 +49,13 @@
 #define IMAGE_IAP_START_ADD    (IMAGE_B_START_ADD + IMAGE_SIZE)  /* 0x0006D000 */
 #define IMAGE_IAP_SIZE         (12 * 1024)
 
-/* OTA DataFlash address (for ImageFlag storage) */
-/* WCH standard formula: separate from security pairing data at address 0 */
+/* OTA DataFlash address (legacy, kept for reference) */
 #define OTA_DATAFLASH_ADD      (0x00076000 - FLASH_ROM_MAX_SIZE)
+
+/* OTA Flag in Flash ROM (bypasses BLE library EEPROM cache) */
+/* Written at last 4 bytes of Image B area; erasing Image B clears it */
+#define OTA_FLAG_FLASH_ADDR    (IMAGE_B_START_ADD + IMAGE_B_SIZE - 4)  /* 0x6CFFC */
+#define OTA_FLAG_MAGIC         0x4F544103  /* "OTA\x03" = copy B→A needed */
 
 /* OTA IAP Command Codes */
 #define CMD_IAP_PROM           0x80    /* Program flash data */
