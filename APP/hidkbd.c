@@ -47,10 +47,8 @@
 // macOS rejects high latency during service discovery; wait for enumeration to finish
 #define START_PARAM_UPDATE_EVT_DELAY         48000
 
-// Retry interval for param update if macOS ignores request (10s)
-#define PARAM_UPDATE_RETRY_DELAY             16000
-// Max param update retries
-#define PARAM_UPDATE_MAX_RETRIES             3
+// Retry interval for param update if macOS ignores/rejects request (30s)
+#define PARAM_UPDATE_RETRY_DELAY             48000
 
 // Param update delay
 #define START_PHY_UPDATE_DELAY               1600
@@ -133,6 +131,9 @@ static uint8_t s_gate_fail_count = 0;      // FP match failure count in current 
 #define FP_GATE_MAX_RETRIES  3             // Max fingerprint attempts before gate failure
 static uint32_t s_fp_power_on_tick = 0;  // RTC tick when fp_power_on() called
 
+// Factory reset: deferred bond erase + system reset (after OK response sent)
+static uint8_t s_factory_reset_pending = 0;
+
 // Fingerprint search state machine
 // Each state does send+recv in one call to avoid UART FIFO overflow
 static uint8_t s_search_active = 0;
@@ -173,7 +174,7 @@ static uint32_t s_ota_erase_addr = 0;
 static uint32_t s_ota_erase_blocks = 0;
 static uint32_t s_ota_erase_count = 0;
 static uint8_t s_ota_verify_status = 0;
-static uint8_t s_ota_active = 0;  // OTA mode: suppress all non-OTA functionality
+uint8_t s_ota_active = 0;  // OTA mode: suppress all non-OTA functionality (non-static: extern'd by hiddev.c)
 static uint8_t s_ota_reboot_pending = 0;  // Deferred reboot after OTA verification
 
 // OTA secure context (for encrypted .imfw upgrades)
@@ -373,6 +374,8 @@ static uint16_t hidEmuConnHandle = GAP_CONNHANDLE_INIT;
 static uint8_t s_param_update_retries = 0;
 // Whether our desired latency has been accepted (extern'd by hiddev.c)
 uint8_t s_latency_accepted = 0;
+// Current supervision timeout in units of 10ms (extern'd by hiddev.c, updated on every param change)
+uint16_t s_conn_timeout = 0;
 // Long op param wait state (reset on disconnect)
 static uint8_t s_long_op_param_requested = 0;
 static uint32_t s_long_op_wait_start = 0;
@@ -635,14 +638,18 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
     if(events & START_PARAM_UPDATE_EVT)
     {
-        if(s_latency_accepted)
+        if(s_ota_active)
         {
-            // Already got acceptable params, skip
+            return (events ^ START_PARAM_UPDATE_EVT);
+        }
+        // Skip if timeout already adequate (>= 2s = 200 units of 10ms)
+        if(s_conn_timeout >= 200)
+        {
             return (events ^ START_PARAM_UPDATE_EVT);
         }
         s_param_update_retries++;
-        PRINT("Requesting param update (attempt %d/%d): interval=%d-%d, latency=%d, timeout=%d\n",
-              s_param_update_retries, PARAM_UPDATE_MAX_RETRIES,
+        PRINT("Requesting param update (attempt %d): interval=%d-%d, latency=%d, timeout=%d\n",
+              s_param_update_retries,
               DEFAULT_DESIRED_MIN_CONN_INTERVAL, DEFAULT_DESIRED_MAX_CONN_INTERVAL,
               DEFAULT_DESIRED_SLAVE_LATENCY, DEFAULT_DESIRED_CONN_TIMEOUT);
         GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
@@ -652,11 +659,8 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                                              DEFAULT_DESIRED_CONN_TIMEOUT,
                                              hidEmuTaskId);
 
-        // Schedule retry if not accepted
-        if(s_param_update_retries < PARAM_UPDATE_MAX_RETRIES)
-        {
-            tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, PARAM_UPDATE_RETRY_DELAY);
-        }
+        // Retry every 30s until accepted (macOS may reject during HID activity)
+        tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, PARAM_UPDATE_RETRY_DELAY);
 
         return (events ^ START_PARAM_UPDATE_EVT);
     }
@@ -1100,12 +1104,14 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                             fp_clear_all();
                         }
                         g_cached_fp_bitmap = 0;
-                        // Clear password
+                        // Clear security data (pairing keys, password)
                         immurok_security_factory_reset();
-                        // Clear BLE bonds
-                        HidDev_SetParameter(HIDDEV_ERASE_ALLBONDS, 0, NULL);
+                        // Send OK response FIRST, then defer bond erase + reboot
+                        // (ERASE_ALLBONDS terminates link immediately — response would be lost)
                         rspBuf[0] = IMMUROK_RSP_OK;
                         ImmurokService_SendResponse(rspBuf, 1);
+                        s_factory_reset_pending = 1;
+                        tmos_start_task(hidEmuTaskId, FP_POWER_OFF_EVT, 320);  // 200ms
                         break;
                     }
                     case IMMUROK_CMD_KEY_DELETE:
@@ -1584,6 +1590,16 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
     if(events & FP_POWER_OFF_EVT)
     {
+        // Deferred factory reset: erase bonds + system reset
+        // (OK response already sent, 200ms delay for BLE transmission)
+        if(s_factory_reset_pending) {
+            s_factory_reset_pending = 0;
+            PRINT("Factory reset: erasing bonds + reboot\n");
+            HidDev_SetParameter(HIDDEV_ERASE_ALLBONDS, 0, NULL);
+            DelayMs(100);
+            SYS_ResetExecute();
+            // Never returns
+        }
         // Power off fingerprint module after idle timeout
         if(fp_is_powered() && !s_enroll_active) {
             PRINT("FP idle timeout - powering off\n");
@@ -1597,8 +1613,9 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         // Shared event bit: deferred KEY_SIGN or ECDH compute (when not in OTA mode)
         if(!s_ota_active)
         {
-            // DELETE_FP / FACTORY_RESET: short ops (~400ms), no need to wait for param update
-            if(s_pending_cmd == IMMUROK_CMD_DELETE_FP)
+            // DELETE_FP: ~700ms blocking (fp_ensure_ready + fp_delete).
+            // Borderline for 720ms fast-param timeout — request update first if needed.
+            if(s_pending_cmd == IMMUROK_CMD_DELETE_FP && s_latency_accepted)
             {
                 int del_ret = fp_ensure_ready();
                 if(del_ret == FP_OK) {
@@ -1614,32 +1631,19 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 return (events ^ OTA_FLASH_ERASE_EVT);
             }
 
-            // All long computations (~2s) need supervision timeout > 2s.
-            // Initial conn params have 720ms timeout — must update first.
-            // Wait for s_latency_accepted before proceeding.
-            if(!s_latency_accepted)
+            // ECC (~2s) needs supervision timeout >= 5s to avoid disconnect.
+            // Reject with 0xE1 if timeout too short — lets App diagnose param issues.
+            // s_conn_timeout is in units of 10ms, so 500 = 5000ms = 5s.
+            if(s_conn_timeout < 500)
             {
-                if(!s_long_op_param_requested)
-                {
-                    s_long_op_param_requested = 1;
-                    s_long_op_wait_start = TMOS_GetSystemClock();
-                    PRINT("Long op deferred: waiting for param update\n");
-                    tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                PRINT("Long op REJECTED: timeout=%dms (need >=5000ms)\n", s_conn_timeout * 10);
+                s_long_op_param_requested = 0;
+                s_long_op_wait_start = 0;
+                if(s_pending_cmd == IMMUROK_CMD_KEY_SIGN || s_pending_cmd == IMMUROK_CMD_KEY_GENERATE) {
+                    uint8_t rspErr[1] = { 0xE1 };
+                    ImmurokService_SendResponse(rspErr, 1);
                 }
-                uint32_t elapsed_ms = (TMOS_GetSystemClock() - s_long_op_wait_start) * 625 / 1000;
-                if(elapsed_ms > 10000)
-                {
-                    PRINT("Long op: param update timeout (%dms), aborting\n", (int)elapsed_ms);
-                    s_long_op_param_requested = 0;
-                    s_long_op_wait_start = 0;
-                    if(s_pending_cmd == IMMUROK_CMD_KEY_SIGN || s_pending_cmd == IMMUROK_CMD_KEY_GENERATE) {
-                        uint8_t rspErr[1] = { SEC_ERR_INTERNAL };
-                        ImmurokService_SendResponse(rspErr, 1);
-                    }
-                    s_pending_cmd = 0;
-                    return (events ^ OTA_FLASH_ERASE_EVT);
-                }
-                tmos_start_task(hidEmuTaskId, FP_GATE_EXEC_EVT, 320);  // poll 200ms
+                s_pending_cmd = 0;
                 return (events ^ OTA_FLASH_ERASE_EVT);
             }
             s_long_op_param_requested = 0;
@@ -1648,6 +1652,9 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
             // Lock out concurrent commands during ECC (~2s)
             s_long_op_busy = 1;
+            // Suppress FP power-off during ECC — avoid sys_safe_access / PRINT
+            // inside TMOS_SystemProcess() called from uECC keepalive
+            tmos_stop_task(hidEmuTaskId, FP_POWER_OFF_EVT);
 
             // Check if this is an ECDH computation
             immurok_ecdh_state_t ecdh_state = immurok_security_get_ecdh_state();
@@ -1934,19 +1941,28 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
 #if HAS_RGB_LED
                 led_blink_start('B');
 #endif
-                // Clear pending FP gate state
+                // Clear ALL session state for clean reconnect
                 s_pending_cmd = 0;
                 s_pending_payload_len = 0;
                 immurok_security_auth_cancel();
-                // Reset param update state for next connection
+                // Reset param update state
                 s_param_update_retries = 0;
                 s_latency_accepted = 0;
+                s_conn_timeout = 0;
                 s_long_op_param_requested = 0;
                 s_long_op_wait_start = 0;
                 s_long_op_busy = 0;
+                // Reset fingerprint state
+                s_search_active = 0;
+                s_enroll_active = 0;
+                s_gate_fail_count = 0;
+                s_gate_preheat = 0;
                 tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
                 tmos_stop_task(hidEmuTaskId, HID_KEY_RELEASE_EVT);
                 tmos_stop_task(hidEmuTaskId, FP_NOTIFY_RETRY_EVT);
+                tmos_stop_task(hidEmuTaskId, FP_SEARCH_EVT);
+                tmos_stop_task(hidEmuTaskId, FP_ENROLL_EVT);
+                tmos_stop_task(hidEmuTaskId, FP_WAKE_DONE_EVT);
                 s_fp_notify_pending = 0;
                 // Start fast advertising, schedule switch to slow after 30s
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_FAST_INT);
@@ -2174,7 +2190,9 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             rspBuf[4] = FW_VERSION_MAJOR;
             rspBuf[5] = FW_VERSION_MINOR;
             rspBuf[6] = FW_VERSION_PATCH;
-            rspLen = 7;
+            rspBuf[7] = (FW_BUILD_NUMBER >> 8) & 0xFF;
+            rspBuf[8] = FW_BUILD_NUMBER & 0xFF;
+            rspLen = 9;
         }
         break;
 
@@ -2350,10 +2368,12 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 fp_gate_enter();
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
             } else {
-                // No fingerprints, reset directly
+                // No fingerprints — clear security, send OK, defer bond erase + reboot
                 immurok_security_factory_reset();
-                HidDev_SetParameter(HIDDEV_ERASE_ALLBONDS, 0, NULL);
                 rspBuf[0] = IMMUROK_RSP_OK;
+                // Response sent below via break; defer bond erase after BLE transmits
+                s_factory_reset_pending = 1;
+                tmos_start_task(hidEmuTaskId, FP_POWER_OFF_EVT, 320);  // 200ms
             }
         }
         break;
@@ -2562,6 +2582,10 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                     // Send 0x10 explicitly + 80ms delay (like FP gate path)
                     // so BLE flushes notification before ECC blocks (~2s)
                     PRINT("  KEY_SIGN cooldown, deferred to TMOS\n");
+                    // Pre-request param update if needed (no FP wait to buy time)
+                    if(!s_latency_accepted) {
+                        tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                    }
                     uint8_t fpApproved[1] = { 0x10 };
                     ImmurokService_SendResponse(fpApproved, 1);
                     tmos_start_task(hidEmuTaskId, FP_GATE_EXEC_EVT, 128);  // 80ms
@@ -2616,6 +2640,9 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
             } else {
                 PRINT("  KEY_GENERATE deferred to TMOS\n");
+                if(!s_latency_accepted) {
+                    tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                }
                 tmos_set_event(hidEmuTaskId, FP_GATE_EXEC_EVT);
                 return;  // Response sent from TMOS event handler
             }

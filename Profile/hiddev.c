@@ -26,6 +26,9 @@
  * MACROS
  */
 
+// Param update retry delay (625us units, 48000 = 30s)
+#define PARAM_UPDATE_RETRY_DELAY          48000
+
 // Battery measurement period in (625us)
 // 60000 * 625us = 37.5s per tick, measure every 2nd tick ≈ 75s
 #define DEFAULT_BATT_PERIOD               60000
@@ -849,21 +852,27 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
         ImmurokService_SendResponse(paramNotif, 6);
     }
 
-    // Track whether macOS accepted our latency request.
-    // macOS pushes fast params (15ms, latency=0, timeout=720ms) after HID activity;
-    // must reset s_latency_accepted so ECC waits for param update before proceeding.
+    // Track current connection parameters for ECC safety check.
+    // ECC signing (~2s) requires supervision timeout >= 5s to avoid disconnect.
     extern uint8_t s_latency_accepted;
+    extern uint16_t s_conn_timeout;  // current timeout in units of 10ms
     extern uint8_t hidEmuTaskId;
+    s_conn_timeout = connTimeout;
     if(connSlaveLatency > 0)
     {
         s_latency_accepted = 1;
-        tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
-        PRINT("Latency accepted!\n");
+        PRINT("Latency accepted (timeout=%dms)!\n", connTimeout * 10);
     }
-    else if(s_latency_accepted)
+    else
     {
         s_latency_accepted = 0;
-        PRINT("Latency reverted by host, will re-request\n");
+    }
+    // Stop retry timer only when timeout is adequate (>= 2s)
+    if(connTimeout >= 200) {
+        tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+    } else {
+        // Timeout inadequate — ensure retry timer is running
+        tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, PARAM_UPDATE_RETRY_DELAY);
     }
 }
 

@@ -16,6 +16,7 @@
 #include <stdarg.h>
 #include "hiddev.h"
 #include "hidkbd.h"
+#include "version.h"
 #include "fingerprint.h"
 #include "hardware_pins.h"
 #include "ws2812.h"
@@ -227,7 +228,7 @@ int main(void)
 
     // Touch INT input (active high) - for button scan
     TOUCH_SetMode(GPIO_ModeIN_PD);
-    PRINT("%s [build:%s %s]\n", VER_LIB, __DATE__, __TIME__);
+    PRINT("%s [fw:" FW_VERSION_STRING ".%04X build:%s %s]\n", VER_LIB, FW_BUILD_NUMBER, __DATE__, __TIME__);
     CH59x_BLEInit();
     HAL_Init();
     GAPRole_PeripheralInit();

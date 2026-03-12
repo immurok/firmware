@@ -137,6 +137,10 @@ static void uart_send(const uint8_t *data, uint16_t len)
     }
 }
 
+// Reentrancy guard for TMOS keepalive in uart_recv.
+// Prevents nested TMOS_SystemProcess() if a TMOS event triggers another UART operation.
+static volatile uint8_t s_in_uart_tmos_kick = 0;
+
 static int uart_recv(uint8_t *data, uint16_t max_len, uint32_t timeout_ms)
 {
     uint16_t count = 0;
@@ -150,10 +154,16 @@ static int uart_recv(uint8_t *data, uint16_t max_len, uint32_t timeout_ms)
             idle_count = 0;
         } else {
             idle_count++;
-            // Feed watchdog every ~40ms to prevent reset during long UART waits
-            // (WWDG period ≈ 559ms at 60MHz)
-            if ((idle_count & 0x3FFFF) == 0) {
+            // Keep BLE alive: call TMOS_SystemProcess() every ~15ms (≈ one connection interval)
+            // to prevent supervision timeout during long UART waits (up to 200ms).
+            // 15ms ≈ 90000 loops at 60MHz. Use reentrancy guard to prevent nested calls.
+            if ((idle_count % 90000) == 0) {
                 WWDG_SetCounter(0);
+                if(!s_in_uart_tmos_kick) {
+                    s_in_uart_tmos_kick = 1;
+                    TMOS_SystemProcess();
+                    s_in_uart_tmos_kick = 0;
+                }
             }
             uint32_t limit = (count > 0) ? gap_timeout_loops : timeout_loops;
             if (idle_count >= limit) {

@@ -95,8 +95,19 @@ HW_VER ?= 0
 
 BLE_MEMHEAP = 5632
 
+# Firmware version from version.h
+FW_VER_MAJOR := $(shell grep 'FW_VERSION_MAJOR' APP/include/version.h | awk '{print $$3}')
+FW_VER_MINOR := $(shell grep 'FW_VERSION_MINOR' APP/include/version.h | awk '{print $$3}')
+FW_VER_PATCH := $(shell grep 'FW_VERSION_PATCH' APP/include/version.h | awk '{print $$3}')
+
+# Build number from git: short hash → 16-bit integer (e.g. "a3f1" → 0xa3f1)
+GIT_HASH := $(shell git rev-parse --short=4 HEAD 2>/dev/null || echo "0000")
+BUILD_NUMBER := 0x$(GIT_HASH)
+FW_VERSION := $(FW_VER_MAJOR).$(FW_VER_MINOR).$(FW_VER_PATCH).$(GIT_HASH)
+
 # Common defines
 C_DEFS_COMMON = \
+	-DFW_BUILD_NUMBER=$(BUILD_NUMBER) \
 	-DHARDWARE_VER$(HW_VER) \
 	-DCH592 \
 	-DBLE_MAC=FALSE \
@@ -190,7 +201,7 @@ vpath %.S $(sort $(dir $(ASM_SOURCES)))
 
 # Track build flags — auto-clean when flags change
 BUILD_FLAGS_FILE = $(BUILD_DIR)/.build_flags
-CURRENT_FLAGS = $(BUILD_MODE) HW_VER=$(HW_VER)
+CURRENT_FLAGS = $(BUILD_MODE) HW_VER=$(HW_VER) FW=$(FW_VERSION)
 $(shell mkdir -p $(BUILD_DIR))
 $(shell if [ ! -f $(BUILD_FLAGS_FILE) ] || [ "$$(cat $(BUILD_FLAGS_FILE))" != "$(CURRENT_FLAGS)" ]; then \
 	rm -f $(BUILD_DIR)/*.o; \
@@ -199,7 +210,8 @@ fi)
 
 # Build targets
 all: $(BUILD_DIR)/$(TARGET).elf $(BUILD_DIR)/$(TARGET).hex $(BUILD_DIR)/$(TARGET).bin size
-	@echo "Build mode: $(BUILD_MODE), HW: VER$(HW_VER)"
+	@echo "Build mode: $(BUILD_MODE), HW: VER$(HW_VER), FW: $(FW_VERSION)"
+	@echo "$(FW_VERSION)" > $(BUILD_DIR)/.fw_version
 
 $(BUILD_DIR)/%.o: %.c Makefile | $(BUILD_DIR)
 	@echo "CC $<"
