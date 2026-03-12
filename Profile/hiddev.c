@@ -20,6 +20,7 @@
 #include "devinfoservice.h"
 #include "hidkbd.h"
 #include "hiddev.h"
+#include "immurokservice.h"
 
 /*********************************************************************
  * MACROS
@@ -836,7 +837,21 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
           connSlaveLatency,
           connTimeout, connTimeout * 10);
 
-    // Track whether macOS accepted our latency request
+    // Notify App of param change: [0xF0, interval_hi, interval_lo, latency, timeout_hi, timeout_lo]
+    {
+        uint8_t paramNotif[6];
+        paramNotif[0] = 0xF0;  // PARAM_UPDATE tag
+        paramNotif[1] = (uint8_t)(connInterval >> 8);
+        paramNotif[2] = (uint8_t)(connInterval & 0xFF);
+        paramNotif[3] = (uint8_t)connSlaveLatency;
+        paramNotif[4] = (uint8_t)(connTimeout >> 8);
+        paramNotif[5] = (uint8_t)(connTimeout & 0xFF);
+        ImmurokService_SendResponse(paramNotif, 6);
+    }
+
+    // Track whether macOS accepted our latency request.
+    // macOS pushes fast params (15ms, latency=0, timeout=720ms) after HID activity;
+    // must reset s_latency_accepted so ECC waits for param update before proceeding.
     extern uint8_t s_latency_accepted;
     extern uint8_t hidEmuTaskId;
     if(connSlaveLatency > 0)
@@ -844,6 +859,11 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
         s_latency_accepted = 1;
         tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
         PRINT("Latency accepted!\n");
+    }
+    else if(s_latency_accepted)
+    {
+        s_latency_accepted = 0;
+        PRINT("Latency reverted by host, will re-request\n");
     }
 }
 

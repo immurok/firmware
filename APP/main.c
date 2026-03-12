@@ -185,6 +185,10 @@ int main(void)
 #if(defined(HAL_SLEEP)) && (HAL_SLEEP == TRUE)
     GPIOA_ModeCfg(GPIO_Pin_All, GPIO_ModeIN_PU);
     GPIOB_ModeCfg(GPIO_Pin_All, GPIO_ModeIN_PU);
+#if HAS_VBAT_ADC
+    // Clear pull-up on ADC divider pin — pull-up leaks through resistor network
+    GPIOA_ModeCfg(PIN_VBAT, GPIO_ModeIN_Floating);
+#endif
 #endif
 #ifdef DEBUG
     // UART3: PA5 TX, PA4 RX, 115200 baud (debug output)

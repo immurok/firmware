@@ -2089,6 +2089,8 @@ static int fp_gate_needed(void)
 {
     // Use cached bitmap — avoids blocking fp_wake() (~300ms) in GATT callback
     if(g_cached_fp_bitmap == 0) return 0;
+    // Never verified since boot → always require FP
+    if(s_fp_gate_last_verify == 0) return 1;
     uint32_t now = TMOS_GetSystemClock();
     uint32_t ms_since = (now - s_fp_gate_last_verify) * 625 / 1000;
     if(ms_since > FP_GATE_COOLDOWN_MS) return 1;
