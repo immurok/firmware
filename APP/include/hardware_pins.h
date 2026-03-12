@@ -3,8 +3,9 @@
  *
  * VER0: Original prototype (BTN/Touch/FP_PWR on GPIOA)
  * VER1: Rev.1 board (BTN/Touch/FP_PWR on GPIOB, adds WS2812)
+ * VER2: Rev.2 board (BTN on PB12, RGB LED on PB4/PA12/PA13)
  *
- * Select via Makefile: make VER=0 (default) or make VER=1
+ * Select via Makefile: make VER=0 or make VER=1 or make VER=2
  */
 
 #ifndef HARDWARE_PINS_H
@@ -26,7 +27,65 @@
 // Version-specific pins
 // ============================================================================
 
-#if defined(HARDWARE_VER1)
+#if defined(HARDWARE_VER2)
+
+// --- VER2 Pin Assignments ---
+// Same as VER1 except: BTN moved to PB12, RGB LED on PB4/PA12/PA13 (active low)
+#define PIN_FP_PWR          GPIO_Pin_7      // PB7  - Fingerprint power (active high)
+#define PIN_TOUCH           GPIO_Pin_10     // PB10 - Touch INT (active high)
+#define PIN_BTN             GPIO_Pin_12     // PB12 - Button (active low)
+#define PIN_VBAT            GPIO_Pin_14     // PA14 - Battery voltage (1/2 divider) → AIN4
+#define VBAT_ADC_CH         CH_EXTIN_4      // ADC channel 4
+#define HAS_VBAT_ADC        1
+#define HAS_WS2812          0
+
+// RGB LED (active low: set low = ON, set high = OFF)
+#define PIN_LED_RED         GPIO_Pin_4      // PB4
+#define PIN_LED_GREEN       GPIO_Pin_12     // PA12
+#define PIN_LED_BLUE        GPIO_Pin_13     // PA13
+#define HAS_RGB_LED         1
+
+#define LED_RED_On()        GPIOB_ResetBits(PIN_LED_RED)
+#define LED_RED_Off()       GPIOB_SetBits(PIN_LED_RED)
+#define LED_GREEN_On()      GPIOA_ResetBits(PIN_LED_GREEN)
+#define LED_GREEN_Off()     GPIOA_SetBits(PIN_LED_GREEN)
+#define LED_BLUE_On()       GPIOA_ResetBits(PIN_LED_BLUE)
+#define LED_BLUE_Off()      GPIOA_SetBits(PIN_LED_BLUE)
+
+static inline void LED_RGB_Init(void)
+{
+    // All LEDs off (high = off for active-low)
+    GPIOB_SetBits(PIN_LED_RED);
+    GPIOA_SetBits(PIN_LED_GREEN);
+    GPIOA_SetBits(PIN_LED_BLUE);
+    GPIOB_ModeCfg(PIN_LED_RED, GPIO_ModeOut_PP_5mA);
+    GPIOA_ModeCfg(PIN_LED_GREEN | PIN_LED_BLUE, GPIO_ModeOut_PP_5mA);
+}
+
+// FP power (GPIOB)
+#define FP_PWR_SetHigh()            GPIOB_SetBits(PIN_FP_PWR)
+#define FP_PWR_SetLow()             GPIOB_ResetBits(PIN_FP_PWR)
+#define FP_PWR_SetMode(m)           GPIOB_ModeCfg(PIN_FP_PWR, m)
+
+// Touch INT (GPIOB)
+#define TOUCH_SetMode(m)            GPIOB_ModeCfg(PIN_TOUCH, m)
+#define TOUCH_SetITMode(m)          GPIOB_ITModeCfg(PIN_TOUCH, m)
+#define TOUCH_ReadPin()             (GPIOB_ReadPortPin(PIN_TOUCH) & PIN_TOUCH)
+#define TOUCH_ReadITFlag()          GPIOB_ReadITFlagBit(PIN_TOUCH)
+#define TOUCH_ClearITFlag()         GPIOB_ClearITFlagBit(PIN_TOUCH)
+
+// Button (GPIOB)
+#define BTN_SetMode(m)              GPIOB_ModeCfg(PIN_BTN, m)
+#define BTN_SetITMode(m)            GPIOB_ITModeCfg(PIN_BTN, m)
+#define BTN_ReadPin()               (GPIOB_ReadPortPin(PIN_BTN) & PIN_BTN)
+#define BTN_ReadITFlag()            GPIOB_ReadITFlagBit(PIN_BTN)
+#define BTN_ClearITFlag()           GPIOB_ClearITFlagBit(PIN_BTN)
+
+// GPIO IRQ (BTN and Touch both on GPIOB)
+#define BTN_TOUCH_IRQn              GPIO_B_IRQn
+#define BTN_TOUCH_IRQHandler        GPIOB_IRQHandler
+
+#elif defined(HARDWARE_VER1)
 
 // --- VER1 Pin Assignments ---
 #define PIN_FP_PWR          GPIO_Pin_7      // PB7  - Fingerprint power (active high)
@@ -37,6 +96,7 @@
 #define VBAT_ADC_CH         CH_EXTIN_4      // ADC channel 4
 #define HAS_VBAT_ADC        1
 #define HAS_WS2812          0  // TODO: enable after sleep issue resolved
+#define HAS_RGB_LED         0
 
 // FP power (GPIOB)
 #define FP_PWR_SetHigh()            GPIOB_SetBits(PIN_FP_PWR)
@@ -73,6 +133,7 @@
 #define PIN_TOUCH           GPIO_Pin_13     // PA13 - Touch INT (active high)
 #define PIN_BTN             GPIO_Pin_14     // PA14 - Button (active low)
 #define HAS_WS2812          0
+#define HAS_RGB_LED         0
 
 // FP power (GPIOA)
 #define FP_PWR_SetHigh()            GPIOA_SetBits(PIN_FP_PWR)

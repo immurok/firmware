@@ -26,6 +26,7 @@
 #include "otaprofile.h"
 #include "ota.h"
 #include "hardware_pins.h"
+#include "version.h"
 #if HAS_VBAT_ADC
 #include "CH59x_adc.h"
 #endif
@@ -127,8 +128,9 @@ static uint16_t s_enroll_page_id = 0;
 static uint8_t s_enroll_send_lift = 0;  // Flag: need to send lift finger notification
 static uint8_t s_enroll_send_done = 0;  // Flag: need to send final success response
 
-// AUTH_REQUEST preheat: power on + verify only, don't start search
-static uint8_t s_auth_preheat = 0;
+static uint8_t s_gate_preheat = 0;        // FP gate preheat: module powered, waiting for touch
+static uint8_t s_gate_fail_count = 0;      // FP match failure count in current gate session
+#define FP_GATE_MAX_RETRIES  3             // Max fingerprint attempts before gate failure
 static uint32_t s_fp_power_on_tick = 0;  // RTC tick when fp_power_on() called
 
 // Fingerprint search state machine
@@ -177,6 +179,86 @@ static uint8_t s_ota_reboot_pending = 0;  // Deferred reboot after OTA verificat
 // OTA secure context (for encrypted .imfw upgrades)
 #include "ota_keys.h"
 static ota_secure_ctx_t s_ota_sec = {0};
+
+/*********************************************************************
+ * RGB LED Indicator (VER2 board)
+ */
+#if HAS_RGB_LED
+static uint8_t s_led_task_id;
+#define LED_BLINK_EVT       0x0001
+#define LED_OFF_EVT         0x0002
+#define LED_BLINK_TICKS     800     // 500ms
+#define LED_FLASH_TICKS     320     // 200ms
+#define LED_SOLID_2S_TICKS  3200    // 2s
+
+static uint8_t s_led_color = 0;   // 'R', 'G', 'B', or 0
+static uint8_t s_led_blink = 0;
+static uint8_t s_led_toggle = 0;
+
+static void led_all_off(void)
+{
+    LED_RED_Off(); LED_GREEN_Off(); LED_BLUE_Off();
+}
+
+static void led_on(uint8_t c)
+{
+    led_all_off();
+    if(c == 'R') LED_RED_On();
+    else if(c == 'G') LED_GREEN_On();
+    else if(c == 'B') LED_BLUE_On();
+}
+
+static void led_stop(void)
+{
+    tmos_stop_task(s_led_task_id, LED_BLINK_EVT);
+    tmos_stop_task(s_led_task_id, LED_OFF_EVT);
+    led_all_off();
+    s_led_blink = 0;
+    s_led_color = 0;
+}
+
+// Solid on; auto-off after `ticks` (0 = stay on until next led_* call)
+static void led_solid(uint8_t c, uint16_t ticks)
+{
+    led_stop();
+    s_led_color = c;
+    led_on(c);
+    if(ticks) tmos_start_task(s_led_task_id, LED_OFF_EVT, ticks);
+}
+
+// Slow blink (~1 Hz)
+static void led_blink_start(uint8_t c)
+{
+    led_stop();
+    s_led_color = c;
+    s_led_blink = 1;
+    s_led_toggle = 1;
+    led_on(c);
+    tmos_start_task(s_led_task_id, LED_BLINK_EVT, LED_BLINK_TICKS);
+}
+
+static uint16_t LED_ProcessEvent(uint8_t task_id, uint16_t events)
+{
+    if(events & LED_BLINK_EVT)
+    {
+        if(s_led_blink)
+        {
+            s_led_toggle ^= 1;
+            if(s_led_toggle) led_on(s_led_color);
+            else led_all_off();
+            tmos_start_task(s_led_task_id, LED_BLINK_EVT, LED_BLINK_TICKS);
+        }
+        return events ^ LED_BLINK_EVT;
+    }
+    if(events & LED_OFF_EVT)
+    {
+        led_all_off();
+        s_led_color = 0;
+        return events ^ LED_OFF_EVT;
+    }
+    return 0;
+}
+#endif // HAS_RGB_LED
 
 /*********************************************************************
  * LOCAL FUNCTIONS
@@ -398,6 +480,11 @@ void HidEmu_Init()
     BTN_SetITMode(GPIO_ITMode_FallEdge);
     PFIC_EnableIRQ(BTN_TOUCH_IRQn);
     PRINT("GPIO interrupts enabled\n");
+
+#if HAS_RGB_LED
+    s_led_task_id = TMOS_ProcessEventRegister(LED_ProcessEvent);
+    led_blink_start('B');  // Blue blink = advertising
+#endif
 
     // Initialize security module
     immurok_security_init();
@@ -685,6 +772,13 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 {
                     // Block further touch events until finger is lifted
                     s_wait_finger_lift = 1;
+#if HAS_RGB_LED
+                    if(s_pending_cmd != 0 || immurok_security_has_pending_auth()) {
+                        led_blink_start('G');  // restore blink for gate mode
+                    } else {
+                        led_solid('G', 0);
+                    }
+#endif
 
                     // Send CTRL key to wake host screen, but only when no
                     // gated command is pending (KEY_SIGN, OTP, etc. don't need it)
@@ -767,10 +861,15 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         // Reset power-off timer
         fp_reset_power_timer();
 
-        if(s_auth_preheat) {
-            // AUTH_REQUEST preheat: module is ready, wait for touch GPIO
-            s_auth_preheat = 0;
-            PRINT("FP ready, waiting for touch...\n");
+        if(s_gate_preheat) {
+            // Gate preheat: module is ready, start green LED + wait for touch
+            s_gate_preheat = 0;
+            PRINT("FP ready, green LED, waiting for touch...\n");
+#if HAS_RGB_LED
+            led_blink_start('G');
+#else
+            fp_led_flash(FP_LED_GREEN, 20, 0);  // continuous flash
+#endif
             return (events ^ FP_WAKE_DONE_EVT);
         }
 
@@ -843,10 +942,18 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 {
                     PRINT("FP search timeout + gate expired (%dms), clearing cmd 0x%02X\n",
                           (int)gate_elapsed, s_pending_cmd);
+#if HAS_RGB_LED
+                    led_blink_start('R');
+                    tmos_start_task(s_led_task_id, LED_OFF_EVT, 1600);
+#else
+                    fp_led_flash(FP_LED_RED, 15, 3);
+#endif
                     s_pending_cmd = 0;
                     s_pending_payload_len = 0;
+                    s_gate_fail_count = 0;
                     uint8_t rspBuf[1] = { 0x07 };
                     ImmurokService_SendResponse(rspBuf, 1);
+                    fp_power_off();
                 }
                 else
                 {
@@ -860,7 +967,11 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             else
             {
                 PRINT("FP search timeout\n");
+#if HAS_RGB_LED
+                led_solid('R', LED_FLASH_TICKS);
+#else
                 fp_led_flash(FP_LED_RED, 25, 1);
+#endif
             }
             fp_reset_power_timer();
             return (events ^ FP_SEARCH_EVT);
@@ -928,7 +1039,12 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             {
                 uint16_t page_id = (search_result[0] << 8) | search_result[1];
                 uint16_t match_score = (search_result[2] << 8) | search_result[3];
+#if HAS_RGB_LED
+                led_solid('B', 1600);  // blue 1s
+#else
                 fp_led_flash(FP_LED_BLUE, 25, 1);
+#endif
+                s_gate_fail_count = 0;
                 PRINT("FP matched! id=%d, score=%d\n", page_id, match_score);
 
                 // Match succeeded - power off unless pending cmd needs FP module
@@ -1105,34 +1221,85 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             }
             else
             {
+                // Red LED for failure indication
+#if HAS_RGB_LED
+                led_solid('R', LED_FLASH_TICKS);
+#else
                 fp_led_flash(FP_LED_RED, 25, 1);
+#endif
                 PRINT("FP no match (ack=0x%02X)\n", ack);
-                if(immurok_security_has_pending_auth() || s_pending_cmd != 0)
+
+                // Track gate failure count
+                if(s_pending_cmd != 0 || immurok_security_has_pending_auth())
                 {
-                    // Notify App of mismatch so it can show "Try again" in terminal
-                    PRINT("FP mismatch, notifying App, waiting for retry\n");
+                    s_gate_fail_count++;
+                    PRINT("FP gate fail count: %d/%d\n", s_gate_fail_count, FP_GATE_MAX_RETRIES);
+
+                    if(s_gate_fail_count >= FP_GATE_MAX_RETRIES)
+                    {
+                        // Max retries reached — terminate gate
+                        PRINT("FP gate: max retries reached, cancelling\n");
+#if HAS_RGB_LED
+                        led_blink_start('R');
+                        tmos_start_task(s_led_task_id, LED_OFF_EVT, 1600);  // 1s
+#else
+                        fp_led_flash(FP_LED_RED, 15, 3);  // fast flash 3x
+#endif
+                        if(s_pending_cmd != 0) {
+                            s_pending_cmd = 0;
+                            s_pending_payload_len = 0;
+                            uint8_t rspBuf[1] = { 0x07 };
+                            ImmurokService_SendResponse(rspBuf, 1);
+                        }
+                        if(immurok_security_has_pending_auth()) {
+                            uint8_t rspBuf[1] = { 0x07 };
+                            ImmurokService_SendResponse(rspBuf, 1);
+                            immurok_security_auth_cancel();
+                        }
+                        s_gate_fail_count = 0;
+                        fp_power_off();
+                        break;
+                    }
+
+                    // Not max retries — notify App + check gate timeout
                     uint8_t notifyBuf[1] = { 0x07 };  // FP_NOT_MATCH
                     ImmurokService_SendResponse(notifyBuf, 1);
-                }
-                // Check overall gate timeout for pending commands
-                if(s_pending_cmd != 0)
-                {
-                    uint32_t gate_elapsed = (TMOS_GetSystemClock() - s_pending_cmd_start) * 625 / 1000;
-                    if(gate_elapsed > FP_GATE_TIMEOUT_MS)
+
+                    if(s_pending_cmd != 0)
                     {
-                        PRINT("FP gate timeout (%dms), cancelling pending cmd 0x%02X\n",
-                              (int)gate_elapsed, s_pending_cmd);
-                        s_pending_cmd = 0;
-                        uint8_t rspBuf[1];
-                        rspBuf[0] = 0x07;  // AUTH_FAIL / gate timeout
-                        ImmurokService_SendResponse(rspBuf, 1);
-                    }
-                    else
-                    {
-                        PRINT("FP gate: retry (%dms/%dms)\n", (int)gate_elapsed, FP_GATE_TIMEOUT_MS);
+                        uint32_t gate_elapsed = (TMOS_GetSystemClock() - s_pending_cmd_start) * 625 / 1000;
+                        if(gate_elapsed > FP_GATE_TIMEOUT_MS)
+                        {
+                            PRINT("FP gate timeout (%dms), cancelling pending cmd 0x%02X\n",
+                                  (int)gate_elapsed, s_pending_cmd);
+#if HAS_RGB_LED
+                            led_blink_start('R');
+                            tmos_start_task(s_led_task_id, LED_OFF_EVT, 1600);
+#else
+                            fp_led_flash(FP_LED_RED, 15, 3);
+#endif
+                            s_pending_cmd = 0;
+                            s_pending_payload_len = 0;
+                            uint8_t rspBuf[1] = { 0x07 };
+                            ImmurokService_SendResponse(rspBuf, 1);
+                            s_gate_fail_count = 0;
+                            fp_power_off();
+                            break;
+                        }
+                        else
+                        {
+                            PRINT("FP gate: retry (%dms/%dms)\n", (int)gate_elapsed, FP_GATE_TIMEOUT_MS);
+                        }
                     }
                 }
-                // No match - keep power on for retry via next touch IRQ
+
+                // Restore green LED for next attempt (VER0 only — VER2 restores in TOUCH_SCAN_EVT)
+#if !HAS_RGB_LED
+                if(s_pending_cmd != 0 || immurok_security_has_pending_auth()) {
+                    fp_led_flash(FP_LED_GREEN, 20, 0);  // continuous flash
+                }
+#endif
+                // Keep power on for retry via next touch IRQ
                 fp_reset_power_timer();
             }
             break;
@@ -1203,6 +1370,9 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             PRINT("ENROLL_EVT: starting slot %d\n", s_enroll_page_id);
             enroll_step = 1;
             enroll_start = TMOS_GetSystemClock();
+#if HAS_RGB_LED
+            led_blink_start('G');  // Green blink = waiting for finger
+#endif
             // Send initial status: [0x11, status=0(waiting), current=0, total=6]
             rspBuf[0] = 0x11;
             rspBuf[1] = 0;     // FP_ENROLL_WAITING
@@ -1215,6 +1385,9 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             // Send lift finger notification (delayed from previous capture)
             uint8_t capture_num = s_enroll_send_lift;
             s_enroll_send_lift = 0;
+#if HAS_RGB_LED
+            led_blink_start('G');  // Green blink = waiting for next finger
+#endif
             rspBuf[0] = 0x11;
             rspBuf[1] = 3;     // FP_ENROLL_LIFT_FINGER
             rspBuf[2] = capture_num;
@@ -1243,6 +1416,9 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
                 if(ret == FP_OK && ack == 0x00) {
                     PRINT("ENROLL_EVT: captured %d/6\n", capture_num);
+#if HAS_RGB_LED
+                    led_solid('G', 0);  // Green solid = captured
+#endif
                     // [0x11, status=1(captured), current, total]
                     rspBuf[0] = 0x11;
                     rspBuf[1] = 1;     // FP_ENROLL_CAPTURED
@@ -1327,6 +1503,9 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
             if(ret == FP_OK && ack == 0x00) {
                 PRINT("ENROLL_EVT: SUCCESS!\n");
+#if HAS_RGB_LED
+                led_stop();
+#endif
                 // Send completion progress notification first
                 // Status 4 = FP_ENROLL_COMPLETE (custom status for completion)
                 rspBuf[0] = 0x11;
@@ -1663,6 +1842,12 @@ static void hidEmuSendCtrlKey(void)
 {
     uint8_t buf[HID_KEYBOARD_IN_RPT_LEN] = {0};
 
+    // Cancel any pending key-release timer and send immediate release first,
+    // to prevent Ctrl from "sticking" if called multiple times (e.g. ACK retry)
+    tmos_stop_task(hidEmuTaskId, HID_KEY_RELEASE_EVT);
+    HidDev_Report(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT,
+                  HID_KEYBOARD_IN_RPT_LEN, buf);
+
     // Press: LEFT_CTRL modifier only
     buf[0] = 0x01;  // LEFT_CTRL
     HidDev_Report(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT,
@@ -1699,6 +1884,9 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
             if(pEvent->gap.opcode == GAP_MAKE_DISCOVERABLE_DONE_EVENT)
             {
                 PRINT("Advertising..\n");
+#if HAS_RGB_LED
+                led_blink_start('B');
+#endif
             }
             break;
 
@@ -1715,6 +1903,9 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_FAST_INT);
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MAX, ADV_FAST_INT);
                 PRINT("Connected..\n");
+#if HAS_RGB_LED
+                led_solid('B', LED_SOLID_2S_TICKS);
+#endif
                 // Print connection parameters
                 // Interval: unit 1.25ms, Latency: events, Timeout: unit 10ms
                 PRINT("Conn params: Interval=%d (%d.%02dms), Latency=%d, Timeout=%d (%dms)\n",
@@ -1740,6 +1931,9 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
             else if(pEvent->gap.opcode == GAP_LINK_TERMINATED_EVENT)
             {
                 PRINT("Disconnected.. Reason:%x\n", pEvent->linkTerminate.reason);
+#if HAS_RGB_LED
+                led_blink_start('B');
+#endif
                 // Clear pending FP gate state
                 s_pending_cmd = 0;
                 s_pending_payload_len = 0;
@@ -1751,6 +1945,9 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 s_long_op_wait_start = 0;
                 s_long_op_busy = 0;
                 tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                tmos_stop_task(hidEmuTaskId, HID_KEY_RELEASE_EVT);
+                tmos_stop_task(hidEmuTaskId, FP_NOTIFY_RETRY_EVT);
+                s_fp_notify_pending = 0;
                 // Start fast advertising, schedule switch to slow after 30s
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_FAST_INT);
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MAX, ADV_FAST_INT);
@@ -1899,6 +2096,39 @@ static int fp_gate_needed(void)
     return 0;
 }
 
+/* Unified FP gate preheat: power on + green LED + wait for touch.
+ * Called from command handlers after fp_gate_needed() returns true.
+ * Module will be ready for instant search when user touches sensor. */
+static void fp_gate_enter(void)
+{
+    s_gate_fail_count = 0;
+
+    // Request param update early — ECDSA needs supervision timeout > 2s.
+    // By requesting now (while user presses finger), params may be accepted
+    // before FP_GATE_EXEC_EVT needs them, avoiding the blocking wait.
+    if(!s_latency_accepted) {
+        tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+    }
+
+    if(!fp_is_powered()) {
+        fp_power_on();
+        s_fp_power_on_tick = RTC_GetCycle32k();
+        s_gate_preheat = 1;
+        tmos_start_task(hidEmuTaskId, FP_WAKE_DONE_EVT, 48);  // 30ms
+    } else if(!fp_is_ready()) {
+        s_gate_preheat = 1;
+        tmos_start_task(hidEmuTaskId, FP_WAKE_DONE_EVT, 16);  // 10ms
+    } else {
+        // Already powered and ready — just start green LED
+        PRINT("FP already ready, green LED\n");
+#if HAS_RGB_LED
+        led_blink_start('G');
+#else
+        fp_led_flash(FP_LED_GREEN, 20, 0);
+#endif
+    }
+}
+
 static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t len)
 {
     static uint8_t rspBuf[IMMUROK_RSP_MAX_LEN];  // static: save 64B stack (only 512B total)
@@ -1938,7 +2168,11 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             uint8_t batt = 0;
             Batt_GetParameter(BATT_PARAM_LEVEL, &batt);
             rspBuf[3] = batt;
-            rspLen = 4;
+            // Firmware version (macOS blocks standard Device Info Service for HID)
+            rspBuf[4] = FW_VERSION_MAJOR;
+            rspBuf[5] = FW_VERSION_MINOR;
+            rspBuf[6] = FW_VERSION_PATCH;
+            rspLen = 7;
         }
         break;
 
@@ -1982,6 +2216,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                     s_pending_cmd_start = TMOS_GetSystemClock();
                     s_pending_payload[0] = slotId;
                     s_pending_payload_len = 1;
+                    fp_gate_enter();
                     rspBuf[0] = IMMUROK_RSP_WAIT_FP;
                 } else {
                     // No fingerprints yet, allow directly
@@ -2012,6 +2247,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 s_pending_cmd_start = TMOS_GetSystemClock();
                 s_pending_payload[0] = slotId;
                 s_pending_payload_len = 1;
+                fp_gate_enter();
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
             } else {
                 // No fingerprints exist — nothing to delete
@@ -2025,20 +2261,8 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
         PRINT("  AUTH_REQUEST\n");
         {
             immurok_security_set_auth_state(AUTH_STATE_WAIT_FINGERPRINT);
+            fp_gate_enter();
             rspBuf[0] = IMMUROK_RSP_WAIT_FP;
-
-            // Preheat FP module (power on + verify) but don't start search.
-            // Search will be triggered by touch GPIO interrupt.
-            if(!fp_is_powered()) {
-                s_auth_preheat = 1;
-                fp_power_on();
-                s_fp_power_on_tick = RTC_GetCycle32k();
-                tmos_start_task(hidEmuTaskId, FP_WAKE_DONE_EVT, 48);  // 30ms (poll for 0x55)
-            } else if(!fp_is_ready()) {
-                s_auth_preheat = 1;
-                tmos_start_task(hidEmuTaskId, FP_WAKE_DONE_EVT, 16);  // 10ms delay
-            }
-            // If already ready, just wait for touch — no action needed
         }
         break;
 
@@ -2051,6 +2275,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 s_pending_cmd = IMMUROK_CMD_PAIR_INIT;
                 s_pending_cmd_start = TMOS_GetSystemClock();
                 s_pending_payload_len = 0;
+                fp_gate_enter();
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
                 break;
             }
@@ -2120,6 +2345,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 s_pending_cmd = IMMUROK_CMD_FACTORY_RESET;
                 s_pending_cmd_start = TMOS_GetSystemClock();
                 s_pending_payload_len = 0;
+                fp_gate_enter();
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
             } else {
                 // No fingerprints, reset directly
@@ -2258,6 +2484,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 s_pending_payload[0] = cat;
                 s_pending_payload[1] = idx;
                 s_pending_payload_len = 2;
+                fp_gate_enter();
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
             } else {
                 rspBuf[0] = (immurok_keystore_delete(cat, idx) == 0)
@@ -2285,6 +2512,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 s_pending_payload[0] = cat;
                 s_pending_payload[1] = idx;
                 s_pending_payload_len = 2;
+                fp_gate_enter();
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
             } else {
                 rspBuf[0] = (immurok_keystore_commit(cat, idx) == 0)
@@ -2325,12 +2553,17 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
 
                 if(fp_gate_needed()) {
                     PRINT("  FP gate: caching KEY_SIGN\n");
+                    fp_gate_enter();
                     rspBuf[0] = IMMUROK_RSP_WAIT_FP;
                 } else {
-                    // No FP enrolled — sign immediately via TMOS event
-                    PRINT("  KEY_SIGN deferred to TMOS\n");
-                    tmos_set_event(hidEmuTaskId, FP_GATE_EXEC_EVT);
-                    return;  // Response sent from TMOS event handler
+                    // Cooldown — approved implicitly, defer ECDSA to TMOS
+                    // Send 0x10 explicitly + 80ms delay (like FP gate path)
+                    // so BLE flushes notification before ECC blocks (~2s)
+                    PRINT("  KEY_SIGN cooldown, deferred to TMOS\n");
+                    uint8_t fpApproved[1] = { 0x10 };
+                    ImmurokService_SendResponse(fpApproved, 1);
+                    tmos_start_task(hidEmuTaskId, FP_GATE_EXEC_EVT, 128);  // 80ms
+                    return;
                 }
             } else {
                 // Partial hash received, ACK
@@ -2377,6 +2610,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
 
             if(fp_gate_needed()) {
                 PRINT("  FP gate: caching KEY_GENERATE\n");
+                fp_gate_enter();
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
             } else {
                 PRINT("  KEY_GENERATE deferred to TMOS\n");
@@ -2439,6 +2673,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 s_pending_payload[3] = pData[5];
                 s_pending_payload[4] = pData[6];
                 s_pending_payload_len = 5;
+                fp_gate_enter();
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
             } else {
                 // No fingerprints enrolled, compute directly
@@ -2834,8 +3069,8 @@ void BTN_TOUCH_IRQHandler(void)
 }
 
 
-#if defined(HARDWARE_VER1)
-// VER1: BTN/TOUCH on GPIOB - stub GPIOA handler prevents
+#if defined(HARDWARE_VER1) || defined(HARDWARE_VER2)
+// VER1/VER2: BTN/TOUCH on GPIOB - stub GPIOA handler prevents
 // stray GPIOA interrupts hitting default infinite-loop -> watchdog reset
 __INTERRUPT
 __HIGH_CODE

@@ -200,6 +200,13 @@ int main(void)
     ws2812_init();
 #endif
 
+#if HAS_RGB_LED
+    LED_RGB_Init();
+    LED_RED_On();
+    DelayMs(200);   // Red flash once = system startup
+    LED_RED_Off();
+#endif
+
     // Initialize fingerprint module
     extern uint8_t g_cached_fp_bitmap;
     int fp_ret = fp_init();
@@ -221,7 +228,7 @@ int main(void)
     HAL_Init();
     GAPRole_PeripheralInit();
     HidDev_Init();
-    HidEmu_Init();
+    HidEmu_Init();  // LED task registered here → blue blink starts
 
     // 打印上次复位原因
     PRINT("Reset status: 0x%02X\n", R8_RESET_STATUS & 0x07);
