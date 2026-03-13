@@ -97,9 +97,9 @@
 // Button scan interval (in 625us units, 160 = 100ms)
 #define BUTTON_SCAN_INTERVAL    160
 
-// Fingerprint power off delay (10 seconds in 625us units)
-// 10000ms / 0.625ms = 16000
-#define FP_POWER_OFF_DELAY      16000
+// Fingerprint power off delay (in 625us units)
+#define FP_POWER_OFF_DELAY        16000   // 10s: normal idle
+#define FP_GATE_POWER_OFF_DELAY   48000   // 30s: gate active (matches App timeout)
 
 // Advertising intervals (units of 0.625ms)
 #define ADV_FAST_INT             48     // 30ms - fast reconnection after disconnect
@@ -266,12 +266,13 @@ static uint16_t LED_ProcessEvent(uint8_t task_id, uint16_t events)
  */
 
 // Reset fingerprint power-off timer (call after any FP operation)
+// Uses 30s when gate is active (pending cmd or auth), 10s otherwise
 static void fp_reset_power_timer(void)
 {
-    // Cancel any pending power-off event
     tmos_stop_task(hidEmuTaskId, FP_POWER_OFF_EVT);
-    // Schedule new power-off event in 10 seconds
-    tmos_start_task(hidEmuTaskId, FP_POWER_OFF_EVT, FP_POWER_OFF_DELAY);
+    uint16_t delay = (s_pending_cmd != 0 || immurok_security_has_pending_auth())
+                     ? FP_GATE_POWER_OFF_DELAY : FP_POWER_OFF_DELAY;
+    tmos_start_task(hidEmuTaskId, FP_POWER_OFF_EVT, delay);
 }
 
 // Ensure fingerprint module is ready for operation
@@ -955,7 +956,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     s_pending_cmd = 0;
                     s_pending_payload_len = 0;
                     s_gate_fail_count = 0;
-                    uint8_t rspBuf[1] = { 0x07 };
+                    uint8_t rspBuf[1] = { SEC_ERR_TIMEOUT };
                     ImmurokService_SendResponse(rspBuf, 1);
                     fp_power_off();
                 }
@@ -1227,16 +1228,29 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             }
             else
             {
+                PRINT("FP no match (ack=0x%02X)\n", ack);
+                uint8_t in_gate = (s_pending_cmd != 0 || immurok_security_has_pending_auth());
+
                 // Red LED for failure indication
 #if HAS_RGB_LED
-                led_solid('R', LED_FLASH_TICKS);
+                if(in_gate) {
+                    // Gate mode: brief red, then restore green blink for retry
+                    led_stop();
+                    led_on('R');
+                    // After 500ms, LED_BLINK_EVT restarts green blink
+                    s_led_color = 'G';
+                    s_led_blink = 1;
+                    s_led_toggle = 0;
+                    tmos_start_task(s_led_task_id, LED_BLINK_EVT, 800);  // 500ms red then green blink
+                } else {
+                    led_solid('R', LED_FLASH_TICKS);
+                }
 #else
                 fp_led_flash(FP_LED_RED, 25, 1);
 #endif
-                PRINT("FP no match (ack=0x%02X)\n", ack);
 
                 // Track gate failure count
-                if(s_pending_cmd != 0 || immurok_security_has_pending_auth())
+                if(in_gate)
                 {
                     s_gate_fail_count++;
                     PRINT("FP gate fail count: %d/%d\n", s_gate_fail_count, FP_GATE_MAX_RETRIES);
@@ -1254,11 +1268,11 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                         if(s_pending_cmd != 0) {
                             s_pending_cmd = 0;
                             s_pending_payload_len = 0;
-                            uint8_t rspBuf[1] = { 0x07 };
+                            uint8_t rspBuf[1] = { SEC_ERR_TIMEOUT };
                             ImmurokService_SendResponse(rspBuf, 1);
                         }
                         if(immurok_security_has_pending_auth()) {
-                            uint8_t rspBuf[1] = { 0x07 };
+                            uint8_t rspBuf[1] = { SEC_ERR_TIMEOUT };
                             ImmurokService_SendResponse(rspBuf, 1);
                             immurok_security_auth_cancel();
                         }
@@ -1286,7 +1300,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 #endif
                             s_pending_cmd = 0;
                             s_pending_payload_len = 0;
-                            uint8_t rspBuf[1] = { 0x07 };
+                            uint8_t rspBuf[1] = { SEC_ERR_TIMEOUT };
                             ImmurokService_SendResponse(rspBuf, 1);
                             s_gate_fail_count = 0;
                             fp_power_off();
@@ -1604,6 +1618,25 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         if(fp_is_powered() && !s_enroll_active) {
             PRINT("FP idle timeout - powering off\n");
             fp_power_off();
+            // Clear stale gate state — user didn't touch within power-off window
+            if(s_pending_cmd != 0) {
+                PRINT("FP idle: clearing stale pending cmd 0x%02X\n", s_pending_cmd);
+                s_pending_cmd = 0;
+                s_pending_payload_len = 0;
+                s_gate_fail_count = 0;
+#if HAS_RGB_LED
+                led_solid('R', 1600);  // red 1s
+#endif
+                uint8_t rspBuf[1] = { SEC_ERR_TIMEOUT };  // 0x06: gate timeout (distinct from 0x07 FP_NOT_MATCH)
+                ImmurokService_SendResponse(rspBuf, 1);
+            }
+            if(immurok_security_has_pending_auth()) {
+                PRINT("FP idle: clearing stale auth\n");
+                immurok_security_auth_cancel();
+#if HAS_RGB_LED
+                led_solid('R', 1600);
+#endif
+            }
         }
         return (events ^ FP_POWER_OFF_EVT);
     }
@@ -2144,6 +2177,7 @@ static void fp_gate_enter(void)
 #else
         fp_led_flash(FP_LED_GREEN, 20, 0);
 #endif
+        fp_reset_power_timer();  // extend to 30s (gate active)
     }
 }
 
@@ -2724,7 +2758,16 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             PRINT("  Clearing pending cmd 0x%02X\n", s_pending_cmd);
             s_pending_cmd = 0;
             s_pending_payload_len = 0;
+#if HAS_RGB_LED
+            led_solid('R', 1600);  // red 1s
+#endif
             fp_power_off();
+        }
+        if(immurok_security_has_pending_auth()) {
+            immurok_security_auth_cancel();
+#if HAS_RGB_LED
+            led_solid('R', 1600);
+#endif
         }
         rspBuf[0] = IMMUROK_RSP_OK;
         break;
