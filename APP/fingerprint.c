@@ -81,7 +81,8 @@
 // ============================================================================
 
 static bool s_powered_on = false;
-volatile uint8_t g_sleep_inhibit = 0;  // Non-zero: suppress HAL_SLEEP (set while FP module active)
+volatile uint8_t g_sleep_inhibit = 0;  // Reference count: >0 suppresses HAL_SLEEP. Multiple sources
+                                       // (FP module, BLE short timeout) can independently hold it.
 static uint32_t s_power_on_tick = 0;  // RTC tick at power-on (for timing measurement)
 static bool s_initialized = false;
 static bool s_password_verified = false;
@@ -385,7 +386,7 @@ void fp_power_on(void)
     // Re-initialize UART1 pins (were set to pull-down in fp_power_off)
     uart_init();
     s_powered_on = true;
-    g_sleep_inhibit = 1;  // Suppress sleep while FP module is active
+    g_sleep_inhibit++;  // Suppress sleep while FP module is active
     s_power_on_tick = RTC_GetCycle32k();
     PRINT("Fingerprint power ON\n");
 }
@@ -404,7 +405,7 @@ void fp_power_off(void)
     R8_SLP_CLK_OFF0 |= RB_SLP_CLK_UART1;
     sys_safe_access_disable();
     s_powered_on = false;
-    g_sleep_inhibit = 0;  // Allow sleep again
+    if(g_sleep_inhibit > 0) g_sleep_inhibit--;  // Release FP hold on sleep inhibit
     s_password_verified = false;  // Need to re-verify after power on
     PRINT("Fingerprint power OFF\n");
 }
@@ -969,7 +970,7 @@ int fp_get_template_count(uint16_t *count)
     return FP_OK;
 }
 
-int fp_get_fingerprint_bitmap(uint8_t *bitmap)
+int fp_get_fingerprint_bitmap(uint16_t *bitmap)
 {
     if (!fp_is_ready() || !bitmap) {
         return FP_ERR_FAIL;
@@ -977,7 +978,7 @@ int fp_get_fingerprint_bitmap(uint8_t *bitmap)
 
     // CMD_READ_INDEX_TAB (0x1F) reads index table
     // Parameter: page number (0-3), each page covers 256 templates
-    // For immurok we only need page 0 (slots 0-4)
+    // For immurok we only need page 0 (slots 0-9 for dual-slot)
     uint8_t params[1] = { 0 };  // Page 0
 
     fp_send_cmd(CMD_READ_INDEX_TAB, params, 1);
@@ -995,11 +996,12 @@ int fp_get_fingerprint_bitmap(uint8_t *bitmap)
 
     // Response contains 32 bytes of bitmap (256 bits for 256 templates)
     // Each bit represents whether a template exists at that slot
-    // For immurok, we only care about bits 0-4 (slots 0-4)
-    // The bitmap is in s_rx_buf[10..41], first byte covers slots 0-7
-    *bitmap = s_rx_buf[10] & 0x1F;  // Only keep bits 0-4 (max 5 fingerprints)
+    // The bitmap is in s_rx_buf[10..41], first byte covers slots 0-7, second byte 8-15
+    // For dual-slot we need bits 0-9 (FP_SLOT_MAX=10)
+    *bitmap = (uint16_t)(s_rx_buf[10]) | ((uint16_t)(s_rx_buf[11]) << 8);
+    *bitmap &= ((1 << FP_SLOT_MAX) - 1);  // Keep only bits 0-9
 
-    PRINT("Fingerprint bitmap: 0x%02X\n", *bitmap);
+    PRINT("Fingerprint raw bitmap: 0x%04X\n", *bitmap);
 
     return FP_OK;
 }

@@ -16,6 +16,18 @@
 #define FP_MAX_TEMPLATES        29      // Maximum fingerprint templates (0-28)
 #define FP_UART_BAUD            57600   // UART baud rate (8N2)
 
+// Dual-slot fingerprint configuration
+#define FP_USER_MAX             5       // Max user-visible fingerprints (adjustable: 6, 10, etc.)
+#define FP_SLOTS_PER_FINGER     2       // Physical slots per fingerprint
+#define FP_SLOT_MAX             (FP_USER_MAX * FP_SLOTS_PER_FINGER)  // 10
+
+// Mapping: user finger_id → physical slot
+#define FP_SLOT_FIRST(fid)      ((fid) * FP_SLOTS_PER_FINGER)
+#define FP_SLOT_SECOND(fid)     ((fid) * FP_SLOTS_PER_FINGER + 1)
+
+// Reverse mapping: physical slot → user finger_id
+#define FP_FINGER_ID(slot)      ((slot) / FP_SLOTS_PER_FINGER)
+
 // Response buffer size
 #define FP_RX_BUF_SIZE          128
 
@@ -64,6 +76,9 @@ typedef enum {
     FP_ENROLL_CAPTURED = 1,     // Finger captured
     FP_ENROLL_PROCESSING = 2,   // Processing/merging
     FP_ENROLL_LIFT_FINGER = 3,  // Lift finger for next capture
+    FP_ENROLL_COMPLETE = 4,     // Enrollment complete
+    FP_ENROLL_ADJUST = 5,       // Adjust finger angle for second slot
+    FP_ENROLL_FAILED = 0xFF,    // Enrollment failed
 } fp_enroll_event_t;
 
 // LED control modes
@@ -143,7 +158,7 @@ int fp_get_template_count(uint16_t *count);
  * @param bitmap Output bitmap (bit 0-4 for slots 0-4)
  * @return FP_OK on success
  */
-int fp_get_fingerprint_bitmap(uint8_t *bitmap);
+int fp_get_fingerprint_bitmap(uint16_t *bitmap);
 
 /**
  * Search for a fingerprint

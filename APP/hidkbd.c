@@ -61,16 +61,16 @@
 #define DEFAULT_DESIRED_MIN_CONN_INTERVAL    24
 
 // Maximum connection interval (units of 1.25ms)
-// 40 = 50ms
-#define DEFAULT_DESIRED_MAX_CONN_INTERVAL    40
+// 48 = 60ms
+#define DEFAULT_DESIRED_MAX_CONN_INTERVAL    48
 
 // Slave latency to use if parameter update request
-// 29 = skip up to 29 intervals; effective idle interval = 50ms * 30 = 1.5s
-// Keystroke wakes immediately, latency drops back to 30-50ms
-#define DEFAULT_DESIRED_SLAVE_LATENCY        29
+// 20 = skip up to 20 intervals; effective idle interval = 60ms * 21 = 1.26s
+// Keystroke wakes immediately, latency drops back to 30-60ms
+#define DEFAULT_DESIRED_SLAVE_LATENCY        20
 
 // Supervision timeout value (units of 10ms)
-// Apple requires: timeout > intervalMax * (latency + 1) * 3 = 50ms * 30 * 3 = 4500ms
+// Apple requires: timeout > intervalMax * (latency + 1) * 3 = 60ms * 21 * 3 = 3780ms
 // 600 = 6s (Apple max = 6s)
 #define DEFAULT_DESIRED_CONN_TIMEOUT         600
 
@@ -109,6 +109,18 @@
 // 30000ms / 0.625ms = 48000
 #define SLOW_ADV_DELAY           48000
 
+// Delay before switching to deep-slow advertising (5min after slow)
+// 300000ms / 0.625ms = 480000 — exceeds uint16_t, split into 2.5min chunks
+#define DEEP_SLOW_ADV_DELAY      48000   // reuse 30s: counted by s_adv_slow_count
+#define DEEP_SLOW_ADV_COUNTS     10      // 30s × 10 = 5 minutes
+#define ADV_DEEP_SLOW_INT        48000   // 30s interval (0.625ms units)
+
+// Advertising phase state machine
+#define ADV_PHASE_OFF        0   // Not advertising
+#define ADV_PHASE_FAST       1   // 30ms, 30s duration
+#define ADV_PHASE_SLOW       2   // 5s, 5min duration
+#define ADV_PHASE_DEEP_SLOW  3   // 30s, indefinite, LED 0.25s/5s
+
 /*********************************************************************
  * TYPEDEFS
  */
@@ -122,7 +134,8 @@ uint8_t hidEmuTaskId = INVALID_TASK_ID;
 
 // Fingerprint enrollment state
 static uint8_t s_enroll_active = 0;
-static uint16_t s_enroll_page_id = 0;
+static uint16_t s_enroll_page_id = 0;   // User finger ID (0 to FP_USER_MAX-1)
+static uint8_t s_enroll_round = 0;      // 0=first slot, 1=second slot
 static uint8_t s_enroll_send_lift = 0;  // Flag: need to send lift finger notification
 static uint8_t s_enroll_send_done = 0;  // Flag: need to send final success response
 
@@ -141,7 +154,7 @@ static uint8_t s_search_state = 0;   // 0=GET_IMAGE, 1=GEN_CHAR, 2=SEARCH
 static uint32_t s_search_start_time = 0;
 static uint8_t s_wait_finger_lift = 0;  // Block new search until finger lifted
 
-#define FP_SEARCH_TIMEOUT_MS    500   // 0.5 second timeout
+#define FP_SEARCH_TIMEOUT_MS    1500  // 1.5s: GET_IMAGE+GEN_CHAR+SEARCH each ~300ms with TMOS overhead
 
 // Fingerprint notify retry state (HID wake + ACK mechanism)
 static uint8_t s_fp_notify_pending = 0;     // Has pending notification awaiting ACK
@@ -162,11 +175,29 @@ static uint32_t s_fp_gate_last_verify = 0;  // TMOS tick of last FP verification
 
 // Cached fingerprint bitmap (updated at init/enroll/delete, used by GET_STATUS)
 // Extern: set from main.c after fp_init, avoids blocking in GATT callback
-uint8_t g_cached_fp_bitmap = 0;
+uint16_t g_cached_fp_bitmap = 0;
+
+// Convert raw physical bitmap to user-visible bitmap
+// Both physical slots must be present for a finger to count as enrolled
+static uint8_t fp_user_bitmap(void)
+{
+    uint8_t ubm = 0;
+    for(int i = 0; i < FP_USER_MAX; i++) {
+        if((g_cached_fp_bitmap & (1 << FP_SLOT_FIRST(i))) &&
+           (g_cached_fp_bitmap & (1 << FP_SLOT_SECOND(i)))) {
+            ubm |= (1 << i);
+        }
+    }
+    return ubm;
+}
 
 // GPIO interrupt flags (set in ISR, consumed in TMOS event loop)
 volatile uint8_t g_touch_irq_flag = 0;
 volatile uint8_t g_btn_irq_flag = 0;
+
+// Advertising phase tracking
+static uint8_t s_adv_phase = ADV_PHASE_OFF;
+static uint8_t s_adv_slow_count = 0;  // counts SLOW_ADV_EVT ticks toward deep-slow
 
 // OTA IAP state
 static OTA_IAP_CMD_t s_ota_iap_data;
@@ -188,13 +219,21 @@ static ota_secure_ctx_t s_ota_sec = {0};
 static uint8_t s_led_task_id;
 #define LED_BLINK_EVT       0x0001
 #define LED_OFF_EVT         0x0002
-#define LED_BLINK_TICKS     800     // 500ms
+#define LED_BLINK_TICKS     800     // 500ms (default on & off)
 #define LED_FLASH_TICKS     320     // 200ms
 #define LED_SOLID_2S_TICKS  3200    // 2s
+
+// Advertising phase LED patterns (on/off in 625us units)
+#define LED_ADV_SLOW_ON     800     // 500ms on
+#define LED_ADV_SLOW_OFF    1600    // 1s off
+#define LED_ADV_DSLOW_ON    400     // 250ms on
+#define LED_ADV_DSLOW_OFF   8000    // 5s off
 
 static uint8_t s_led_color = 0;   // 'R', 'G', 'B', or 0
 static uint8_t s_led_blink = 0;
 static uint8_t s_led_toggle = 0;
+static uint16_t s_led_on_ticks = LED_BLINK_TICKS;   // on duration
+static uint16_t s_led_off_ticks = LED_BLINK_TICKS;  // off duration
 
 static void led_all_off(void)
 {
@@ -227,15 +266,23 @@ static void led_solid(uint8_t c, uint16_t ticks)
     if(ticks) tmos_start_task(s_led_task_id, LED_OFF_EVT, ticks);
 }
 
-// Slow blink (~1 Hz)
-static void led_blink_start(uint8_t c)
+// Blink with custom on/off durations (625us units)
+static void led_blink_start_ex(uint8_t c, uint16_t on_ticks, uint16_t off_ticks)
 {
     led_stop();
     s_led_color = c;
     s_led_blink = 1;
     s_led_toggle = 1;
+    s_led_on_ticks = on_ticks;
+    s_led_off_ticks = off_ticks;
     led_on(c);
-    tmos_start_task(s_led_task_id, LED_BLINK_EVT, LED_BLINK_TICKS);
+    tmos_start_task(s_led_task_id, LED_BLINK_EVT, on_ticks);
+}
+
+// Default symmetric blink (~1 Hz, 500ms on / 500ms off)
+static void led_blink_start(uint8_t c)
+{
+    led_blink_start_ex(c, LED_BLINK_TICKS, LED_BLINK_TICKS);
 }
 
 static uint16_t LED_ProcessEvent(uint8_t task_id, uint16_t events)
@@ -245,9 +292,13 @@ static uint16_t LED_ProcessEvent(uint8_t task_id, uint16_t events)
         if(s_led_blink)
         {
             s_led_toggle ^= 1;
-            if(s_led_toggle) led_on(s_led_color);
-            else led_all_off();
-            tmos_start_task(s_led_task_id, LED_BLINK_EVT, LED_BLINK_TICKS);
+            if(s_led_toggle) {
+                led_on(s_led_color);
+                tmos_start_task(s_led_task_id, LED_BLINK_EVT, s_led_on_ticks);
+            } else {
+                led_all_off();
+                tmos_start_task(s_led_task_id, LED_BLINK_EVT, s_led_off_ticks);
+            }
         }
         return events ^ LED_BLINK_EVT;
     }
@@ -283,6 +334,26 @@ static int fp_ensure_ready(void)
         fp_reset_power_timer();
     }
     return ret;
+}
+
+// Restart fast advertising cycle (fast 30s → slow 5min → deep-slow)
+// Called when user touches sensor or presses button during slow/deep-slow phase
+static void adv_restart_fast_cycle(void)
+{
+    if(s_adv_phase == ADV_PHASE_FAST) return;  // already fast
+    PRINT("ADV: restart fast cycle (was phase %d)\n", s_adv_phase);
+    s_adv_phase = ADV_PHASE_FAST;
+    s_adv_slow_count = 0;
+    tmos_stop_task(hidEmuTaskId, SLOW_ADV_EVT);
+    GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_FAST_INT);
+    GAP_SetParamValue(TGAP_DISC_ADV_INT_MAX, ADV_FAST_INT);
+    GAP_SetParamValue(TGAP_LIM_ADV_TIMEOUT, 0);  // no timeout (we manage via SLOW_ADV_EVT)
+    uint8_t adv_enable = TRUE;
+    GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &adv_enable);
+    tmos_start_task(hidEmuTaskId, SLOW_ADV_EVT, SLOW_ADV_DELAY);
+#if HAS_RGB_LED
+    led_blink_start('B');
+#endif
 }
 
 /*********************************************************************
@@ -372,7 +443,7 @@ static hidDevCfg_t hidEmuCfg = {
 static uint16_t hidEmuConnHandle = GAP_CONNHANDLE_INIT;
 
 // Param update retry counter
-static uint8_t s_param_update_retries = 0;
+uint8_t s_param_update_retries = 0;
 // Whether our desired latency has been accepted (extern'd by hiddev.c)
 uint8_t s_latency_accepted = 0;
 // Current supervision timeout in units of 10ms (extern'd by hiddev.c, updated on every param change)
@@ -424,6 +495,8 @@ static void battSetupCB(void)
 static void battTeardownCB(void)
 {
     ADC_DisablePower();
+    // Restore pull-down: floating PA14 at ~VCC/2 triggers constant GPIO-wake
+    GPIOA_ModeCfg(PIN_VBAT, GPIO_ModeIN_PD);
 }
 
 // Li-ion discharge curve: voltage (mV) → percentage
@@ -677,13 +750,45 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
     if(events & SLOW_ADV_EVT)
     {
-        // Switch to slow advertising for power saving
-        PRINT("Switching to slow advertising (%dms)\n", (int)(ADV_SLOW_INT * 0.625));
-        GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_SLOW_INT);
-        GAP_SetParamValue(TGAP_DISC_ADV_INT_MAX, ADV_SLOW_INT);
-        // Restart advertising with new interval
-        uint8_t adv_enable = TRUE;
-        GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &adv_enable);
+        if(s_adv_phase == ADV_PHASE_FAST)
+        {
+            // Fast → Slow: 5s interval, LED 0.5s on / 1s off
+            PRINT("ADV: fast→slow (5s)\n");
+            s_adv_phase = ADV_PHASE_SLOW;
+            s_adv_slow_count = 0;
+            GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_SLOW_INT);
+            GAP_SetParamValue(TGAP_DISC_ADV_INT_MAX, ADV_SLOW_INT);
+            uint8_t adv_enable = TRUE;
+            GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &adv_enable);
+#if HAS_RGB_LED
+            led_blink_start_ex('B', LED_ADV_SLOW_ON, LED_ADV_SLOW_OFF);
+#endif
+            // Schedule next tick (30s) to count toward 5min
+            tmos_start_task(hidEmuTaskId, SLOW_ADV_EVT, DEEP_SLOW_ADV_DELAY);
+        }
+        else if(s_adv_phase == ADV_PHASE_SLOW)
+        {
+            s_adv_slow_count++;
+            if(s_adv_slow_count >= DEEP_SLOW_ADV_COUNTS)
+            {
+                // Slow → Deep-slow: 30s interval, LED 0.25s on / 5s off
+                PRINT("ADV: slow→deep-slow (30s)\n");
+                s_adv_phase = ADV_PHASE_DEEP_SLOW;
+                GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_DEEP_SLOW_INT);
+                GAP_SetParamValue(TGAP_DISC_ADV_INT_MAX, ADV_DEEP_SLOW_INT);
+                uint8_t adv_enable = TRUE;
+                GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &adv_enable);
+#if HAS_RGB_LED
+                led_blink_start_ex('B', LED_ADV_DSLOW_ON, LED_ADV_DSLOW_OFF);
+#endif
+            }
+            else
+            {
+                // Still in slow phase, keep counting
+                tmos_start_task(hidEmuTaskId, SLOW_ADV_EVT, DEEP_SLOW_ADV_DELAY);
+            }
+        }
+        // ADV_PHASE_DEEP_SLOW: no more timers, stay indefinitely
         return (events ^ SLOW_ADV_EVT);
     }
 
@@ -707,6 +812,11 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         {
             pressStart = TMOS_GetSystemClock();
             longTriggered = 0;
+            // Restart fast advertising if in slow/deep-slow phase
+            if(s_adv_phase >= ADV_PHASE_SLOW)
+            {
+                adv_restart_fast_cycle();
+            }
             // Fast polling while pressed (long-press detection)
             tmos_start_task(hidEmuTaskId, BUTTON_SCAN_EVT, BUTTON_SCAN_INTERVAL);
         }
@@ -762,6 +872,12 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             {
                 // Confirmed touch after 3 consecutive readings
                 touchDebounce = 0;
+
+                // Restart fast advertising if in slow/deep-slow phase
+                if(s_adv_phase >= ADV_PHASE_SLOW)
+                {
+                    adv_restart_fast_cycle();
+                }
 
                 if(s_enroll_active) {
                     // Skip - enrollment handles touch internally
@@ -1029,7 +1145,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             search_params[1] = 0;
             search_params[2] = 0;
             search_params[3] = 0;
-            search_params[4] = FP_MAX_TEMPLATES;
+            search_params[4] = FP_SLOT_MAX;
             fp_send_cmd(0x04, search_params, 5);  // CMD_SEARCH
 
             uint8_t search_result[4];
@@ -1042,15 +1158,17 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
             if(ret == FP_OK && ack == 0x00)
             {
-                uint16_t page_id = (search_result[0] << 8) | search_result[1];
+                uint16_t raw_page_id = (search_result[0] << 8) | search_result[1];
                 uint16_t match_score = (search_result[2] << 8) | search_result[3];
+                // Convert physical slot to user finger ID
+                uint16_t page_id = FP_FINGER_ID(raw_page_id);
 #if HAS_RGB_LED
                 led_solid('B', 1600);  // blue 1s
 #else
                 fp_led_flash(FP_LED_BLUE, 25, 1);
 #endif
                 s_gate_fail_count = 0;
-                PRINT("FP matched! id=%d, score=%d\n", page_id, match_score);
+                PRINT("FP matched! raw_slot=%d, finger_id=%d, score=%d\n", raw_page_id, page_id, match_score);
 
                 // Match succeeded - power off unless pending cmd needs FP module
                 if(s_pending_cmd != IMMUROK_CMD_DELETE_FP &&
@@ -1339,8 +1457,10 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
     {
         if(s_ota_active) { s_enroll_active = 0; return (events ^ FP_ENROLL_EVT); }
 
-        // Non-blocking enrollment using state machine
-        // States: 0=init, 1-6=wait finger N, 7=merge, 8=store
+        // Non-blocking dual-slot enrollment using state machine
+        // Each round: steps 1-6=capture, 7=merge, 8=store
+        // Round 0 → slot finger_id*2, Round 1 → slot finger_id*2+1
+        // Total captures reported to App: 12 (2 rounds × 6)
         static uint8_t enroll_step = 0;
         static uint32_t enroll_start = 0;
 
@@ -1348,6 +1468,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             enroll_step = 0;
             s_enroll_send_lift = 0;
             s_enroll_send_done = 0;
+            s_enroll_round = 0;
             return (events ^ FP_ENROLL_EVT);
         }
 
@@ -1358,10 +1479,11 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
             uint8_t rspBuf[2];
             rspBuf[0] = IMMUROK_RSP_OK;
-            rspBuf[1] = (uint8_t)s_enroll_page_id;
+            rspBuf[1] = (uint8_t)s_enroll_page_id;  // User finger ID
             ImmurokService_SendResponse(rspBuf, 2);
             s_enroll_active = 0;
             enroll_step = 0;
+            s_enroll_round = 0;
             fp_reset_power_timer();
             return (events ^ FP_ENROLL_EVT);
         }
@@ -1370,16 +1492,20 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         extern int fp_send_cmd(uint8_t cmd, const uint8_t *data, uint16_t len);
         extern int fp_recv_ack(uint8_t *ack, uint8_t *data, uint16_t *len, uint32_t timeout_ms);
 
+        // Helper: total captures = 2 rounds × 6
+        #define ENROLL_TOTAL  (FP_SLOTS_PER_FINGER * 6)
+
         uint8_t rspBuf[4];
 
         if(enroll_step == 0) {
             // Initialize - wake up fingerprint module first
-            PRINT("ENROLL_EVT: waking module for slot %d\n", s_enroll_page_id);
+            PRINT("ENROLL_EVT: waking module for finger %d (slots %d,%d)\n",
+                  s_enroll_page_id, FP_SLOT_FIRST(s_enroll_page_id), FP_SLOT_SECOND(s_enroll_page_id));
             int wake_ret = fp_ensure_ready();
             if(wake_ret != FP_OK) {
                 PRINT("ENROLL_EVT: wake failed %d\n", wake_ret);
                 rspBuf[0] = 0x11;
-                rspBuf[1] = 0xFF;  // FP_ENROLL_FAILED
+                rspBuf[1] = FP_ENROLL_FAILED;
                 rspBuf[2] = 0;
                 rspBuf[3] = 0;
                 ImmurokService_SendResponse(rspBuf, 4);
@@ -1387,17 +1513,18 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 fp_reset_power_timer();
                 return (events ^ FP_ENROLL_EVT);
             }
-            PRINT("ENROLL_EVT: starting slot %d\n", s_enroll_page_id);
+            PRINT("ENROLL_EVT: starting finger %d\n", s_enroll_page_id);
+            s_enroll_round = 0;
             enroll_step = 1;
             enroll_start = TMOS_GetSystemClock();
 #if HAS_RGB_LED
             led_blink_start('G');  // Green blink = waiting for finger
 #endif
-            // Send initial status: [0x11, status=0(waiting), current=0, total=6]
+            // Send initial status: [0x11, status=waiting, current=0, total=12]
             rspBuf[0] = 0x11;
-            rspBuf[1] = 0;     // FP_ENROLL_WAITING
-            rspBuf[2] = 0;     // current
-            rspBuf[3] = 6;     // total
+            rspBuf[1] = FP_ENROLL_WAITING;
+            rspBuf[2] = 0;
+            rspBuf[3] = ENROLL_TOTAL;
             ImmurokService_SendResponse(rspBuf, 4);
             tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 160);  // 100ms
         }
@@ -1409,16 +1536,17 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             led_blink_start('G');  // Green blink = waiting for next finger
 #endif
             rspBuf[0] = 0x11;
-            rspBuf[1] = 3;     // FP_ENROLL_LIFT_FINGER
-            rspBuf[2] = capture_num;
-            rspBuf[3] = 6;
+            rspBuf[1] = FP_ENROLL_LIFT_FINGER;
+            rspBuf[2] = capture_num;    // global capture number (1-12)
+            rspBuf[3] = ENROLL_TOTAL;
             ImmurokService_SendResponse(rspBuf, 4);
             // Wait for finger lift — keep under watchdog period (559ms)
             tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 768);  // 480ms
         }
         else if(enroll_step >= 1 && enroll_step <= 6) {
-            // Try to capture finger N
-            uint8_t capture_num = enroll_step;
+            // Try to capture finger N (local step within current round)
+            uint8_t local_step = enroll_step;
+            uint8_t global_capture = s_enroll_round * 6 + local_step;  // 1-12 for progress
 
             // Send GetImage command
             fp_send_cmd(0x01, NULL, 0);  // CMD_GET_IMAGE
@@ -1428,36 +1556,35 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
             if(ret == FP_OK && ack == 0x00) {
                 // Image captured, generate char
-                uint8_t buf_id = capture_num;
+                uint8_t buf_id = local_step;  // buffers 1-6 (reused per round)
                 uint8_t params[1] = { buf_id };
                 fp_send_cmd(0x02, params, 1);  // CMD_IMAGE2TZ
                 ret = fp_recv_ack(&ack, NULL, NULL, 100);
                 WWDG_SetCounter(0);
 
                 if(ret == FP_OK && ack == 0x00) {
-                    PRINT("ENROLL_EVT: captured %d/6\n", capture_num);
+                    PRINT("ENROLL_EVT: captured %d/%d (round %d, local %d/6)\n",
+                          global_capture, ENROLL_TOTAL, s_enroll_round, local_step);
 #if HAS_RGB_LED
                     led_solid('G', 0);  // Green solid = captured
 #endif
-                    // [0x11, status=1(captured), current, total]
                     rspBuf[0] = 0x11;
-                    rspBuf[1] = 1;     // FP_ENROLL_CAPTURED
-                    rspBuf[2] = capture_num;
-                    rspBuf[3] = 6;
+                    rspBuf[1] = FP_ENROLL_CAPTURED;
+                    rspBuf[2] = global_capture;
+                    rspBuf[3] = ENROLL_TOTAL;
                     ImmurokService_SendResponse(rspBuf, 4);
 
                     enroll_step++;
                     if(enroll_step <= 6) {
-                        // Schedule lift finger notification after 200ms (non-blocking)
-                        s_enroll_send_lift = capture_num;  // Remember which capture to notify
-                        tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 320);  // 320 * 625us = 200ms
+                        // Schedule lift finger notification after 200ms
+                        s_enroll_send_lift = global_capture;
+                        tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 320);
                     } else {
-                        // All captures done, merge
-                        enroll_step = 7;  // Move to merge step
+                        // All 6 captures done for this round, merge
+                        enroll_step = 7;
                         tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 160);
                     }
                 } else {
-                    // Gen char failed
                     PRINT("ENROLL_EVT: gen_char failed\n");
                     tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 320);
                 }
@@ -1466,28 +1593,34 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 // No finger or timeout, retry
                 uint32_t elapsed = (TMOS_GetSystemClock() - enroll_start) * 625 / 1000;
                 if(elapsed > 60000) {
-                    PRINT("ENROLL_EVT: timeout\n");
+                    PRINT("ENROLL_EVT: timeout (round %d)\n", s_enroll_round);
                     rspBuf[0] = 0x11;
-                    rspBuf[1] = 0xFF;  // FP_ENROLL_FAILED
+                    rspBuf[1] = FP_ENROLL_FAILED;
                     rspBuf[2] = 0;
                     rspBuf[3] = 0;
                     ImmurokService_SendResponse(rspBuf, 4);
+                    // Rollback if round 2 timed out
+                    if(s_enroll_round == 1) {
+                        fp_delete(FP_SLOT_FIRST(s_enroll_page_id), 1);
+                        PRINT("ENROLL_EVT: rolled back slot %d\n", FP_SLOT_FIRST(s_enroll_page_id));
+                    }
                     s_enroll_active = 0;
                     enroll_step = 0;
-                    fp_reset_power_timer();  // Start idle timer
+                    s_enroll_round = 0;
+                    fp_reset_power_timer();
                 } else {
-                    tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 320);  // 200ms
+                    tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 320);
                 }
             }
         }
         else if(enroll_step == 7) {
-            // Merge
-            PRINT("ENROLL_EVT: merging...\n");
-            // Send processing notification
+            // Merge all 6 captures into one model
+            uint8_t global_capture = (s_enroll_round + 1) * 6;
+            PRINT("ENROLL_EVT: merging round %d...\n", s_enroll_round);
             rspBuf[0] = 0x11;
-            rspBuf[1] = 2;     // FP_ENROLL_PROCESSING
-            rspBuf[2] = 6;     // all captures done
-            rspBuf[3] = 6;
+            rspBuf[1] = FP_ENROLL_PROCESSING;
+            rspBuf[2] = global_capture;
+            rspBuf[3] = ENROLL_TOTAL;
             ImmurokService_SendResponse(rspBuf, 4);
             fp_send_cmd(0x05, NULL, 0);  // CMD_REG_MODEL
             uint8_t ack;
@@ -1495,59 +1628,89 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             WWDG_SetCounter(0);
 
             if(ret == FP_OK && ack == 0x00) {
-                enroll_step = 8;
+                enroll_step = 8;  // store
                 tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 160);
             } else {
-                PRINT("ENROLL_EVT: merge failed\n");
+                PRINT("ENROLL_EVT: merge failed (round %d)\n", s_enroll_round);
                 rspBuf[0] = 0x11;
-                rspBuf[1] = 0xFF;  // FP_ENROLL_FAILED
+                rspBuf[1] = FP_ENROLL_FAILED;
                 rspBuf[2] = 0;
                 rspBuf[3] = 0;
                 ImmurokService_SendResponse(rspBuf, 4);
+                // Rollback if round 2 merge fails
+                if(s_enroll_round == 1) {
+                    fp_delete(FP_SLOT_FIRST(s_enroll_page_id), 1);
+                    PRINT("ENROLL_EVT: rolled back slot %d\n", FP_SLOT_FIRST(s_enroll_page_id));
+                }
                 s_enroll_active = 0;
                 enroll_step = 0;
-                fp_reset_power_timer();  // Start idle timer
+                s_enroll_round = 0;
+                fp_reset_power_timer();
             }
         }
         else if(enroll_step == 8) {
-            // Store
-            PRINT("ENROLL_EVT: storing to page %d\n", s_enroll_page_id);
+            // Store merged model to physical slot based on current round
+            uint16_t phys_slot = (s_enroll_round == 0)
+                ? FP_SLOT_FIRST(s_enroll_page_id)
+                : FP_SLOT_SECOND(s_enroll_page_id);
+            PRINT("ENROLL_EVT: storing to physical slot %d (round %d)\n", phys_slot, s_enroll_round);
             uint8_t params[3];
             params[0] = 1;  // buffer 1
-            params[1] = (s_enroll_page_id >> 8) & 0xFF;
-            params[2] = s_enroll_page_id & 0xFF;
+            params[1] = (phys_slot >> 8) & 0xFF;
+            params[2] = phys_slot & 0xFF;
             fp_send_cmd(0x06, params, 3);  // CMD_STORE
             uint8_t ack;
             int ret = fp_recv_ack(&ack, NULL, NULL, 500);
             WWDG_SetCounter(0);
 
             if(ret == FP_OK && ack == 0x00) {
-                PRINT("ENROLL_EVT: SUCCESS!\n");
+                if(s_enroll_round == 0) {
+                    // Round 1 done — send adjust notification, start round 2
+                    PRINT("ENROLL_EVT: round 1 stored, sending adjust\n");
+                    rspBuf[0] = 0x11;
+                    rspBuf[1] = FP_ENROLL_ADJUST;
+                    rspBuf[2] = 6;            // current progress
+                    rspBuf[3] = ENROLL_TOTAL;
+                    ImmurokService_SendResponse(rspBuf, 4);
+                    s_enroll_round = 1;
+                    enroll_step = 1;  // restart capture loop for round 2
+                    enroll_start = TMOS_GetSystemClock();  // reset timeout
 #if HAS_RGB_LED
-                led_stop();
+                    led_blink_start('G');
 #endif
-                // Send completion progress notification first
-                // Status 4 = FP_ENROLL_COMPLETE (custom status for completion)
-                rspBuf[0] = 0x11;
-                rspBuf[1] = 4;     // FP_ENROLL_COMPLETE
-                rspBuf[2] = 6;
-                rspBuf[3] = 6;
-                ImmurokService_SendResponse(rspBuf, 4);
-                // Schedule final success response after 100ms (non-blocking)
-                s_enroll_send_done = 1;
-                tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 160);  // 100ms
-                return (events ^ FP_ENROLL_EVT);
+                    tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 1600);  // 1s pause for user to adjust
+                } else {
+                    // Round 2 done — complete!
+                    PRINT("ENROLL_EVT: SUCCESS (both slots stored)!\n");
+#if HAS_RGB_LED
+                    led_stop();
+#endif
+                    rspBuf[0] = 0x11;
+                    rspBuf[1] = FP_ENROLL_COMPLETE;
+                    rspBuf[2] = ENROLL_TOTAL;
+                    rspBuf[3] = ENROLL_TOTAL;
+                    ImmurokService_SendResponse(rspBuf, 4);
+                    s_enroll_send_done = 1;
+                    tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 160);  // 100ms
+                    return (events ^ FP_ENROLL_EVT);
+                }
             } else {
-                PRINT("ENROLL_EVT: store failed\n");
+                PRINT("ENROLL_EVT: store failed (round %d)\n", s_enroll_round);
                 rspBuf[0] = 0x11;
-                rspBuf[1] = 0xFF;  // FP_ENROLL_FAILED
+                rspBuf[1] = FP_ENROLL_FAILED;
                 rspBuf[2] = 0;
                 rspBuf[3] = 0;
                 ImmurokService_SendResponse(rspBuf, 4);
+                // Rollback if round 2 store fails
+                if(s_enroll_round == 1) {
+                    fp_delete(FP_SLOT_FIRST(s_enroll_page_id), 1);
+                    PRINT("ENROLL_EVT: rolled back slot %d\n", FP_SLOT_FIRST(s_enroll_page_id));
+                }
+                s_enroll_active = 0;
+                enroll_step = 0;
+                s_enroll_round = 0;
+                fp_reset_power_timer();
             }
-            s_enroll_active = 0;
-            enroll_step = 0;
-            fp_reset_power_timer();  // Start idle timer after enrollment
         }
 
         return (events ^ FP_ENROLL_EVT);
@@ -1646,13 +1809,15 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         // Shared event bit: deferred KEY_SIGN or ECDH compute (when not in OTA mode)
         if(!s_ota_active)
         {
-            // DELETE_FP: ~700ms blocking (fp_ensure_ready + fp_delete).
-            // Borderline for 720ms fast-param timeout — request update first if needed.
+            // DELETE_FP: delete both physical slots for a finger (consecutive)
             if(s_pending_cmd == IMMUROK_CMD_DELETE_FP && s_latency_accepted)
             {
+                uint8_t fingerId = s_pending_payload[0];
                 int del_ret = fp_ensure_ready();
                 if(del_ret == FP_OK) {
-                    del_ret = fp_delete(s_pending_payload[0], 1);
+                    // Delete 2 consecutive slots starting at FP_SLOT_FIRST
+                    del_ret = fp_delete(FP_SLOT_FIRST(fingerId), 2);
+                    WWDG_SetCounter(0);
                     if(del_ret == FP_OK)
                         fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
                 }
@@ -1672,10 +1837,8 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 PRINT("Long op REJECTED: timeout=%dms (need >=5000ms)\n", s_conn_timeout * 10);
                 s_long_op_param_requested = 0;
                 s_long_op_wait_start = 0;
-                if(s_pending_cmd == IMMUROK_CMD_KEY_SIGN || s_pending_cmd == IMMUROK_CMD_KEY_GENERATE) {
-                    uint8_t rspErr[1] = { 0xE1 };
-                    ImmurokService_SendResponse(rspErr, 1);
-                }
+                uint8_t rspErr[1] = { 0xE1 };
+                ImmurokService_SendResponse(rspErr, 1);
                 s_pending_cmd = 0;
                 return (events ^ OTA_FLASH_ERASE_EVT);
             }
@@ -1923,9 +2086,14 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
         case GAPROLE_ADVERTISING:
             if(pEvent->gap.opcode == GAP_MAKE_DISCOVERABLE_DONE_EVENT)
             {
-                PRINT("Advertising..\n");
+                PRINT("Advertising (phase %d)..\n", s_adv_phase);
 #if HAS_RGB_LED
-                led_blink_start('B');
+                // LED is managed by SLOW_ADV_EVT phase transitions;
+                // only set default blink if no phase-specific pattern is active
+                if(s_adv_phase <= ADV_PHASE_FAST && !s_led_blink)
+                {
+                    led_blink_start('B');
+                }
 #endif
             }
             break;
@@ -1938,8 +2106,9 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 // get connection handle
                 hidEmuConnHandle = event->connectionHandle;
                 tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, START_PARAM_UPDATE_EVT_DELAY);
-                // Cancel slow advertising timer, restore fast interval for next disconnect
+                // Cancel advertising cycle timer, mark as connected (not advertising)
                 tmos_stop_task(hidEmuTaskId, SLOW_ADV_EVT);
+                s_adv_phase = ADV_PHASE_OFF;
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_FAST_INT);
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MAX, ADV_FAST_INT);
                 PRINT("Connected..\n");
@@ -1953,6 +2122,15 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                       (event->connInterval * 5) / 4, ((event->connInterval * 5) % 4) * 25,
                       event->connLatency,
                       event->connTimeout, event->connTimeout * 10);
+                // Save initial connection parameters — Linux may already negotiate
+                // adequate params at connection time, so hidDevParamUpdateCB may
+                // never fire. Without this, s_conn_timeout stays 0 and PAIR_INIT
+                // is rejected with 0xE1.
+                s_conn_timeout = event->connTimeout;
+                if(event->connLatency > 0)
+                {
+                    s_latency_accepted = 1;
+                }
             }
             break;
 
@@ -1966,7 +2144,17 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
         case GAPROLE_WAITING:
             if(pEvent->gap.opcode == GAP_END_DISCOVERABLE_DONE_EVENT)
             {
-                PRINT("Waiting for advertising..\n");
+                PRINT("Advertising timeout (phase %d)\n", s_adv_phase);
+                // Initial advertising timed out (no bond) → start fast cycle
+                if(s_adv_phase == ADV_PHASE_OFF)
+                {
+                    s_adv_phase = ADV_PHASE_FAST;
+                    s_adv_slow_count = 0;
+                    GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_FAST_INT);
+                    GAP_SetParamValue(TGAP_DISC_ADV_INT_MAX, ADV_FAST_INT);
+                    GAP_SetParamValue(TGAP_LIM_ADV_TIMEOUT, 0);  // no timeout
+                    tmos_start_task(hidEmuTaskId, SLOW_ADV_EVT, SLOW_ADV_DELAY);
+                }
             }
             else if(pEvent->gap.opcode == GAP_LINK_TERMINATED_EVENT)
             {
@@ -1982,6 +2170,8 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 s_param_update_retries = 0;
                 s_latency_accepted = 0;
                 s_conn_timeout = 0;
+                extern volatile uint8_t g_sleep_inhibit;
+                g_sleep_inhibit = 0;  // Reset all sleep inhibit holds on disconnect
                 s_long_op_param_requested = 0;
                 s_long_op_wait_start = 0;
                 s_long_op_busy = 0;
@@ -1997,9 +2187,12 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 tmos_stop_task(hidEmuTaskId, FP_ENROLL_EVT);
                 tmos_stop_task(hidEmuTaskId, FP_WAKE_DONE_EVT);
                 s_fp_notify_pending = 0;
-                // Start fast advertising, schedule switch to slow after 30s
+                // Start fast advertising cycle (fast 30s → slow 5min → deep-slow)
+                s_adv_phase = ADV_PHASE_FAST;
+                s_adv_slow_count = 0;
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, ADV_FAST_INT);
                 GAP_SetParamValue(TGAP_DISC_ADV_INT_MAX, ADV_FAST_INT);
+                GAP_SetParamValue(TGAP_LIM_ADV_TIMEOUT, 0);  // no timeout
                 tmos_start_task(hidEmuTaskId, SLOW_ADV_EVT, SLOW_ADV_DELAY);
             }
             else if(pEvent->gap.opcode == GAP_LINK_ESTABLISHED_EVENT)
@@ -2136,8 +2329,8 @@ static void hidEmuEvtCB(uint8_t evt)
 // Rolling window: each pass-through refreshes the timer for batch operations
 static int fp_gate_needed(void)
 {
-    // Use cached bitmap — avoids blocking fp_wake() (~300ms) in GATT callback
-    if(g_cached_fp_bitmap == 0) return 0;
+    // Use user bitmap — avoids blocking fp_wake() (~300ms) in GATT callback
+    if(fp_user_bitmap() == 0) return 0;
     // Never verified since boot → always require FP
     if(s_fp_gate_last_verify == 0) return 1;
     uint32_t now = TMOS_GetSystemClock();
@@ -2212,10 +2405,10 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
     case IMMUROK_CMD_GET_STATUS:
         PRINT("  GET_STATUS\n");
         {
-            // Use cached bitmap — no blocking UART ops in GATT callback
+            // Use user bitmap — no blocking UART ops in GATT callback
             // (fp_wake blocks ~300ms which overflows the 512B stack in sleep mode)
             rspBuf[0] = IMMUROK_RSP_OK;
-            rspBuf[1] = g_cached_fp_bitmap;
+            rspBuf[1] = fp_user_bitmap();
             rspBuf[2] = immurok_security_is_paired() ? 1 : 0;
             uint8_t batt = 0;
             Batt_GetParameter(BATT_PARAM_LEVEL, &batt);
@@ -2232,49 +2425,48 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
 
     case IMMUROK_CMD_FP_LIST:
         {
-            // Use cached bitmap — no blocking fp_wake() in GATT callback
+            uint8_t ubm = fp_user_bitmap();
             rspBuf[0] = IMMUROK_RSP_OK;
-            rspBuf[1] = g_cached_fp_bitmap;
+            rspBuf[1] = ubm;
             rspLen = 2;
-            PRINT("  FP_LIST: bitmap=0x%02X\n", g_cached_fp_bitmap);
+            PRINT("  FP_LIST: raw=0x%04X, user=0x%02X\n", g_cached_fp_bitmap, ubm);
         }
         break;
 
     case IMMUROK_CMD_ENROLL_START:
-        // Payload: [slotId:1]
+        // Payload: [fingerId:1]
         if(payloadLen < 1) {
             rspBuf[0] = IMMUROK_RSP_INVALID_PARAM;
             break;
         }
         {
-            uint8_t slotId = pData[2];
-            PRINT("  ENROLL_START slot=%d\n", slotId);
+            uint8_t fingerId = pData[2];
+            PRINT("  ENROLL_START finger=%d\n", fingerId);
 
             if(s_enroll_active) {
                 rspBuf[0] = IMMUROK_RSP_BUSY;
-            } else if(slotId >= 5) {
+            } else if(fingerId >= FP_USER_MAX) {
                 rspBuf[0] = IMMUROK_RSP_INVALID_PARAM;
             } else {
-                // Use cached bitmap — no blocking fp_wake() in GATT callback
-                uint8_t bitmap = g_cached_fp_bitmap;
-                if(bitmap & (1 << slotId)) {
-                    PRINT("  Slot %d already occupied (bitmap=0x%02X)\n", slotId, bitmap);
+                uint8_t ubm = fp_user_bitmap();
+                if(ubm & (1 << fingerId)) {
+                    PRINT("  Finger %d already enrolled (user_bitmap=0x%02X)\n", fingerId, ubm);
                     rspBuf[0] = IMMUROK_RSP_INVALID_PARAM;
                     break;
                 }
 
                 // Fingerprint gate: if any fingerprint exists, require verification
-                if(bitmap != 0) {
+                if(ubm != 0) {
                     PRINT("  FP gate: caching ENROLL_START, waiting for FP verify\n");
                     s_pending_cmd = IMMUROK_CMD_ENROLL_START;
                     s_pending_cmd_start = TMOS_GetSystemClock();
-                    s_pending_payload[0] = slotId;
+                    s_pending_payload[0] = fingerId;
                     s_pending_payload_len = 1;
                     fp_gate_enter();
                     rspBuf[0] = IMMUROK_RSP_WAIT_FP;
                 } else {
                     // No fingerprints yet, allow directly
-                    s_enroll_page_id = slotId;
+                    s_enroll_page_id = fingerId;
                     s_enroll_active = 1;
                     tmos_set_event(hidEmuTaskId, FP_ENROLL_EVT);
                     rspBuf[0] = IMMUROK_RSP_OK;
@@ -2283,23 +2475,46 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
         }
         break;
 
+    case IMMUROK_CMD_ENROLL_CANCEL:
+        PRINT("  ENROLL_CANCEL active=%d\n", s_enroll_active);
+        if(s_enroll_active) {
+            // If round 1 completed, roll back the first slot
+            if(s_enroll_round == 1) {
+                fp_delete(FP_SLOT_FIRST(s_enroll_page_id), 1);
+                PRINT("  Rolled back slot %d\n", FP_SLOT_FIRST(s_enroll_page_id));
+            }
+            s_enroll_active = 0;
+            s_enroll_round = 0;
+            tmos_stop_task(hidEmuTaskId, FP_ENROLL_EVT);
+#if HAS_RGB_LED
+            led_solid('R', LED_FLASH_TICKS);
+#endif
+            fp_reset_power_timer();
+        }
+        rspBuf[0] = IMMUROK_RSP_OK;
+        break;
+
     case IMMUROK_CMD_DELETE_FP:
-        // Payload: [slotId:1]
+        // Payload: [fingerId:1]
         if(payloadLen < 1) {
             rspBuf[0] = IMMUROK_RSP_INVALID_PARAM;
             break;
         }
         {
-            uint8_t slotId = pData[2];
-            PRINT("  DELETE_FP slot=%d\n", slotId);
+            uint8_t fingerId = pData[2];
+            PRINT("  DELETE_FP finger=%d\n", fingerId);
 
-            // Use cached bitmap — no blocking fp_wake() in GATT callback
-            uint8_t bitmap = g_cached_fp_bitmap;
-            if(bitmap != 0) {
+            if(fingerId >= FP_USER_MAX) {
+                rspBuf[0] = IMMUROK_RSP_INVALID_PARAM;
+                break;
+            }
+
+            uint8_t ubm = fp_user_bitmap();
+            if(ubm != 0) {
                 PRINT("  FP gate: caching DELETE_FP, waiting for FP verify\n");
                 s_pending_cmd = IMMUROK_CMD_DELETE_FP;
                 s_pending_cmd_start = TMOS_GetSystemClock();
-                s_pending_payload[0] = slotId;
+                s_pending_payload[0] = fingerId;
                 s_pending_payload_len = 1;
                 fp_gate_enter();
                 rspBuf[0] = IMMUROK_RSP_WAIT_FP;
@@ -2323,8 +2538,11 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
     case IMMUROK_CMD_PAIR_INIT:
         PRINT("  PAIR_INIT\n");
         {
-            // Use cached bitmap — no blocking fp_wake() in GATT callback
-            if(g_cached_fp_bitmap != 0 && fp_gate_needed()) {
+            // ECDH needs timeout >= 5s; request param update early
+            if(s_conn_timeout < 500) {
+                tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+            }
+            if(fp_user_bitmap() != 0 && fp_gate_needed()) {
                 PRINT("  FP gate: caching PAIR_INIT, waiting for FP verify\n");
                 s_pending_cmd = IMMUROK_CMD_PAIR_INIT;
                 s_pending_cmd_start = TMOS_GetSystemClock();
@@ -2392,9 +2610,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
     case IMMUROK_CMD_FACTORY_RESET:
         PRINT("  FACTORY_RESET\n");
         {
-            // Use cached bitmap — no blocking fp_wake() in GATT callback
-            uint8_t bitmap = g_cached_fp_bitmap;
-            if(bitmap != 0) {
+            if(fp_user_bitmap() != 0) {
                 PRINT("  FP gate: caching FACTORY_RESET, waiting for FP verify\n");
                 s_pending_cmd = IMMUROK_CMD_FACTORY_RESET;
                 s_pending_cmd_start = TMOS_GetSystemClock();

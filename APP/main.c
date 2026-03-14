@@ -187,8 +187,12 @@ int main(void)
     GPIOA_ModeCfg(GPIO_Pin_All, GPIO_ModeIN_PU);
     GPIOB_ModeCfg(GPIO_Pin_All, GPIO_ModeIN_PU);
 #if HAS_VBAT_ADC
-    // Clear pull-up on ADC divider pin — pull-up leaks through resistor network
-    GPIOA_ModeCfg(PIN_VBAT, GPIO_ModeIN_Floating);
+    // Pull-down on VBAT divider pin: floating leaves PA14 at ~VCC/2 (near GPIO
+    // threshold) causing constant RB_SLP_GPIO_WAKE false wakeups from noise.
+    // Pull-down stabilizes at ~0.2V; adds ~1.5uA vs floating but saves ~55uA
+    // from eliminated spurious wakeups. ADC settles in <10us after switching
+    // to floating in battSetupCB.
+    GPIOA_ModeCfg(PIN_VBAT, GPIO_ModeIN_PD);
 #endif
 #endif
 #ifdef DEBUG
@@ -213,11 +217,28 @@ int main(void)
 #endif
 
     // Initialize fingerprint module
-    extern uint8_t g_cached_fp_bitmap;
+    extern uint16_t g_cached_fp_bitmap;
     int fp_ret = fp_init();
     if(fp_ret == FP_OK) {
         PRINT("Fingerprint module OK\n");
         // Cache bitmap before power off (used by GET_STATUS without blocking)
+        fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
+        // Clean up orphan slots (e.g. after OTA from single-slot firmware,
+        // or if round 2 failed and rollback also failed)
+        for(int i = 0; i < FP_USER_MAX; i++) {
+            uint16_t bit_a = (1 << FP_SLOT_FIRST(i));
+            uint16_t bit_b = (1 << FP_SLOT_SECOND(i));
+            uint16_t has_a = g_cached_fp_bitmap & bit_a;
+            uint16_t has_b = g_cached_fp_bitmap & bit_b;
+            if(has_a && !has_b) {
+                PRINT("Orphan slot %d (finger %d, missing second), cleaning\n", FP_SLOT_FIRST(i), i);
+                fp_delete(FP_SLOT_FIRST(i), 1);
+            } else if(!has_a && has_b) {
+                PRINT("Orphan slot %d (finger %d, missing first), cleaning\n", FP_SLOT_SECOND(i), i);
+                fp_delete(FP_SLOT_SECOND(i), 1);
+            }
+        }
+        // Re-cache after cleanup
         fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
         // Power off after init - will be powered on when needed (touch detected)
         fp_power_off();

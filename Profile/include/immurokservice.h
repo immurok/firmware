@@ -27,6 +27,7 @@ extern "C" {
 // Command codes (v3.0 protocol — ECDH pairing)
 #define IMMUROK_CMD_GET_STATUS      0x01
 #define IMMUROK_CMD_ENROLL_START    0x10
+#define IMMUROK_CMD_ENROLL_CANCEL  0x11
 #define IMMUROK_CMD_DELETE_FP       0x12
 #define IMMUROK_CMD_FP_LIST         0x13
 #define IMMUROK_CMD_FP_MATCH_ACK    0x22

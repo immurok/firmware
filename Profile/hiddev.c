@@ -28,6 +28,8 @@
 
 // Param update retry delay (625us units, 48000 = 30s)
 #define PARAM_UPDATE_RETRY_DELAY          48000
+// Shorter re-request delay after macOS periodic param reset (625us units, 4800 = 3s)
+#define PARAM_UPDATE_REREQUEST_DELAY      4800
 
 // Battery measurement period in (625us)
 // 60000 * 625us = 37.5s per tick, measure every 2nd tick ≈ 75s
@@ -867,12 +869,23 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
     {
         s_latency_accepted = 0;
     }
+    // Inhibit deep sleep when supervision timeout is dangerously short.
+    // macOS periodic param resets set timeout to ~720ms; deep sleep wake
+    // latency can cause supervision timeout and disconnect.
+    extern volatile uint8_t g_sleep_inhibit;
+    extern uint8_t s_param_update_retries;
     // Stop retry timer only when timeout is adequate (>= 2s)
     if(connTimeout >= 200) {
         tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+        if(g_sleep_inhibit > 0) g_sleep_inhibit--;  // Release BLE-timeout hold
     } else {
-        // Timeout inadequate — ensure retry timer is running
-        tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, PARAM_UPDATE_RETRY_DELAY);
+        g_sleep_inhibit++;  // Suppress sleep until params restored
+        // Timeout inadequate — ensure retry timer is running.
+        // After first successful negotiation (retries > 0), macOS periodic
+        // param resets don't need 30s wait (service discovery already done).
+        uint32_t delay = s_param_update_retries > 0
+            ? PARAM_UPDATE_REREQUEST_DELAY : PARAM_UPDATE_RETRY_DELAY;
+        tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, delay);
     }
 }
 
