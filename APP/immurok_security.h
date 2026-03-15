@@ -75,6 +75,14 @@ void immurok_security_auth_cancel(void);
  */
 int immurok_security_sign_fp_match(uint16_t page_id, uint8_t *out_buf);
 
+/**
+ * Compute challenge response: HMAC-SHA256(shared_key, nonce)[0:8]
+ * @param nonce 8-byte challenge from App
+ * @param out_hmac8 Output buffer (at least 8 bytes)
+ * @return 0 on success, -1 if not paired
+ */
+int immurok_security_challenge_response(const uint8_t *nonce, uint8_t *out_hmac8);
+
 // ============================================================================
 // Public API — Reset
 // ============================================================================

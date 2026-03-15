@@ -488,6 +488,8 @@ static hidDevCB_t hidEmuHidCBs = {
 static void battSetupCB(void)
 {
     GPIOA_ModeCfg(PIN_VBAT, GPIO_ModeIN_Floating);
+    // RC = 500kΩ × 0.1μF = 50ms; wait 5τ for divider to settle
+    DelayMs(250);
     ADC_ExtSingleChSampInit(SampleFreq_3_2, ADC_PGA_0);
     ADC_ChannelCfg(VBAT_ADC_CH);
 }
@@ -2593,6 +2595,23 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             rspBuf[0] = IMMUROK_CMD_PAIR_STATUS;
             rspBuf[1] = immurok_security_is_paired() ? 0x01 : 0x00;
             rspLen = 2;
+        }
+        break;
+
+    case IMMUROK_CMD_CHALLENGE:
+        PRINT("  CHALLENGE\n");
+        if(payloadLen < 8) {
+            rspBuf[0] = IMMUROK_RSP_INVALID_PARAM;
+            break;
+        }
+        {
+            rspBuf[0] = IMMUROK_CMD_CHALLENGE;
+            if(immurok_security_challenge_response(&pData[2], &rspBuf[1]) == 0) {
+                rspLen = 9;  // [0x38][hmac:8B]
+            } else {
+                rspBuf[1] = 0xFF;  // not paired
+                rspLen = 2;
+            }
         }
         break;
 

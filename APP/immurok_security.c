@@ -328,6 +328,24 @@ int immurok_security_sign_fp_match(uint16_t page_id, uint8_t *out_buf)
 }
 
 // ============================================================================
+// Challenge-Response Verification
+// ============================================================================
+
+int immurok_security_challenge_response(const uint8_t *nonce, uint8_t *out_hmac8)
+{
+    if (!s_data.paired) {
+        return -1;
+    }
+
+    // HMAC-SHA256(shared_key, nonce[8]), truncate to 8 bytes
+    uint8_t hmac_full[32];
+    hmac_sha256(s_data.shared_key, 32, nonce, 8, hmac_full);
+    memcpy(out_hmac8, hmac_full, 8);
+
+    return 0;
+}
+
+// ============================================================================
 // Factory Reset
 // ============================================================================
 

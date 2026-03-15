@@ -385,20 +385,10 @@ static bStatus_t battReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
 
     uuid = BUILD_UINT16(pAttr->type.uuid[0], pAttr->type.uuid[1]);
 
-    // Measure battery level if reading level
+    // Return cached battery level (updated periodically by Batt_MeasLevel).
+    // Avoid measuring here — ADC settling delay would block the BLE stack.
     if(uuid == BATT_LEVEL_UUID)
     {
-        uint8_t level;
-
-        level = battMeasure();
-
-        // If level has gone down
-        if(level < battLevel)
-        {
-            // Update level
-            battLevel = level;
-        }
-
         *pLen = 1;
         pValue[0] = battLevel;
     }
@@ -510,6 +500,9 @@ static uint8_t battMeasure(void)
     {
         // ADC-based measurement: setup configures the ADC channel
         battServiceSetupCB();
+
+        // Discard first sample to pre-charge ADC sampling capacitor
+        ADC_ExcutSingleConver();
 
         // Average 4 ADC samples for stability
         uint32_t sum = 0;

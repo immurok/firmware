@@ -37,6 +37,7 @@ extern "C" {
 #define IMMUROK_CMD_AUTH_REQUEST    0x33
 #define IMMUROK_CMD_FACTORY_RESET   0x36
 #define IMMUROK_CMD_GATE_CANCEL    0x37
+#define IMMUROK_CMD_CHALLENGE      0x38  // Challenge-response device verification
 
 // Keystore commands
 #define IMMUROK_CMD_KEY_COUNT      0x60
