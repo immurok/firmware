@@ -64,10 +64,6 @@ const uint8_t devInfoSoftwareRevUUID[ATT_BT_UUID_SIZE] = {
 const uint8_t devInfoMfrNameUUID[ATT_BT_UUID_SIZE] = {
     LO_UINT16(MANUFACTURER_NAME_UUID), HI_UINT16(MANUFACTURER_NAME_UUID)};
 
-// IEEE 11073-20601 Regulatory Certification Data List
-const uint8_t devInfo11073CertUUID[ATT_BT_UUID_SIZE] = {
-    LO_UINT16(IEEE_11073_CERT_DATA_UUID), HI_UINT16(IEEE_11073_CERT_DATA_UUID)};
-
 // PnP ID
 const uint8_t devInfoPnpIdUUID[ATT_BT_UUID_SIZE] = {
     LO_UINT16(PNP_ID_UUID), HI_UINT16(PNP_ID_UUID)};
@@ -95,9 +91,17 @@ static const gattAttrType_t devInfoService = {ATT_BT_UUID_SIZE, devInfoServUUID}
 static uint8_t devInfoSystemIdProps = GATT_PROP_READ;
 static uint8_t devInfoSystemId[DEVINFO_SYSTEM_ID_LEN] = {0, 0, 0, 0, 0, 0, 0, 0};
 
-// Model Number String characteristic
+// Model Number String characteristic. Default build leaves FW_VARIANT undefined
+// → "IK-1" (general SKU, declared 2026-05-14). Color-specific builds opt in
+// with -DFW_VARIANT=\"W\" (or B / G) and produce "IK-1-W"/"IK-1-B"/"IK-1-G"
+// via adjacent string literal concatenation. All four SKUs are listed under
+// the same SIG Product Declaration (R078979 / QDID 179771).
 static uint8_t       devInfoModelNumberProps = GATT_PROP_READ;
+#ifdef FW_VARIANT
+static const uint8_t devInfoModelNumber[] = "IK-1-" FW_VARIANT;
+#else
 static const uint8_t devInfoModelNumber[] = "IK-1";
+#endif
 
 // Serial Number String characteristic
 static uint8_t       devInfoSerialNumberProps = GATT_PROP_READ;
@@ -117,17 +121,9 @@ static const uint8_t devInfoSoftwareRev[] = "001";
 
 // Manufacturer Name String characteristic
 static uint8_t       devInfoMfrNameProps = GATT_PROP_READ;
-static const uint8_t devInfoMfrName[] = "immurok.com";
+static const uint8_t devInfoMfrName[] = "immurok";
 
-// IEEE 11073-20601 Regulatory Certification Data List characteristic
-static uint8_t       devInfo11073CertProps = GATT_PROP_READ;
-static const uint8_t devInfo11073Cert[] = {
-    DEVINFO_11073_BODY_EXP, // authoritative body type
-    0x00,                   // authoritative body structure type
-                            // authoritative body data follows below:
-    'e', 'x', 'p', 'e', 'r', 'i', 'm', 'e', 'n', 't', 'a', 'l'};
-
-// System ID characteristic
+// PnP ID characteristic
 static uint8_t devInfoPnpIdProps = GATT_PROP_READ;
 static uint8_t devInfoPnpId[DEVINFO_PNP_ID_LEN] = {
     1,                                    // Vendor ID source (1=Bluetooth SIG)
@@ -246,20 +242,6 @@ static gattAttribute_t devInfoAttrTbl[] = {
         GATT_PERMIT_READ,
         0,
         (uint8_t *)devInfoMfrName},
-
-    // IEEE 11073-20601 Regulatory Certification Data List Declaration
-    {
-        {ATT_BT_UUID_SIZE, characterUUID},
-        GATT_PERMIT_READ,
-        0,
-        &devInfo11073CertProps},
-
-    // IEEE 11073-20601 Regulatory Certification Data List Value
-    {
-        {ATT_BT_UUID_SIZE, devInfo11073CertUUID},
-        GATT_PERMIT_READ,
-        0,
-        (uint8_t *)devInfo11073Cert},
 
     // PnP ID Declaration
     {
@@ -400,10 +382,6 @@ bStatus_t DevInfo_GetParameter(uint8_t param, void *value)
 
         case DEVINFO_MANUFACTURER_NAME:
             tmos_memcpy(value, devInfoMfrName, sizeof(devInfoMfrName));
-            break;
-
-        case DEVINFO_11073_CERT_DATA:
-            tmos_memcpy(value, devInfo11073Cert, sizeof(devInfo11073Cert));
             break;
 
         case DEVINFO_PNP_ID:
@@ -549,22 +527,6 @@ static bStatus_t devInfo_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
 
                 // copy data
                 tmos_memcpy(pValue, &devInfoMfrName[offset], *pLen);
-            }
-            break;
-
-        case IEEE_11073_CERT_DATA_UUID:
-            // verify offset
-            if(offset >= sizeof(devInfo11073Cert))
-            {
-                status = ATT_ERR_INVALID_OFFSET;
-            }
-            else
-            {
-                // determine read length
-                *pLen = MIN(maxLen, (sizeof(devInfo11073Cert) - offset));
-
-                // copy data
-                tmos_memcpy(pValue, &devInfo11073Cert[offset], *pLen);
             }
             break;
 

@@ -26,6 +26,11 @@ typedef enum {
     SEC_ERR_TIMEOUT = 0x06,
     SEC_ERR_FP_NOT_MATCH = 0x07,
     SEC_ERR_WAIT_FP = 0x11,
+    SEC_ERR_WAIT_BUTTON = 0xF0,    // PAIR_INIT 等待用户按设备按钮确认
+    SEC_ERR_NEEDS_RESET = 0xF1,    // PAIR_INIT 但设备仍有指纹，需先 factory reset
+    SEC_ERR_NOT_PAIRED  = 0xF2,    // 设备未配对，命令被拒（仅 GET_STATUS / PAIR_* 允许）
+    SEC_ERR_NO_FP_ENROLLED = 0xF3, // 已配对但未录入指纹，所有 keystore/auth/OTA 命令被拒
+    SEC_ERR_LOW_BATTERY = 0xF4,    // 电量过低，拒绝长写操作（KEY_WRITE/COMMIT/GENERATE/OTA），防止半截写损坏 keystore；KEY_SIGN/AUTH 不受限
     SEC_ERR_INVALID_STATE = 0xFD,
     SEC_ERR_INVALID_PARAM = 0xFE,
     SEC_ERR_INTERNAL = 0xFF,
@@ -52,6 +57,15 @@ int  immurok_security_pair_make_key(void);       // Called from TMOS event — b
 int  immurok_security_pair_get_pubkey(uint8_t *compressed33);  // Get device compressed pubkey (BE)
 int  immurok_security_pair_confirm(const uint8_t *app_compressed33); // Receive App pubkey, start shared_secret
 int  immurok_security_pair_compute_secret(void); // Called from TMOS event — blocks ~2s
+
+// EEPROM_READ called immediately after pair_compute_secret crashes the chip
+// (drops to IAP bootloader). compute_secret now defers the save: caller
+// checks immurok_security_pair_save_pending after calling it, sends the
+// PAIR_CONFIRM response, then schedules a separate TMOS event later to
+// call immurok_security_pair_save() once the call stack has unwound.
+extern volatile uint8_t immurok_security_pair_save_pending;
+int  immurok_security_pair_save(void);
+
 immurok_ecdh_state_t immurok_security_get_ecdh_state(void);
 
 // ============================================================================

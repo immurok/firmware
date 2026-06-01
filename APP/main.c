@@ -194,6 +194,13 @@ int main(void)
     // to floating in battSetupCB.
     GPIOA_ModeCfg(PIN_VBAT, GPIO_ModeIN_PD);
 #endif
+#ifdef PIN_ANTI_OPEN
+    // Tamper-switch pin: the blanket GPIOB IN_PU above would leak ~73µA
+    // through the switch to GND whenever the case is closed (switch shorts
+    // PB10 to GND). Force pull-down — with the switch either side of its
+    // travel the pin and PD sit at the same potential, so no leakage.
+    GPIOB_ModeCfg(PIN_ANTI_OPEN, GPIO_ModeIN_PD);
+#endif
 #endif
 #ifdef DEBUG
     // UART3: PA5 TX, PA4 RX, 115200 baud (debug output)
@@ -223,23 +230,7 @@ int main(void)
         PRINT("Fingerprint module OK\n");
         // Cache bitmap before power off (used by GET_STATUS without blocking)
         fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
-        // Clean up orphan slots (e.g. after OTA from single-slot firmware,
-        // or if round 2 failed and rollback also failed)
-        for(int i = 0; i < FP_USER_MAX; i++) {
-            uint16_t bit_a = (1 << FP_SLOT_FIRST(i));
-            uint16_t bit_b = (1 << FP_SLOT_SECOND(i));
-            uint16_t has_a = g_cached_fp_bitmap & bit_a;
-            uint16_t has_b = g_cached_fp_bitmap & bit_b;
-            if(has_a && !has_b) {
-                PRINT("Orphan slot %d (finger %d, missing second), cleaning\n", FP_SLOT_FIRST(i), i);
-                fp_delete(FP_SLOT_FIRST(i), 1);
-            } else if(!has_a && has_b) {
-                PRINT("Orphan slot %d (finger %d, missing first), cleaning\n", FP_SLOT_SECOND(i), i);
-                fp_delete(FP_SLOT_SECOND(i), 1);
-            }
-        }
-        // Re-cache after cleanup
-        fp_get_fingerprint_bitmap(&g_cached_fp_bitmap);
+        // Single-slot: no orphan cleanup needed (PSAutoEnroll is atomic)
         // Power off after init - will be powered on when needed (touch detected)
         fp_power_off();
         PRINT("Fingerprint power management enabled\n");
@@ -247,7 +238,8 @@ int main(void)
         PRINT("Fingerprint init failed: %d\n", fp_ret);
     }
 
-    // Touch INT input (active high) - for button scan
+    // Touch INT input (active high). Idle default is IN_PD for all HW revs —
+    // fp_power_on() toggles to Floating for R599S during active sensor use.
     TOUCH_SetMode(GPIO_ModeIN_PD);
     PRINT("%s [fw:" FW_VERSION_STRING ".%04X build:%s %s]\n", VER_LIB, FW_BUILD_NUMBER, __DATE__, __TIME__);
     CH59x_BLEInit();
@@ -255,6 +247,12 @@ int main(void)
     GAPRole_PeripheralInit();
     HidDev_Init();
     HidEmu_Init();  // LED task registered here → blue blink starts
+#ifdef DEBUG
+    // BLE library gates UART3 clock during init — restore it for debug output
+    sys_safe_access_enable();
+    R8_SLP_CLK_OFF0 &= ~RB_SLP_CLK_UART3;
+    sys_safe_access_disable();
+#endif
 
     // 打印上次复位原因
     PRINT("Reset status: 0x%02X\n", R8_RESET_STATUS & 0x07);

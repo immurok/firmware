@@ -26,15 +26,25 @@ extern "C" {
 
 // Command codes (v3.0 protocol — ECDH pairing)
 #define IMMUROK_CMD_GET_STATUS      0x01
+#define IMMUROK_CMD_GET_BATT_RAW    0x02    // returns [OK, mv_lo, mv_hi, pct, adc_lo, adc_hi]
 #define IMMUROK_CMD_ENROLL_START    0x10
 #define IMMUROK_CMD_ENROLL_CANCEL  0x11
 #define IMMUROK_CMD_DELETE_FP       0x12
 #define IMMUROK_CMD_FP_LIST         0x13
 #define IMMUROK_CMD_FP_MATCH_ACK    0x22
+// MCU → App. No payload. App decides based on current screen state:
+//   locked   → ignore (in case it follows a 0x21 unlock notify)
+//   unlocked → trigger system lock (drop preceding 0x21 if any)
+#define IMMUROK_CMD_LOCK_REQUEST    0x23
 #define IMMUROK_CMD_PAIR_INIT       0x30
 #define IMMUROK_CMD_PAIR_CONFIRM    0x31
 #define IMMUROK_CMD_PAIR_STATUS     0x32
 #define IMMUROK_CMD_AUTH_REQUEST    0x33
+// PAIR_INIT 收到后，固件等待按设备按钮，期间会通知：
+//   [0x34, 0x00] 等待按钮超时 (30s)
+//   [0x34, 0x01] 用户已按按钮，ECDH 计算开始
+//   [0x34, 0x02] 用户长按取消
+#define IMMUROK_NTF_PAIR_BUTTON     0x34
 #define IMMUROK_CMD_FACTORY_RESET   0x36
 #define IMMUROK_CMD_GATE_CANCEL    0x37
 #define IMMUROK_CMD_CHALLENGE      0x38  // Challenge-response device verification
@@ -62,10 +72,12 @@ extern "C" {
 
 // Callback function types
 typedef void (*immurokCommandCB_t)(uint16_t connHandle, uint8_t *pData, uint8_t len);
+typedef void (*immurokCccChangeCB_t)(uint8_t enabled);  // CCCD notify enable/disable
 
 // Callback structure
 typedef struct {
     immurokCommandCB_t pfnCommandCB;    // Command received callback
+    immurokCccChangeCB_t pfnCccChangeCB; // CCCD write callback (app connected/disconnected)
 } immurokServiceCBs_t;
 
 /*********************************************************************

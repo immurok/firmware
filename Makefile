@@ -86,12 +86,12 @@ C_INCLUDES = \
 	-I$(SRC_PATH)/StdPeriphDriver/inc \
 	-I$(SRC_PATH)/RVMSIS
 
-# Hardware version (default: 0)
-# Usage: make VER=0 or make VER=1
+# Hardware version (default: latest = 5)
+# Usage: make VER=0 / VER=1 / VER=2 / VER=3 / VER=5
 ifdef VER
 HW_VER = $(VER)
 endif
-HW_VER ?= 0
+HW_VER ?= 5
 
 BLE_MEMHEAP = 5632
 
@@ -105,15 +105,27 @@ GIT_HASH := $(shell git rev-parse --short=4 HEAD 2>/dev/null || echo "0000")
 BUILD_NUMBER := 0x$(GIT_HASH)
 FW_VERSION := $(FW_VER_MAJOR).$(FW_VER_MINOR).$(FW_VER_PATCH).$(GIT_HASH)
 
+# Optional color variant. Unset → DIS Model Number = "IK-1" (general SKU,
+# declared 2026-05-14). Set to W/B/G → "IK-1-W"/"IK-1-B"/"IK-1-G" (declared
+# 2026-05-07). Build with: `make FW_VARIANT=W` (also wired through
+# ota/build-ota.sh as `--variant=W`).
+ifdef FW_VARIANT
+FW_VARIANT_DEFINE = -DFW_VARIANT=\"$(FW_VARIANT)\"
+else
+FW_VARIANT_DEFINE =
+endif
+
 # Common defines
 C_DEFS_COMMON = \
 	-DFW_BUILD_NUMBER=$(BUILD_NUMBER) \
+	$(FW_VARIANT_DEFINE) \
 	-DHARDWARE_VER$(HW_VER) \
 	-DCH592 \
 	-DBLE_MAC=FALSE \
 	-DDCDC_ENABLE=TRUE \
 	-DBLE_MEMHEAP_SIZE=$(BLE_MEMHEAP) \
 	-DBLE_BUFF_MAX_LEN=251 \
+	-DBLE_TX_NUM_EVENT=4 \
 	-DCLK_OSC32K=0 \
 	-DWAKE_UP_RTC_MAX_TIME=164 \
 	-DuECC_PLATFORM=uECC_arch_other \

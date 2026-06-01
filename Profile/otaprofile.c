@@ -1,7 +1,9 @@
 /*
  * OTA Profile Implementation for immurok CH592F
- * Service UUID: 0xFEE0 (BLE OTA Service)
- * Characteristic UUID: 0xFEE1 (OTA Data Channel)
+ * Service UUID: d29005de-1391-4a54-8168-bf4e3c080430 (BLE OTA Service)
+ * Char UUID:    c75f4c30-9a2d-4445-92e0-0e034c53d092 (OTA Data Channel)
+ *
+ * UUIDs are stored little-endian (BLE wire format).
  */
 
 #include "CONFIG.h"
@@ -18,18 +20,20 @@
 
 static OTAProfileCBs_t *OTAProfile_AppCBs = NULL;
 
-/* OTA Profile Service UUID: 0xFEE0 */
-static const uint8_t OTAProfileServUUID[ATT_BT_UUID_SIZE] = {
-    LO_UINT16(OTAPROFILE_SERV_UUID), HI_UINT16(OTAPROFILE_SERV_UUID)
+/* OTA Service UUID: d29005de-1391-4a54-8168-bf4e3c080430 */
+static const uint8_t OTAProfileServUUID[ATT_UUID_SIZE] = {
+    0x30, 0x04, 0x08, 0x3c, 0x4e, 0xbf, 0x68, 0x81,
+    0x54, 0x4a, 0x91, 0x13, 0xde, 0x05, 0x90, 0xd2
 };
 
-/* OTA Characteristic UUID: 0xFEE1 */
-static const uint8_t OTAProfileCharUUID[ATT_BT_UUID_SIZE] = {
-    LO_UINT16(OTAPROFILE_CHAR_UUID), HI_UINT16(OTAPROFILE_CHAR_UUID)
+/* OTA Characteristic UUID: c75f4c30-9a2d-4445-92e0-0e034c53d092 */
+static const uint8_t OTAProfileCharUUID[ATT_UUID_SIZE] = {
+    0x92, 0xd0, 0x53, 0x4c, 0x03, 0x0e, 0xe0, 0x92,
+    0x45, 0x44, 0x2d, 0x9a, 0x30, 0x4c, 0x5f, 0xc7
 };
 
 /* Service declaration */
-static const gattAttrType_t OTAProfileService = {ATT_BT_UUID_SIZE, OTAProfileServUUID};
+static const gattAttrType_t OTAProfileService = {ATT_UUID_SIZE, OTAProfileServUUID};
 
 /* Characteristic properties: Read + Write + Write Without Response */
 static uint8_t OTAProfileCharProps = GATT_PROP_READ | GATT_PROP_WRITE | GATT_PROP_WRITE_NO_RSP;
@@ -68,9 +72,12 @@ static gattAttribute_t OTAProfileAttrTbl[] = {
     },
 
     /* OTA Characteristic Value */
+    // ENCRYPT_WRITE: an unbonded peer must not be able to drive OTA (ERASE
+    // alone is enough to brick Image B + suppress HID/FP via s_ota_active).
+    // ENCRYPT_READ: status bytes back to OTA tool stay in encrypted link.
     {
-        {ATT_BT_UUID_SIZE, OTAProfileCharUUID},
-        GATT_PERMIT_READ | GATT_PERMIT_WRITE,
+        {ATT_UUID_SIZE, OTAProfileCharUUID},
+        GATT_PERMIT_ENCRYPT_READ | GATT_PERMIT_ENCRYPT_WRITE,
         0,
         &OTAProfileChar
     },
@@ -149,38 +156,26 @@ static bStatus_t OTAProfile_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAt
 {
     bStatus_t status = SUCCESS;
 
-    if(pAttr->type.len == ATT_BT_UUID_SIZE)
+    if(pAttr->type.len == ATT_UUID_SIZE &&
+       tmos_memcmp(pAttr->type.uuid, OTAProfileCharUUID, ATT_UUID_SIZE))
     {
-        uint16_t uuid = BUILD_UINT16(pAttr->type.uuid[0], pAttr->type.uuid[1]);
-
-        switch(uuid)
+        *pLen = 0;
+        if(OTAProfileReadLen)
         {
-            case OTAPROFILE_CHAR_UUID:
-            {
-                *pLen = 0;
-                if(OTAProfileReadLen)
-                {
-                    *pLen = OTAProfileReadLen;
-                    tmos_memcpy(pValue, OTAProfileReadBuf, OTAProfileReadLen);
-                    OTAProfileReadLen = 0;
+            *pLen = OTAProfileReadLen;
+            tmos_memcpy(pValue, OTAProfileReadBuf, OTAProfileReadLen);
+            OTAProfileReadLen = 0;
 
-                    if(OTAProfile_AppCBs && OTAProfile_AppCBs->pfnOTAProfileRead)
-                    {
-                        OTAProfile_AppCBs->pfnOTAProfileRead(OTAPROFILE_CHAR);
-                    }
-                }
-                break;
+            if(OTAProfile_AppCBs && OTAProfile_AppCBs->pfnOTAProfileRead)
+            {
+                OTAProfile_AppCBs->pfnOTAProfileRead(OTAPROFILE_CHAR);
             }
-            default:
-                *pLen = 0;
-                status = ATT_ERR_ATTR_NOT_FOUND;
-                break;
         }
     }
     else
     {
         *pLen = 0;
-        status = ATT_ERR_INVALID_HANDLE;
+        status = ATT_ERR_ATTR_NOT_FOUND;
     }
 
     return status;
@@ -196,33 +191,22 @@ static bStatus_t OTAProfile_WriteAttrCB(uint16_t connHandle, gattAttribute_t *pA
 {
     bStatus_t status = SUCCESS;
 
-    if(pAttr->type.len == ATT_BT_UUID_SIZE)
+    if(pAttr->type.len == ATT_UUID_SIZE &&
+       tmos_memcmp(pAttr->type.uuid, OTAProfileCharUUID, ATT_UUID_SIZE))
     {
-        uint16_t uuid = BUILD_UINT16(pAttr->type.uuid[0], pAttr->type.uuid[1]);
-
-        switch(uuid)
+        if(len > IAP_LEN)
         {
-            case OTAPROFILE_CHAR_UUID:
-            {
-                if(len > IAP_LEN)
-                {
-                    status = ATT_ERR_INVALID_VALUE_SIZE;
-                }
-                else
-                {
-                    OTAProfileWriteLen = len;
-                    tmos_memcpy(OTAProfileWriteBuf, pValue, len);
-                }
-                break;
-            }
-            default:
-                status = ATT_ERR_ATTR_NOT_FOUND;
-                break;
+            status = ATT_ERR_INVALID_VALUE_SIZE;
+        }
+        else
+        {
+            OTAProfileWriteLen = len;
+            tmos_memcpy(OTAProfileWriteBuf, pValue, len);
         }
     }
     else
     {
-        status = ATT_ERR_INVALID_HANDLE;
+        status = ATT_ERR_ATTR_NOT_FOUND;
     }
 
     /* Call application callback after successful write */

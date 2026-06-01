@@ -1,7 +1,7 @@
 /*
  * OTA Profile Header for immurok CH592F
- * Service UUID: 0xFEE0
- * Characteristic UUID: 0xFEE1
+ * Service UUID: d29005de-1391-4a54-8168-bf4e3c080430
+ * Char UUID:    c75f4c30-9a2d-4445-92e0-0e034c53d092
  */
 
 #ifndef __OTAPROFILE_H
@@ -10,12 +10,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* OTA Profile Service UUID */
-#define OTAPROFILE_SERV_UUID    0xFEE0
-
-/* OTA Profile Characteristic UUID */
-#define OTAPROFILE_CHAR_UUID    0xFEE1
 
 /* OTA Profile Service bit (for registration) */
 #define OTAPROFILE_SERVICE      0x00000001

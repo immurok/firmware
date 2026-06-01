@@ -229,6 +229,17 @@ int immurok_security_pair_confirm(const uint8_t *app_compressed33)
 }
 
 // Step 5: Called from TMOS event — heavy computation (~2s)
+// Set when ECC compute completes successfully but save is deferred to a
+// later TMOS event. Caller (hidkbd.c EXEC handler) reads this to know it
+// must schedule the save.
+volatile uint8_t immurok_security_pair_save_pending = 0;
+
+int immurok_security_pair_save(void)
+{
+    PRINT("ECDH deferred save start\n");
+    return save_security_data();
+}
+
 int immurok_security_pair_compute_secret(void)
 {
     PRINT("ECDH shared_secret start...\n");
@@ -271,12 +282,16 @@ int immurok_security_pair_compute_secret(void)
     // Mark as paired
     s_data.paired = 0x01;
 
-    // Save to EEPROM
-    int save_ret = save_security_data();
-    PRINT("ECDH pairing complete, save=%d\n", save_ret);
+    // Save deferred — EEPROM_READ called immediately after ECC (~2s of
+    // intensive flash instruction fetch) crashes the chip, regardless of
+    // IRQ state or chunk size. Caller schedules a TMOS event to call
+    // immurok_security_pair_save() once the call stack has fully unwound
+    // and instruction-fetch traffic has settled.
+    immurok_security_pair_save_pending = 1;
+    PRINT("ECDH compute done, save deferred\n");
 
     s_ecdh_state = ECDH_STATE_IDLE;
-    return save_ret;
+    return 0;
 }
 
 // ============================================================================
@@ -359,6 +374,7 @@ int immurok_security_factory_reset(void)
 
     uint8_t ret = EEPROM_ERASE(SECURITY_DATA_ADDR, EEPROM_BLOCK_SIZE);
     PRINT("Factory reset: EEPROM_ERASE ret=%d\n", ret);
+    (void)ret;
 
     immurok_keystore_reset();
 
@@ -415,8 +431,17 @@ static int save_security_data(void)
     PRINT("save_security_data: magic=0x%08lX, paired=%d\n",
           s_data.magic, s_data.paired);
 
-    // Read-modify-write: preserve SSH data that shares Block 0
-    EEPROM_READ(SECURITY_DATA_ADDR, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+    // Read-modify-write to preserve keystore data sharing Block 0. Wrap
+    // the READ in a global-IRQ disable as defense-in-depth — earlier
+    // testing showed inline calls right after ECC could fault into the
+    // IAP bootloader. Caller now defers this whole function via a TMOS
+    // event 200ms after the PAIR_CONFIRM response, so the call stack is
+    // fully unwound; the IRQ wrapper is belt-and-braces.
+    {
+        uint32_t saved = __risc_v_disable_irq();
+        EEPROM_READ(SECURITY_DATA_ADDR, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+        __risc_v_enable_irq(saved);
+    }
     memcpy(immurok_keystore_work_buf, &s_data, sizeof(s_data));
 
     WWDG_SetCounter(0);

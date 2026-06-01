@@ -21,20 +21,25 @@
 #include "hidkbd.h"
 #include "hiddev.h"
 #include "immurokservice.h"
+#include "fingerprint.h"  // fp_is_powered() — battery measurement defers when FP is active
 
 /*********************************************************************
  * MACROS
  */
 
-// Param update retry delay (625us units, 48000 = 30s)
+// Param update retry delay (625us units, 48000 = 30s) — Phase 2 (slave latency)
 #define PARAM_UPDATE_RETRY_DELAY          48000
 // Shorter re-request delay after macOS periodic param reset (625us units, 4800 = 3s)
 #define PARAM_UPDATE_REREQUEST_DELAY      4800
+// Phase 1 retry (latency=0, timeout extension only) — 5s
+#define PARAM_UPDATE_PHASE1_RETRY         8000
 
 // Battery measurement period in (625us)
-// 60000 * 625us = 37.5s per tick, measure every 2nd tick ≈ 75s
+// Tick = 60000 * 625us = 37.5s; measure every 48th tick = 1800s = 30 minutes.
+// App-side hourly GET_BATT_RAW handles fine-grained refresh; firmware ADC
+// cadence only needs to keep the BAS cache "fresh enough" for system Settings.
 #define DEFAULT_BATT_PERIOD               60000
-#define BATT_MEASURE_INTERVAL             2
+#define BATT_MEASURE_INTERVAL             48
 
 // TRUE to run scan parameters refresh notify test
 #define DEFAULT_SCAN_PARAM_NOTIFY_TEST    TRUE
@@ -858,12 +863,17 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
     // ECC signing (~2s) requires supervision timeout >= 5s to avoid disconnect.
     extern uint8_t s_latency_accepted;
     extern uint16_t s_conn_timeout;  // current timeout in units of 10ms
+    extern uint8_t s_post_discovery; // sticky: set once Phase 2 accepted
     extern uint8_t hidEmuTaskId;
     s_conn_timeout = connTimeout;
     if(connSlaveLatency > 0)
     {
         s_latency_accepted = 1;
         PRINT("Latency accepted (timeout=%dms)!\n", connTimeout * 10);
+        if(connTimeout >= 200)
+        {
+            s_post_discovery = 1;  // sticky until disconnect
+        }
     }
     else
     {
@@ -874,17 +884,23 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
     // latency can cause supervision timeout and disconnect.
     extern volatile uint8_t g_sleep_inhibit;
     extern uint8_t s_param_update_retries;
-    // Stop retry timer only when timeout is adequate (>= 2s)
     if(connTimeout >= 200) {
-        tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
         if(g_sleep_inhibit > 0) g_sleep_inhibit--;  // Release BLE-timeout hold
+        if(connSlaveLatency > 0) {
+            // Phase 2 accepted — fully done.
+            tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+        } else {
+            // Phase 1 done (timeout extended, latency still 0). Schedule
+            // Phase 2 (upgrade to slave latency) after macOS finishes
+            // service discovery.
+            tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, PARAM_UPDATE_RETRY_DELAY);
+        }
     } else {
         g_sleep_inhibit++;  // Suppress sleep until params restored
-        // Timeout inadequate — ensure retry timer is running.
-        // After first successful negotiation (retries > 0), macOS periodic
-        // param resets don't need 30s wait (service discovery already done).
+        // Timeout inadequate — retry Phase 1 quickly. Phase 1 (latency=0) is
+        // rarely rejected so REREQUEST_DELAY isn't gated on retries like before.
         uint32_t delay = s_param_update_retries > 0
-            ? PARAM_UPDATE_REREQUEST_DELAY : PARAM_UPDATE_RETRY_DELAY;
+            ? PARAM_UPDATE_REREQUEST_DELAY : PARAM_UPDATE_PHASE1_RETRY;
         tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, delay);
     }
 }
@@ -997,18 +1013,44 @@ static void hidDevScanParamCB(uint8_t event)
  *
  * @return  none
  */
+// Counter for hidDevBattPeriodicTask. Lifted to module scope so
+// HidDev_BattForceUpdate() can reset it when an out-of-band measurement
+// happens (e.g. user-initiated short-press refresh).
+static uint8_t battTickCount = 0;
+
 static void hidDevBattPeriodicTask(void)
 {
-    static uint8_t battTickCount = 0;
-
     battTickCount++;
     if(battTickCount >= BATT_MEASURE_INTERVAL)
     {
-        battTickCount = 0;
-        Batt_MeasLevel();
+        // Skip when the FP module is powered up — a touch / search / enroll
+        // is in progress. Batt_MeasLevel blocks ~250-500ms in
+        // vbat_settle_delay, sliced to keep BLE alive but UART RX from the
+        // FP module can still get starved enough to miss the lift ack;
+        // R599S then latches DETECT and the sensor goes unresponsive.
+        // Decrement so the next periodic tick re-attempts.
+        if(fp_is_powered())
+        {
+            battTickCount--;
+        }
+        else
+        {
+            battTickCount = 0;
+            Batt_MeasLevel();
+        }
     }
 
     // Restart timer
+    tmos_start_task(hidDevTaskId, BATT_PERIODIC_EVT, DEFAULT_BATT_PERIOD);
+}
+
+void HidDev_BattForceUpdate(void)
+{
+    Batt_MeasLevel();
+    battTickCount = 0;
+    // Restart timer so the next periodic tick is a full DEFAULT_BATT_PERIOD
+    // from now. tmos_stop_task is a no-op if the task isn't scheduled.
+    tmos_stop_task(hidDevTaskId, BATT_PERIODIC_EVT);
     tmos_start_task(hidDevTaskId, BATT_PERIODIC_EVT, DEFAULT_BATT_PERIOD);
 }
 

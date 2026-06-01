@@ -147,7 +147,14 @@ static uint32_t compute_entries_checksum(uint32_t entries_addr, uint16_t count,
     while (offset < total_bytes) {
         uint16_t chunk = (total_bytes - offset > sizeof(immurok_keystore_work_buf))
                          ? sizeof(immurok_keystore_work_buf) : (uint16_t)(total_bytes - offset);
-        EEPROM_READ(entries_addr + offset, immurok_keystore_work_buf, chunk);
+        // IRQ-disable around EEPROM_READ — same defense-in-depth as
+        // save_security_data. Inline reads under the wrong execution context
+        // can fault into the IAP bootloader on this chip.
+        {
+            uint32_t saved = __risc_v_disable_irq();
+            EEPROM_READ(entries_addr + offset, immurok_keystore_work_buf, chunk);
+            __risc_v_enable_irq(saved);
+        }
         for (uint16_t i = 0; i < chunk; i++) {
             sum += immurok_keystore_work_buf[i];
             sum = (sum << 1) | (sum >> 31);
@@ -210,7 +217,11 @@ static int save_header(uint8_t cat)
     uint32_t block_base = h_addr & ~0xFFF;
 
     // Read entire block
-    EEPROM_READ(block_base, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+    {
+        uint32_t saved = __risc_v_disable_irq();
+        EEPROM_READ(block_base, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+        __risc_v_enable_irq(saved);
+    }
 
     // Patch header in buffer
     uint16_t offset_in_block = h_addr - block_base;
@@ -225,8 +236,9 @@ static int save_header(uint8_t cat)
     return 0;
 }
 
-// Write an entry to DataFlash using read-modify-write on its block
-// Also updates header count and checksum if needed
+// Write an entry to DataFlash using read-modify-write on its block(s).
+// Handles entries that span a 4KB block boundary (e.g. OTP idx>=44, API idx>=25).
+// Also updates header count and checksum if needed.
 static int write_entry(uint8_t cat, uint16_t idx, const uint8_t *entry_data)
 {
     uint32_t h_addr, e_addr;
@@ -239,11 +251,18 @@ static int write_entry(uint8_t cat, uint16_t idx, const uint8_t *entry_data)
     uint32_t entry_addr = e_addr + (uint32_t)idx * e_size;
     uint32_t entry_block = entry_addr & ~0xFFF;
     uint32_t header_block = h_addr & ~0xFFF;
-
-    // Write the entry's block
-    EEPROM_READ(entry_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
     uint16_t off_in_block = entry_addr - entry_block;
-    memcpy(&immurok_keystore_work_buf[off_in_block], entry_data, e_size);
+    uint16_t first_chunk = EEPROM_BLOCK_SIZE - off_in_block;  // bytes until block end
+    uint8_t  crosses_block = (first_chunk < e_size) ? 1 : 0;
+
+    // --- First block (always needed) ---
+    {
+        uint32_t saved = __risc_v_disable_irq();
+        EEPROM_READ(entry_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+        __risc_v_enable_irq(saved);
+    }
+    uint16_t copy1 = crosses_block ? first_chunk : e_size;
+    memcpy(&immurok_keystore_work_buf[off_in_block], entry_data, copy1);
 
     // If header is in the same block, patch it too
     if (entry_block == header_block) {
@@ -255,6 +274,22 @@ static int write_entry(uint8_t cat, uint16_t idx, const uint8_t *entry_data)
     EEPROM_ERASE(entry_block, EEPROM_BLOCK_SIZE);
     WWDG_SetCounter(0);
     EEPROM_WRITE(entry_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+
+    // --- Second block (only if entry crosses boundary) ---
+    if (crosses_block) {
+        uint32_t next_block = entry_block + EEPROM_BLOCK_SIZE;
+        uint16_t copy2 = e_size - first_chunk;
+        {
+            uint32_t saved = __risc_v_disable_irq();
+            EEPROM_READ(next_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+            __risc_v_enable_irq(saved);
+        }
+        memcpy(&immurok_keystore_work_buf[0], entry_data + first_chunk, copy2);
+        WWDG_SetCounter(0);
+        EEPROM_ERASE(next_block, EEPROM_BLOCK_SIZE);
+        WWDG_SetCounter(0);
+        EEPROM_WRITE(next_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+    }
 
     // If header is in a different block, save it separately
     if (entry_block != header_block) {
@@ -296,6 +331,13 @@ int immurok_keystore_count(uint8_t cat)
     return s_headers[cat].count;
 }
 
+uint32_t immurok_keystore_checksum(uint8_t cat)
+{
+    if (cat >= KEYSTORE_CAT_COUNT)
+        return 0;
+    return s_headers[cat].checksum;
+}
+
 int immurok_keystore_read(uint8_t cat, uint8_t idx, uint8_t offset,
                           uint8_t *buf, uint8_t len)
 {
@@ -330,9 +372,31 @@ int immurok_keystore_stage(uint8_t cat, uint8_t idx, uint8_t offset,
     if ((uint16_t)offset + len > e_size)
         return -1;
 
-    // Start new staging if category/index changed
+    // Start new staging if category/index changed.
+    // For updates to an existing entry (idx != 0xFF and idx < count): preload
+    // current entry from flash so partial writes preserve fields the App
+    // can't see (OTP secret[32], SSH privkey[32]). Otherwise the buffer is
+    // zeroed and a partial KEY_WRITE chain (e.g. App rewrites only name +
+    // service for OTP rename) silently nukes the hidden secret on commit.
     if (s_stage_cat != cat || s_stage_idx != idx) {
-        memset(s_stage_buf, 0, sizeof(s_stage_buf));
+        if (idx != 0xFF && idx < s_headers[cat].count) {
+            // IRQ-disable around EEPROM_READ — same defense-in-depth as
+            // save_security_data / write_entry / save_header / etc. Without
+            // it this read can fault into the IAP bootloader on certain
+            // execution contexts → silent reboot → FP module left in unknown
+            // power state → user sees "FP stuck during enroll/identify".
+            // (1.2.8 introduced this read for partial-write rename safety
+            // but didn't add the wrapper. 1.2.10 closes the loop.)
+            uint32_t saved = __risc_v_disable_irq();
+            EEPROM_READ(e_addr + (uint32_t)idx * e_size, s_stage_buf, e_size);
+            __risc_v_enable_irq(saved);
+            // Zero any tail beyond e_size (s_stage_buf is sized for max entry)
+            if (e_size < sizeof(s_stage_buf)) {
+                memset(&s_stage_buf[e_size], 0, sizeof(s_stage_buf) - e_size);
+            }
+        } else {
+            memset(s_stage_buf, 0, sizeof(s_stage_buf));
+        }
         s_stage_cat = cat;
         s_stage_idx = idx;
     }
@@ -417,15 +481,30 @@ int immurok_keystore_delete(uint8_t cat, uint8_t idx)
     uint16_t last_idx = s_headers[cat].count - 1;
 
     if (idx != last_idx) {
-        // Swap-delete: read last entry, write it to deleted position
+        // Swap-delete: read last entry, write it to deleted position.
+        //
+        // NOTE: do NOT use a local `uint8_t tmp[160]` here. CH592F has only
+        // 512B of CPU stack; this function runs from inside the BLE FP-match
+        // priority chain with a deep call stack already. A 160B local plus
+        // the rest of the frame can overflow into the .stack_guard region
+        // (where immurok_keystore_work_buf lives), and the next EEPROM_READ
+        // populating work_buf then writes through stack/return addresses
+        // → wild jump → IAP fault → BLE disconnect → user sees red LED then
+        // a reset boot. Borrow s_stage_buf (160B, .bss) instead.
         uint32_t last_addr = e_addr + (uint32_t)last_idx * e_size;
-        uint8_t tmp[160] __attribute__((aligned(4)));
-        EEPROM_READ(last_addr, tmp, e_size);
+        {
+            uint32_t saved = __risc_v_disable_irq();
+            EEPROM_READ(last_addr, s_stage_buf, e_size);
+            __risc_v_enable_irq(saved);
+        }
 
         // Write last entry to deleted position
         s_headers[cat].count--;
         s_headers[cat].checksum = 0;  // Will recompute
-        write_entry(cat, idx, tmp);
+        write_entry(cat, idx, s_stage_buf);
+        // Trampling s_stage_buf invalidates any in-flight KEY_WRITE staging.
+        s_stage_cat = 0xFF;
+        s_stage_idx = 0xFF;
     } else {
         // Deleting last entry - just decrement count
         s_headers[cat].count--;
@@ -483,7 +562,7 @@ int immurok_keystore_getpub(uint8_t idx, uint8_t *pub64)
     return immurok_keystore_read(KEYSTORE_CAT_SSH, idx, 16, pub64, 64);
 }
 
-int immurok_keystore_generate(const uint8_t *name16, uint8_t *pub64)
+int immurok_keystore_generate_stage(const uint8_t *name16, uint8_t *pub64)
 {
     if (s_headers[KEYSTORE_CAT_SSH].count >= KEYSTORE_SSH_MAX)
         return -1;
@@ -507,18 +586,24 @@ int immurok_keystore_generate(const uint8_t *name16, uint8_t *pub64)
     // Store public key in entry at offset 16
     memcpy(&s_ecc_entry[16], pub64, 64);
 
-    // Stage and commit the new entry
+    // Stage but do NOT commit — caller commits in a fresh TMOS context
+    // (same hazard as save_security_data: inline EEPROM_ERASE/WRITE right
+    // after ECC compute can fault into the IAP bootloader → silent reboot
+    // and BLE supervision timeout).
     uint8_t new_idx = s_headers[KEYSTORE_CAT_SSH].count;
     if (immurok_keystore_stage(KEYSTORE_CAT_SSH, 0xFF, 0, s_ecc_entry, 112) != 0) {
         memset(s_ecc_entry, 0, 112);
         return -1;
     }
-    if (immurok_keystore_commit(KEYSTORE_CAT_SSH, 0xFF) != 0) {
-        memset(s_ecc_entry, 0, 112);
-        return -1;
-    }
-
     memset(s_ecc_entry, 0, 112);
+    return new_idx;
+}
+
+int immurok_keystore_generate(const uint8_t *name16, uint8_t *pub64)
+{
+    int new_idx = immurok_keystore_generate_stage(name16, pub64);
+    if (new_idx < 0) return -1;
+    if (immurok_keystore_commit(KEYSTORE_CAT_SSH, 0xFF) != 0) return -1;
     return new_idx;
 }
 

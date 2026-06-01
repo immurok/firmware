@@ -399,6 +399,18 @@ extern bStatus_t HidDev_GetParameter(uint8_t param, void *pValue);
 extern void HidDev_PasscodeRsp(uint8_t status, uint32_t passcode);
 
 /*********************************************************************
+ * @fn      HidDev_BattForceUpdate
+ *
+ * @brief   Run an immediate battery measurement and reset the periodic
+ *          measurement schedule. Call this when a manual trigger needs
+ *          a fresh battery reading and wants the next periodic tick to
+ *          start counting from now.
+ *
+ * @return  none
+ */
+extern void HidDev_BattForceUpdate(void);
+
+/*********************************************************************
  * @fn          HidDev_ReadAttrCB
  *
  * @brief       HID Dev attribute read callback.

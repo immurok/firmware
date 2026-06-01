@@ -16,20 +16,26 @@
 #define FP_MAX_TEMPLATES        29      // Maximum fingerprint templates (0-28)
 #define FP_UART_BAUD            57600   // UART baud rate (8N2)
 
-// Dual-slot fingerprint configuration
-#define FP_USER_MAX             5       // Max user-visible fingerprints (adjustable: 6, 10, etc.)
-#define FP_SLOTS_PER_FINGER     2       // Physical slots per fingerprint
-#define FP_SLOT_MAX             (FP_USER_MAX * FP_SLOTS_PER_FINGER)  // 10
+// Single-slot fingerprint configuration
+// Each slot uses 12 GenChar buffers; R559S stores max 100 templates → 8 slots max, limit to 5
+#define FP_USER_MAX             5       // Max user-visible fingerprints
+#define FP_SLOTS_PER_FINGER     1       // Physical slots per fingerprint
+#define FP_SLOT_MAX             FP_USER_MAX  // 5
+#define FP_ENROLL_CAPTURES      12      // Captures per enrollment
 
-// Mapping: user finger_id → physical slot
-#define FP_SLOT_FIRST(fid)      ((fid) * FP_SLOTS_PER_FINGER)
-#define FP_SLOT_SECOND(fid)     ((fid) * FP_SLOTS_PER_FINGER + 1)
+// Mapping: user finger_id ↔ physical slot (identity)
+#define FP_SLOT(fid)            (fid)
+#define FP_FINGER_ID(slot)      (slot)
 
-// Reverse mapping: physical slot → user finger_id
-#define FP_FINGER_ID(slot)      ((slot) / FP_SLOTS_PER_FINGER)
+// Response buffer size (shrunk from 128 → 64 so .bss+.stack_guard doesn't
+// overflow into the 512B main stack. Largest observed packet is ~43B from
+// CMD_READ_INDEX_TAB, so 64B is still safe.)
+#define FP_RX_BUF_SIZE          64
 
-// Response buffer size
-#define FP_RX_BUF_SIZE          128
+// Sensor match threshold. R559S ScoreLevel 5 = strictest (FAR < 0.001%, FRR < 1%).
+// Default-from-factory is 3 (medium); a partial / low-quality short tap can pass
+// at level 3 with a thin feature template, producing a false accept.
+#define FP_TARGET_SCORE_LEVEL   5
 
 // Confirmation codes (RBF[9])
 #define FP_ACK_SUCCESS          0x00    // Command executed successfully
@@ -104,6 +110,50 @@ typedef enum {
 
 // Progress callback type
 typedef void (*fp_progress_cb_t)(fp_enroll_event_t event, int capture, int total);
+
+// ============================================================================
+// UART RX Helpers (interrupt-driven ring buffer; used by FP state machines)
+// ============================================================================
+
+/**
+ * Pop one byte from the UART1 RX ring buffer.
+ * @return byte in 0..255, or -1 if the buffer is empty
+ */
+int uart_rx_pop(void);
+
+/**
+ * Bytes currently available in the UART1 RX ring buffer.
+ */
+uint16_t uart_rx_available(void);
+
+/**
+ * Reset the non-blocking packet parser. Call before each new fp_send_cmd
+ * whose response will be consumed via fp_try_parse_packet.
+ */
+void fp_parser_reset(void);
+
+/**
+ * Build + transmit a command packet. Public entry points:
+ *   fp_send_cmd          - includes uart_flush() (clears RX ring + parser
+ *                          residue). Use for fresh request/response pairs.
+ *   fp_send_cmd_noflush  - skips the flush. Use in caller-managed retry
+ *                          sequences where a late ack from a prior send
+ *                          should be preserved.
+ */
+int fp_send_cmd(uint8_t cmd, const uint8_t *params, uint16_t param_len);
+int fp_send_cmd_noflush(uint8_t cmd, const uint8_t *params, uint16_t param_len);
+
+/**
+ * Try to parse one complete FP response packet from the ring buffer.
+ * Non-blocking — returns immediately whether or not bytes are available.
+ *
+ * @param ack_code   out: response ACK byte
+ * @param params     out: response data (may be NULL to skip)
+ * @param param_len  in/out: on entry max bytes to copy; on success actual bytes
+ * @return  FP_OK on complete packet, FP_ERR_TIMEOUT if more bytes needed,
+ *          FP_ERR_FAIL on checksum/framing error (parser auto-reset).
+ */
+int fp_try_parse_packet(uint8_t *ack_code, uint8_t *params, uint16_t *param_len);
 
 // ============================================================================
 // Initialization
@@ -216,9 +266,22 @@ int fp_clear_all(void);
 void fp_power_on(void);
 
 /**
- * Power off the fingerprint module
+ * Power off the fingerprint module (synchronous: PS_Sleep + VCC cut).
+ * Blocks ~5ms when finger has lifted, ~4s when finger is still on the
+ * sensor (busy-loop calibration of fp_recv_ack). Use only on paths where
+ * lift has been confirmed; see fp_finish_off + async retry in hidkbd.c
+ * for the held-finger case.
  */
 void fp_power_off(void);
+
+/**
+ * Cut VCC + GPIO without sending PS_Sleep. Used by the async retry path
+ * after PS_Sleep has been acked separately, or as a last-resort timeout
+ * fallback. Calling this with finger still on the sensor leaves R599S in
+ * a state where the next touch detection won't fire — only safe after
+ * a successful PS_Sleep ack or on a sensor that's truly stuck.
+ */
+void fp_finish_off(void);
 
 /**
  * Wake up fingerprint module for operation (blocking)
@@ -268,6 +331,14 @@ int fp_sleep(void);
 // ============================================================================
 // Security
 // ============================================================================
+
+/**
+ * Set sensor match score threshold (1=lowest .. 5=highest).
+ * Persists in sensor FLASH; only writes when current level differs from `level`
+ * to avoid wear. Per R559S manual §3.1 register 5 = ScoreLevel.
+ * @return FP_OK on success, FP_ERR_* on failure
+ */
+int fp_set_score_level(uint8_t level);
 
 /**
  * Set module password

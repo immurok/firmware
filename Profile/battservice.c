@@ -504,13 +504,13 @@ static uint8_t battMeasure(void)
         // Discard first sample to pre-charge ADC sampling capacitor
         ADC_ExcutSingleConver();
 
-        // Average 4 ADC samples for stability
+        // Average 3 ADC samples for stability
         uint32_t sum = 0;
-        for(int i = 0; i < 4; i++)
+        for(int i = 0; i < 3; i++)
         {
             sum += ADC_ExcutSingleConver();
         }
-        uint16_t adc = (uint16_t)(sum >> 2);
+        uint16_t adc = (uint16_t)(sum / 3);
 
         if(battServiceTeardownCB != NULL)
         {

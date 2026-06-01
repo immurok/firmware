@@ -83,6 +83,13 @@ void immurok_keystore_init(void);
 int immurok_keystore_count(uint8_t cat);
 
 /**
+ * Get the per-category checksum stored in the header. App caches a key list
+ * locally, queries this on every need, and only re-fetches when it differs.
+ * Returns 0 if cat invalid (treat as cache-invalid on App side).
+ */
+uint32_t immurok_keystore_checksum(uint8_t cat);
+
+/**
  * Read an entry
  * @param cat Category
  * @param idx Entry index (0-based)
@@ -152,6 +159,19 @@ int immurok_keystore_getpub(uint8_t idx, uint8_t *pub64);
  * @return New entry index on success, -1 on error
  */
 int immurok_keystore_generate(const uint8_t *name16, uint8_t *pub64);
+
+/**
+ * Stage half of generate(): runs ECC, fills the staging buffer with the new
+ * SSH entry, but does NOT commit to flash. Caller must invoke
+ * immurok_keystore_commit(KEYSTORE_CAT_SSH, 0xFF) in a fresh TMOS context
+ * (e.g. ~200ms after this returns) — calling EEPROM_ERASE/WRITE inline right
+ * after uECC_make_key on the same call stack can fault into the IAP
+ * bootloader on this chip (same hazard as PAIR_CONFIRM → save_security_data).
+ * @param name16 16-byte name (zero-padded)
+ * @param pub64 Output: 64-byte public key x||y (little-endian)
+ * @return New entry index on success, -1 on error
+ */
+int immurok_keystore_generate_stage(const uint8_t *name16, uint8_t *pub64);
 
 /**
  * Compute TOTP (RFC 6238) for an OTP entry on-device

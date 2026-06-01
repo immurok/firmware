@@ -137,8 +137,6 @@ void sha256_update(sha256_ctx_t *ctx, const uint8_t *data, size_t len)
 void sha256_final(sha256_ctx_t *ctx, uint8_t *digest)
 {
     uint64_t bits = ctx->count * 8;
-    size_t index = (size_t)(ctx->count & 0x3F);
-    size_t pad_len = (index < 56) ? (56 - index) : (120 - index);
 
     // Padding
     static const uint8_t padding[64] = { 0x80 };

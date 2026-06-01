@@ -5,6 +5,8 @@
  */
 
 #include "CH59x_common.h"
+#include "CONFIG.h"
+#include "HAL.h"
 #include "fingerprint.h"
 #include "hardware_pins.h"
 #include "ws2812.h"
@@ -90,6 +92,45 @@ static uint32_t s_cached_password = 0;
 static bool s_password_cached = false;
 static uint32_t s_module_addr = FP_DEFAULT_ADDR;
 static uint8_t s_rx_buf[FP_RX_BUF_SIZE];
+static uint16_t s_rx_total = 0;      // Total bytes from last uart_recv
+static uint16_t s_rx_offset = 0;     // Offset of next unprocessed packet
+static uint8_t s_cur_score_level = 0; // 0 = unknown; set by read_module_info
+
+// ============================================================================
+// UART1 RX Ring Buffer (ISR-driven; SPSC, power-of-2 size)
+// ============================================================================
+// 64B: largest FP response packet is ~21B, so this is >3× the max burst.
+// Kept small because .bss sits between the BLE stack RAM and the 512B main
+// stack — larger ring would collide with .stack_guard.
+#define UART_RX_RING_SIZE 64
+#define UART_RX_RING_MASK (UART_RX_RING_SIZE - 1)
+static volatile uint8_t  s_rx_ring[UART_RX_RING_SIZE];
+static volatile uint16_t s_rx_ring_head = 0;  // written by ISR
+static volatile uint16_t s_rx_ring_tail = 0;  // written by main
+
+static inline void uart_ring_reset(void)
+{
+    // Safe from main context when IRQ is masked or when FP is powered off
+    s_rx_ring_head = 0;
+    s_rx_ring_tail = 0;
+}
+
+uint16_t uart_rx_available(void)
+{
+    uint16_t h = s_rx_ring_head;
+    uint16_t t = s_rx_ring_tail;
+    return (uint16_t)((h - t) & UART_RX_RING_MASK);
+}
+
+// Pop one byte. Returns byte in 0..255, or -1 if empty.
+int uart_rx_pop(void)
+{
+    uint16_t t = s_rx_ring_tail;
+    if (t == s_rx_ring_head) return -1;
+    uint8_t b = s_rx_ring[t];
+    s_rx_ring_tail = (t + 1) & UART_RX_RING_MASK;
+    return b;
+}
 
 // ============================================================================
 // Forward Declarations
@@ -127,7 +168,39 @@ static void uart_init(void)
     UART1_BaudRateCfg(FP_UART_BAUD);
     // 8N1: 1 start bit, 8 data bits, no parity, 1 stop bit
 
+    // Trigger RX IRQ on every byte (FP packets are small and bursty; 1-byte
+    // trigger avoids stale-FIFO edge cases at packet boundaries).
+    UART1_ByteTrigCfg(UART_1BYTE_TRIG);
+    uart_ring_reset();
+    UART1_INTCfg(ENABLE, RB_IER_RECV_RDY | RB_IER_LINE_STAT);
+    PFIC_EnableIRQ(UART1_IRQn);
+
     PRINT("UART1 initialized: %d baud, 8N1\n", FP_UART_BAUD);
+}
+
+// UART1 RX ISR: drain FIFO into ring buffer. Kept small to minimize stack use
+// (CH592F has only 512B of stack). Runs in WCH-Interrupt-fast context.
+__INTERRUPT
+__HIGH_CODE
+void UART1_IRQHandler(void)
+{
+    uint8_t iir = R8_UART1_IIR & RB_IIR_INT_MASK;
+    if (iir == UART_II_LINE_STAT) {
+        (void)R8_UART1_LSR;  // clear line-status flags
+        return;
+    }
+    if (iir == UART_II_RECV_RDY || iir == UART_II_RECV_TOUT) {
+        while (R8_UART1_RFC) {
+            uint8_t b = R8_UART1_RBR;
+            uint16_t next = (s_rx_ring_head + 1) & UART_RX_RING_MASK;
+            if (next != s_rx_ring_tail) {
+                s_rx_ring[s_rx_ring_head] = b;
+                s_rx_ring_head = next;
+            }
+            // else: overflow — drop the byte. 128B ring is >4× the largest
+            // FP packet (~30B), so only possible if main never drains.
+        }
+    }
 }
 
 static void uart_send(const uint8_t *data, uint16_t len)
@@ -150,8 +223,9 @@ static int uart_recv(uint8_t *data, uint16_t max_len, uint32_t timeout_ms)
     uint32_t idle_count = 0;
 
     while (count < max_len) {
-        if (R8_UART1_RFC > 0) {
-            data[count++] = R8_UART1_RBR;
+        int b = uart_rx_pop();
+        if (b >= 0) {
+            data[count++] = (uint8_t)b;
             idle_count = 0;
         } else {
             idle_count++;
@@ -176,11 +250,11 @@ static int uart_recv(uint8_t *data, uint16_t max_len, uint32_t timeout_ms)
     return count;
 }
 
-static void uart_flush(void)
+void uart_flush(void)
 {
-    while (R8_UART1_RFC > 0) {
-        (void)R8_UART1_RBR;
-    }
+    uart_ring_reset();
+    s_rx_total = 0;
+    s_rx_offset = 0;
 }
 
 // ============================================================================
@@ -196,7 +270,11 @@ static uint16_t calc_checksum(const uint8_t *data, uint16_t len)
     return sum;
 }
 
-int fp_send_cmd(uint8_t cmd, const uint8_t *params, uint16_t param_len)
+// Build + transmit a command packet. When `flush` is true the RX ring is
+// reset before sending — the usual case for fresh request/response pairs.
+// Set `flush` false in caller-managed retry sequences where a late-arriving
+// ack from a previous send should NOT be discarded.
+static int fp_send_cmd_impl(uint8_t cmd, const uint8_t *params, uint16_t param_len, int flush)
 {
     static uint8_t packet[64];  // static: save 64B stack (only 512B total)
     uint16_t len = 0;
@@ -233,44 +311,199 @@ int fp_send_cmd(uint8_t cmd, const uint8_t *params, uint16_t param_len)
     packet[len++] = (cs >> 8) & 0xFF;
     packet[len++] = cs & 0xFF;
 
-    // Flush RX and send
-    uart_flush();
+    if (flush) uart_flush();
     uart_send(packet, len);
 
     return FP_OK;
 }
 
+int fp_send_cmd(uint8_t cmd, const uint8_t *params, uint16_t param_len)
+{
+    return fp_send_cmd_impl(cmd, params, param_len, 1);
+}
+
+int fp_send_cmd_noflush(uint8_t cmd, const uint8_t *params, uint16_t param_len)
+{
+    return fp_send_cmd_impl(cmd, params, param_len, 0);
+}
+
 int fp_recv_ack(uint8_t *ack_code, uint8_t *params, uint16_t *param_len, uint32_t timeout_ms)
 {
-    // Read packet
-    int recv_len = uart_recv(s_rx_buf, FP_RX_BUF_SIZE, timeout_ms);
-    if (recv_len < 12) {
-        return FP_ERR_TIMEOUT;
+    // Check for residual data from a previous uart_recv that contained multiple packets
+    uint8_t *buf;
+    uint16_t avail;
+
+    if (s_rx_offset < s_rx_total) {
+        buf = &s_rx_buf[s_rx_offset];
+        avail = s_rx_total - s_rx_offset;
+
+        // Residual too small or invalid header → discard and fall through to fresh read
+        if (avail < 12 || buf[0] != FP_HEADER_1 || buf[1] != FP_HEADER_2) {
+            s_rx_total = 0;
+            s_rx_offset = 0;
+            // Fall through to UART read below
+        } else {
+            goto parse;
+        }
     }
 
+    // Read from UART
+    {
+        int recv_len = uart_recv(s_rx_buf, FP_RX_BUF_SIZE, timeout_ms);
+        if (recv_len < 12) {
+            s_rx_total = 0;
+            s_rx_offset = 0;
+            return FP_ERR_TIMEOUT;
+        }
+        s_rx_total = (uint16_t)recv_len;
+        s_rx_offset = 0;
+        buf = s_rx_buf;
+        avail = s_rx_total;
+    }
+
+parse:
     // Verify header
-    if (s_rx_buf[0] != FP_HEADER_1 || s_rx_buf[1] != FP_HEADER_2) {
+    if (buf[0] != FP_HEADER_1 || buf[1] != FP_HEADER_2) {
+        s_rx_total = 0;
+        s_rx_offset = 0;
         return FP_ERR_FAIL;
     }
 
     // Verify packet type
-    if (s_rx_buf[6] != FP_ACK_PACKET) {
+    if (buf[6] != FP_ACK_PACKET) {
+        s_rx_total = 0;
+        s_rx_offset = 0;
         return FP_ERR_FAIL;
     }
 
-    // Get length
-    uint16_t pkt_len = (s_rx_buf[7] << 8) | s_rx_buf[8];
+    // Get length field (includes ack + params + checksum)
+    uint16_t pkt_len = (buf[7] << 8) | buf[8];
+    uint16_t total_pkt = 9 + pkt_len;  // header(9) + pkt_len
+
+    // Bounds check: reject if declared packet length exceeds available data
+    if (total_pkt > avail) {
+        s_rx_total = 0;
+        s_rx_offset = 0;
+        return FP_ERR_FAIL;
+    }
 
     // Get ACK code
-    *ack_code = s_rx_buf[9];
+    *ack_code = buf[9];
 
     // Get parameters (if any)
     if (param_len && params && pkt_len > 3) {
-        *param_len = pkt_len - 3;  // Subtract ack_code + checksum
-        memcpy(params, &s_rx_buf[10], *param_len);
+        uint16_t data_len = pkt_len - 3;  // Subtract ack_code + checksum
+        if (data_len > *param_len) {
+            data_len = *param_len;
+        }
+        uint16_t data_avail = (avail > 10) ? (avail - 10) : 0;
+        if (data_len > data_avail) {
+            data_len = data_avail;
+        }
+        memcpy(params, &buf[10], data_len);
+        *param_len = data_len;
     }
 
+    // Advance offset past this packet for next call
+    s_rx_offset += total_pkt;
+
     return FP_OK;
+}
+
+// ============================================================================
+// Non-blocking Packet Parser (Phase 2)
+// Incremental accumulator — caller pumps fp_try_parse_packet periodically
+// via a TMOS event. State persists across calls; reset before each new cmd.
+// ============================================================================
+
+static struct {
+    uint8_t  buf[32];    // >= header(9) + ack(1) + largest SEARCH/WAIT_LIFT response
+    uint16_t pos;        // bytes accumulated so far
+    uint16_t total_sz;   // 0 until length field seen, then 9 + pkt_len
+} s_parser;
+
+void fp_parser_reset(void)
+{
+    s_parser.pos = 0;
+    s_parser.total_sz = 0;
+}
+
+int fp_try_parse_packet(uint8_t *ack_code, uint8_t *params, uint16_t *param_len)
+{
+    for (;;) {
+        // Header resync: while not past position 2, enforce the two magic bytes.
+        if (s_parser.pos == 0) {
+            int b = uart_rx_pop();
+            if (b < 0) return FP_ERR_TIMEOUT;
+            if ((uint8_t)b != FP_HEADER_1) continue;
+            s_parser.buf[0] = (uint8_t)b;
+            s_parser.pos = 1;
+        }
+        if (s_parser.pos == 1) {
+            int b = uart_rx_pop();
+            if (b < 0) return FP_ERR_TIMEOUT;
+            if ((uint8_t)b != FP_HEADER_2) {
+                // Not a valid header — drop the first byte and keep scanning.
+                s_parser.pos = 0;
+                continue;
+            }
+            s_parser.buf[1] = (uint8_t)b;
+            s_parser.pos = 2;
+        }
+
+        // Accumulate fixed-size preamble up to and including the length field.
+        while (s_parser.pos < 9) {
+            int b = uart_rx_pop();
+            if (b < 0) return FP_ERR_TIMEOUT;
+            s_parser.buf[s_parser.pos++] = (uint8_t)b;
+        }
+
+        // After header(9) we know packet type and length.
+        if (s_parser.total_sz == 0) {
+            if (s_parser.buf[6] != FP_ACK_PACKET) {
+                fp_parser_reset();
+                return FP_ERR_FAIL;
+            }
+            uint16_t pkt_len = ((uint16_t)s_parser.buf[7] << 8) | s_parser.buf[8];
+            // pkt_len includes ack(1) + params + checksum(2) — minimum 3 bytes.
+            if (pkt_len < 3 || (uint16_t)(9 + pkt_len) > sizeof(s_parser.buf)) {
+                fp_parser_reset();
+                return FP_ERR_FAIL;
+            }
+            s_parser.total_sz = 9 + pkt_len;
+        }
+
+        // Accumulate payload + checksum.
+        while (s_parser.pos < s_parser.total_sz) {
+            int b = uart_rx_pop();
+            if (b < 0) return FP_ERR_TIMEOUT;
+            s_parser.buf[s_parser.pos++] = (uint8_t)b;
+        }
+
+        // Complete packet — validate checksum.
+        uint16_t cs_expected = calc_checksum(&s_parser.buf[6], s_parser.total_sz - 6 - 2);
+        uint16_t cs_recv = ((uint16_t)s_parser.buf[s_parser.total_sz - 2] << 8)
+                         | s_parser.buf[s_parser.total_sz - 1];
+        if (cs_expected != cs_recv) {
+            fp_parser_reset();
+            return FP_ERR_FAIL;
+        }
+
+        // Extract fields.
+        *ack_code = s_parser.buf[9];
+        uint16_t pkt_len = ((uint16_t)s_parser.buf[7] << 8) | s_parser.buf[8];
+        uint16_t data_len = pkt_len - 3;  // subtract ack + checksum
+        if (param_len && params && data_len > 0) {
+            uint16_t to_copy = (data_len > *param_len) ? *param_len : data_len;
+            memcpy(params, &s_parser.buf[10], to_copy);
+            *param_len = to_copy;
+        } else if (param_len) {
+            *param_len = 0;
+        }
+
+        fp_parser_reset();
+        return FP_OK;
+    }
 }
 
 static int send_cmd_recv_ack(uint8_t cmd, const uint8_t *params, uint16_t param_len, uint32_t timeout_ms)
@@ -364,6 +597,9 @@ static void read_module_info(void)
           template_count, params.capacity, params.security_level);
     PRINT("Address: 0x%08lX, Baud: %d\n",
           (unsigned long)params.device_addr, params.baud_setting * 9600);
+    s_cur_score_level = (uint8_t)(params.security_level & 0xFF);
+    (void)template_count;
+    (void)params;
 }
 
 // ============================================================================
@@ -374,8 +610,18 @@ void fp_power_on(void)
 {
     if (s_powered_on) return;
 
-    // Power on module FIRST, then configure UART
-    // (ZW0905 requires MCU_3.3V before UART init)
+    // Ensure UART RX/TX are LOW before VCC rises to prevent current
+    // backflow through the unpowered module's ESD diodes
+    GPIOA_ModeCfg(PIN_FP_TX | PIN_FP_RX, GPIO_ModeIN_PD);
+
+#if HAS_R599S
+    // R599S wants its DETECT line driven against a CMOS input with no internal
+    // pull while the sensor is active. Default idle mode (fp_power_off) is
+    // IN_PD — switch to Floating only for the duration of this power cycle.
+    TOUCH_SetMode(GPIO_ModeIN_Floating);
+#endif
+
+    // Power on VCC, then bring UART pins back up
     FP_PWR_SetMode(GPIO_ModeOut_PP_5mA);
     FP_PWR_SetHigh();
 
@@ -383,7 +629,7 @@ void fp_power_on(void)
     sys_safe_access_enable();
     R8_SLP_CLK_OFF0 &= ~RB_SLP_CLK_UART1;
     sys_safe_access_disable();
-    // Re-initialize UART1 pins (were set to pull-down in fp_power_off)
+    // Now safe to bring UART TX/RX high
     uart_init();
     s_powered_on = true;
     g_sleep_inhibit++;  // Suppress sleep while FP module is active
@@ -391,23 +637,89 @@ void fp_power_on(void)
     PRINT("Fingerprint power ON\n");
 }
 
-void fp_power_off(void)
+// Internal: GPIO + VCC cut, no PS_Sleep command. Caller is responsible for
+// having either successfully issued PS_Sleep or knowingly accepting the
+// "VCC cut while finger on → sensor stuck" risk. Exposed via fp_finish_off()
+// for the async-retry path in hidkbd.c.
+void fp_finish_off(void)
 {
     if (!s_powered_on) return;
 
-    FP_PWR_SetLow();
-    // All FP pins to pull-down: prevent current leaking through
-    // powered-off module's ESD protection diodes
-    FP_PWR_SetMode(GPIO_ModeIN_PD);
+    // Pull UART RX/TX LOW before VCC drops to prevent current backflow
+    // through the module's ESD protection diodes
     GPIOA_ModeCfg(PIN_FP_TX | PIN_FP_RX, GPIO_ModeIN_PD);
+    // Disable UART1 IRQ before gating clock — stale interrupts could otherwise
+    // fire on floating pins once VCC drops.
+    PFIC_DisableIRQ(UART1_IRQn);
+    UART1_INTCfg(DISABLE, RB_IER_RECV_RDY | RB_IER_LINE_STAT);
+    uart_ring_reset();
     // Gate UART1 clock to eliminate peripheral static power
     sys_safe_access_enable();
     R8_SLP_CLK_OFF0 |= RB_SLP_CLK_UART1;
     sys_safe_access_disable();
+
+    // Now safe to cut VCC
+    FP_PWR_SetLow();
+    FP_PWR_SetMode(GPIO_ModeIN_PD);
+
+#if HAS_R599S
+    // Sensor output stage is losing power — clamp DETECT with internal PD so
+    // the pin can't end up floating near the input-buffer threshold and burn
+    // 10-100µA in shoot-through current during sleep.
+    TOUCH_SetMode(GPIO_ModeIN_PD);
+#endif
+
     s_powered_on = false;
     if(g_sleep_inhibit > 0) g_sleep_inhibit--;  // Release FP hold on sleep inhibit
     s_password_verified = false;  // Need to re-verify after power on
     PRINT("Fingerprint power OFF\n");
+}
+
+void fp_power_off(void)
+{
+    if (!s_powered_on) return;
+
+#if HAS_R599S
+    // R599S: must send PS_Sleep(0x33) before cutting VCC-MCU power, otherwise
+    // sensor stays in mA-level current and touch becomes unresponsive on the
+    // next power cycle.
+    //
+    // Wall-clock-bounded ack wait (~100ms). The old path used fp_recv_ack's
+    // busy-loop calibration, which under interrupt pressure (ECC keepalive,
+    // BLE bursts) stretched 200ms nominal to ~4s observed — long enough to
+    // chew through the BLE supervision window. We now read via the
+    // non-blocking parser and bail on wall-clock instead. If the user's
+    // finger is still on the sensor when this fires, the sleep won't ack
+    // within 100ms; we cut VCC anyway and trust the upstream caller
+    // (typically fp_async_off_start) to retry sleep later if needed.
+    fp_parser_reset();
+    fp_send_cmd(CMD_SLEEP, NULL, 0);
+
+    uint32_t start = RTC_GetCycle32k();
+    const uint32_t cap_ticks = 32768 / 10;  // 100ms @ 32.768 kHz
+    uint8_t ack = 0xFF;
+    int got = FP_ERR_TIMEOUT;
+    while ((uint32_t)(RTC_GetCycle32k() - start) < cap_ticks) {
+        got = fp_try_parse_packet(&ack, NULL, NULL);
+        if (got == FP_OK) break;
+        WWDG_SetCounter(0);
+        // Keep BLE alive during the wait. Reentrancy guard mirrors uart_recv.
+        if (!s_in_uart_tmos_kick) {
+            s_in_uart_tmos_kick = 1;
+            TMOS_SystemProcess();
+            s_in_uart_tmos_kick = 0;
+        }
+    }
+    if (got == FP_OK && ack == FP_ACK_SUCCESS) {
+        PRINT("R599S sleep OK, cutting VCC-MCU\n");
+    } else {
+        uint32_t waited_ms = ((uint32_t)(RTC_GetCycle32k() - start) * 1000) / 32768;
+        PRINT("R599S sleep no-ack (%ums, ack=0x%02X), cutting VCC anyway\n",
+              (unsigned)waited_ms, ack);
+    }
+#endif
+
+    fp_finish_off();
 }
 
 bool fp_is_powered(void)
@@ -434,9 +746,9 @@ int fp_complete_wake(void)
     // Try to read ready signal (0x55) - non-blocking check
     bool got_ready = false;
     for (int i = 0; i < 10; i++) {
-        while (R8_UART1_RFC > 0) {
-            uint8_t b = R8_UART1_RBR;
-            if (b == 0x55) {
+        int b;
+        while ((b = uart_rx_pop()) >= 0) {
+            if ((uint8_t)b == 0x55) {
                 got_ready = true;
                 break;
             }
@@ -454,6 +766,7 @@ int fp_complete_wake(void)
         uint32_t elapsed = now - s_power_on_tick;
         uint32_t ms = elapsed / 33;
         PRINT("Module 0x55 received (complete_wake), %dms after power-on\n", ms);
+        (void)ms;
     } else {
         PRINT("Module 0x55 NOT received (complete_wake)\n");
     }
@@ -548,16 +861,20 @@ int fp_wake(void)
     if (!s_powered_on) {
         fp_power_on();
 
+#if HAS_R599S
+        DelayMs(200);  // R599S: DSP needs ≥200ms to initialize sensor touch
+#else
         // Wait for module initialization (100ms - reduced to avoid BLE timeout)
         DelayMs(100);
+#endif
         WWDG_SetCounter(0);  // Feed watchdog after blocking delay
 
         // Try to read ready signal (0x55)
         bool got_ready = false;
         for (int i = 0; i < 10; i++) {
-            while (R8_UART1_RFC > 0) {
-                uint8_t b = R8_UART1_RBR;
-                if (b == 0x55) {
+            int b;
+            while ((b = uart_rx_pop()) >= 0) {
+                if ((uint8_t)b == 0x55) {
                     got_ready = true;
                     break;
                 }
@@ -622,16 +939,19 @@ int fp_init(void)
         // Need to power on and/or verify password
         if (!s_powered_on) {
             fp_power_on();
+#if HAS_R599S
+            DelayMs(200);  // R599S: DSP needs ≥200ms to initialize sensor touch
+#else
             DelayMs(150);  // Minimal boot delay
+#endif
 
             // Read for ready signal FIRST (before any flush)
-            uint8_t init_buf[16];
             bool got_ready = false;
 
             for (int i = 0; i < 10; i++) {
-                while (R8_UART1_RFC > 0) {
-                    uint8_t b = R8_UART1_RBR;
-                    if (b == 0x55) {
+                int b;
+                while ((b = uart_rx_pop()) >= 0) {
+                    if ((uint8_t)b == 0x55) {
                         got_ready = true;
                         break;
                     }
@@ -679,14 +999,13 @@ int fp_init(void)
     // Wait for module initialization signal (0x55)
     DelayMs(100);
 
-    uint8_t init_buf[32];
     int total_read = 0;
     bool got_ready = false;
 
     for (int retry = 0; retry < (INIT_TIMEOUT_MS / 50); retry++) {
-        while (R8_UART1_RFC > 0 && total_read < sizeof(init_buf)) {
-            init_buf[total_read] = R8_UART1_RBR;
-            if (init_buf[total_read] == 0x55) {
+        int b;
+        while ((b = uart_rx_pop()) >= 0) {
+            if ((uint8_t)b == 0x55) {
                 got_ready = true;
             }
             total_read++;
@@ -723,6 +1042,16 @@ int fp_init(void)
     check_sensor();
     read_chip_sn();
     read_module_info();
+
+    // Force ScoreLevel to strictest (5). read_module_info populates
+    // s_cur_score_level; only WriteReg when it differs so we don't wear FLASH
+    // on every boot. Factory default is 3 (medium) which can false-accept
+    // short-tap low-quality images — see Bug 1 root cause.
+    if (s_cur_score_level != FP_TARGET_SCORE_LEVEL) {
+        PRINT("ScoreLevel %d != %d, writing\n",
+              s_cur_score_level, FP_TARGET_SCORE_LEVEL);
+        fp_set_score_level(FP_TARGET_SCORE_LEVEL);
+    }
 
     return FP_OK;
 }
@@ -810,6 +1139,48 @@ int fp_set_password(uint32_t password)
     }
 
     PRINT("Set password failed: 0x%02X\n", ack);
+    return FP_ERR_FAIL;
+}
+
+int fp_set_score_level(uint8_t level)
+{
+    if (!s_powered_on || level < 1 || level > 5) {
+        return FP_ERR_INVALID;
+    }
+
+    // PS_WriteReg (0x0E): [reg_id=5 (ScoreLevel)] [value=level]. Re-read
+    // sys-params after to confirm — silent write failures here are the
+    // exact way the false-accept bug slips back in (chip stays at default
+    // level 3 and lets thin features match).
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint8_t params[2] = { 5, level };
+        fp_send_cmd(CMD_WRITE_REG, params, 2);
+
+        uint8_t ack;
+        int ret = fp_recv_ack(&ack, NULL, NULL, UART_TIMEOUT_MS);
+        if (ret != FP_OK) {
+            PRINT("WriteReg ScoreLevel timeout (attempt %d)\n", attempt + 1);
+            continue;
+        }
+        if (ack != FP_ACK_SUCCESS) {
+            PRINT("WriteReg ScoreLevel ack=0x%02X (attempt %d)\n",
+                  ack, attempt + 1);
+            continue;
+        }
+
+        // Verify by re-reading. read_module_info refreshes s_cur_score_level.
+        s_cur_score_level = 0;  // force refresh
+        read_module_info();
+        if (s_cur_score_level == level) {
+            PRINT("ScoreLevel set to %d (verified)\n", level);
+            return FP_OK;
+        }
+        PRINT("ScoreLevel verify failed: wrote %d, read %d (attempt %d)\n",
+              level, s_cur_score_level, attempt + 1);
+    }
+
+    PRINT("ScoreLevel write FAILED after 3 attempts — sensor at level %d\n",
+          s_cur_score_level);
     return FP_ERR_FAIL;
 }
 
@@ -1085,35 +1456,39 @@ int fp_auto_identify(fp_search_result_t *result)
         return FP_ERR_FAIL;
     }
 
-    // PS_AutoIdentify (0x32): Auto capture + generate + search
-    // Parameters: buffer_id(1) + start_page(2) + count(2) + security_level(1) + return_mask(1)
-    uint8_t params[7];
-    params[0] = 0x01;                   // Buffer ID
-    params[1] = 0x00;                   // Start page MSB
-    params[2] = 0x00;                   // Start page LSB
-    params[3] = 0x00;                   // Search count MSB
-    params[4] = FP_MAX_TEMPLATES;       // Search count LSB
-    params[5] = 0x03;                   // Security level (3 = medium)
-    params[6] = 0x00;                   // Return on match only
+    // PSAutoIdentify (0x32) per manual §4.4.2.2:
+    //   [security_level:1B][ID:2B][parameter:2B]
+    // ID=0xFFFF for 1:N search; parameter bit2=1 suppresses intermediate responses
+    uint8_t params[5];
+    params[0] = 0x03;                   // Security level (3 = medium)
+    params[1] = 0xFF;                   // ID MSB (0xFFFF = 1:N search)
+    params[2] = 0xFF;                   // ID LSB
+    params[3] = 0x00;                   // Parameter MSB
+    params[4] = 0x04;                   // Parameter LSB: bit2=1 (no intermediate responses)
 
-    fp_send_cmd(CMD_AUTO_IDENTIFY, params, 7);
+    fp_send_cmd(CMD_AUTO_IDENTIFY, params, 5);
 
+    // Module handles entire pipeline internally (capture + gen_char + search).
+    // uart_recv calls TMOS_SystemProcess every ~15ms to keep BLE alive.
     uint8_t ack;
-    int ret = fp_recv_ack(&ack, NULL, NULL, 3000);  // 3 second timeout
+    uint8_t resp[5];  // [param:1B][ID:2B][score:2B]
+    uint16_t resp_len = 5;
+    int ret = fp_recv_ack(&ack, resp, &resp_len, 1500);
     if (ret != FP_OK) {
-        return ret;
+        return FP_ERR_TIMEOUT;
     }
 
-    if (ack == FP_ACK_SUCCESS) {
-        result->page_id = (s_rx_buf[10] << 8) | s_rx_buf[11];
-        result->match_score = (s_rx_buf[12] << 8) | s_rx_buf[13];
+    if (ack == FP_ACK_SUCCESS && resp_len >= 5) {
+        // resp[0] = step param (0x05 = search), resp[1:2] = ID, resp[3:4] = score
+        result->page_id = (resp[1] << 8) | resp[2];
+        result->match_score = (resp[3] << 8) | resp[4];
         PRINT("AutoIdentify: page=%d, score=%d\n", result->page_id, result->match_score);
         return FP_OK;
     } else if (ack == FP_ACK_NOT_FOUND || ack == FP_ACK_NOT_MATCH) {
-        PRINT("AutoIdentify: no match\n");
+        PRINT("AutoIdentify: no match (0x%02X)\n", ack);
         return FP_ERR_NOT_FOUND;
-    } else if (ack == FP_ACK_NO_FINGER) {
-        PRINT("AutoIdentify: no finger detected\n");
+    } else if (ack == FP_ACK_NO_FINGER || ack == 0x26) {
+        PRINT("AutoIdentify: timeout (0x%02X)\n", ack);
         return FP_ERR_TIMEOUT;
     }
 

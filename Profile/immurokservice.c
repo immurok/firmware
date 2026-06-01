@@ -1,29 +1,31 @@
 /*
  * immurok Custom GATT Service for CH592F
- * Service UUID: 12340010-0000-1000-8000-00805f9b34fb
- * Command Characteristic: 12340011 (Write)
- * Response Characteristic: 12340012 (Notify)
+ * Service UUID:  45529919-7668-48f9-b9fe-e4eabe6595d9
+ * Command Char:  8a537e1f-3992-4b2c-8b77-8d4e778186e1 (Write)
+ * Response Char: 76a1660d-8cf6-44d1-b3fc-70486028e289 (Notify)
+ *
+ * UUIDs are stored little-endian (BLE wire format).
  */
 
 #include "CONFIG.h"
 #include "immurokservice.h"
 
-// immurok Service UUID: 12340010-0000-1000-8000-00805f9b34fb
+// immurok Service UUID: 45529919-7668-48f9-b9fe-e4eabe6595d9
 static const uint8_t immurokServUUID[ATT_UUID_SIZE] = {
-    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
-    0x00, 0x10, 0x00, 0x00, 0x10, 0x00, 0x34, 0x12
+    0xd9, 0x95, 0x65, 0xbe, 0xea, 0xe4, 0xfe, 0xb9,
+    0xf9, 0x48, 0x68, 0x76, 0x19, 0x99, 0x52, 0x45
 };
 
-// Command Characteristic UUID: 12340011
+// Command Characteristic UUID: 8a537e1f-3992-4b2c-8b77-8d4e778186e1
 static const uint8_t immurokCmdUUID[ATT_UUID_SIZE] = {
-    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
-    0x00, 0x10, 0x00, 0x00, 0x11, 0x00, 0x34, 0x12
+    0xe1, 0x86, 0x81, 0x77, 0x4e, 0x8d, 0x77, 0x8b,
+    0x2c, 0x4b, 0x92, 0x39, 0x1f, 0x7e, 0x53, 0x8a
 };
 
-// Response Characteristic UUID: 12340012
+// Response Characteristic UUID: 76a1660d-8cf6-44d1-b3fc-70486028e289
 static const uint8_t immurokRspUUID[ATT_UUID_SIZE] = {
-    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
-    0x00, 0x10, 0x00, 0x00, 0x12, 0x00, 0x34, 0x12
+    0x89, 0xe2, 0x28, 0x60, 0x48, 0x70, 0xfc, 0xb3,
+    0xd1, 0x44, 0xf6, 0x8c, 0x0d, 0x66, 0xa1, 0x76
 };
 
 // Service declaration
@@ -56,9 +58,13 @@ static gattAttribute_t immurokAttrTbl[] = {
         &immurokCmdProps
     },
     // Command Characteristic Value
+    // ENCRYPT_WRITE: only a peer with a valid bond (and thus an encrypted
+    // link) can write commands. Combined with NO_PAIRING after device is
+    // claimed, this stops a thief on host B from connecting and driving
+    // the immurok service without bonding.
     {
         {ATT_UUID_SIZE, immurokCmdUUID},
-        GATT_PERMIT_WRITE,
+        GATT_PERMIT_ENCRYPT_WRITE,
         0,
         immurokCmdValue
     },
@@ -71,16 +77,20 @@ static gattAttribute_t immurokAttrTbl[] = {
         &immurokRspProps
     },
     // Response Characteristic Value
+    // ENCRYPT_READ: stale response bytes (and any future direct READ payload)
+    // shouldn't leak to an unbonded peer.
     {
         {ATT_UUID_SIZE, immurokRspUUID},
-        GATT_PERMIT_READ,
+        GATT_PERMIT_ENCRYPT_READ,
         0,
         immurokRspValue
     },
     // Response Characteristic CCC
+    // ENCRYPT_WRITE on the descriptor stops an unbonded peer from
+    // subscribing to notifications (FP match, AUTH OK, etc.).
     {
         {ATT_BT_UUID_SIZE, clientCharCfgUUID},
-        GATT_PERMIT_READ | GATT_PERMIT_WRITE,
+        GATT_PERMIT_READ | GATT_PERMIT_ENCRYPT_WRITE,
         0,
         (uint8_t *)immurokRspCCC
     },
@@ -101,7 +111,6 @@ static bStatus_t immurok_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
                                      uint16_t maxLen, uint8_t method)
 {
     bStatus_t status = SUCCESS;
-    uint16_t uuid = BUILD_UINT16(pAttr->type.uuid[0], pAttr->type.uuid[1]);
 
     if(pAttr->type.len == ATT_UUID_SIZE) {
         // 128-bit UUID - Response characteristic
@@ -154,6 +163,10 @@ static bStatus_t immurok_WriteAttrCB(uint16_t connHandle, gattAttribute_t *pAttr
             // CCC write
             status = GATTServApp_ProcessCCCWriteReq(connHandle, pAttr, pValue, len,
                                                      offset, GATT_CLIENT_CFG_NOTIFY);
+            if(status == SUCCESS && immurokServiceCBs && immurokServiceCBs->pfnCccChangeCB) {
+                uint16_t cccValue = BUILD_UINT16(pValue[0], (len > 1) ? pValue[1] : 0);
+                immurokServiceCBs->pfnCccChangeCB((cccValue & GATT_CLIENT_CFG_NOTIFY) ? 1 : 0);
+            }
         } else {
             status = ATT_ERR_ATTR_NOT_FOUND;
         }
