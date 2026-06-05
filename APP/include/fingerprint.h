@@ -21,7 +21,16 @@
 #define FP_USER_MAX             5       // Max user-visible fingerprints
 #define FP_SLOTS_PER_FINGER     1       // Physical slots per fingerprint
 #define FP_SLOT_MAX             FP_USER_MAX  // 5
-#define FP_ENROLL_CAPTURES      12      // Captures per enrollment
+#define FP_ENROLL_CAPTURES      6       // Captures per enrollment (mode-1 broad coverage)
+
+// R559S enrollment logic mode (system register 3, via PS_WriteReg 0x0E):
+//   0 = no area control (factory default)
+//   1 = require DIFFERENT area each capture (GenChar returns 0x28 if overlap too high)
+//   2 = require SIMILAR area each capture (GenChar returns 0x08 if not similar)
+// We use mode 1 so the 6 guided captures actually spread across the finger:
+// broad coverage lowers single-tap FRR for our variable-pose handheld device
+// AND hardens against thin-template false-accept. See enroll-mode1 design doc.
+#define FP_ENROLL_LOGIC_MODE    1
 
 // Mapping: user finger_id ↔ physical slot (identity)
 #define FP_SLOT(fid)            (fid)
@@ -47,6 +56,7 @@
 #define FP_ACK_NOT_MATCH        0x08    // Finger not match
 #define FP_ACK_NOT_FOUND        0x09    // Finger not found in library
 #define FP_ACK_ENROLL_COMBINE   0x0A    // Enrollment combine error
+#define FP_ACK_OVERLAP          0x28    // (mode 1) GenChar: too much overlap w/ previous capture
 #define FP_ACK_BAD_LOCATION     0x0B    // Invalid page ID
 #define FP_ACK_DB_ERROR         0x0C    // Database error
 #define FP_ACK_EMPTY_DB         0x23    // Database is empty
@@ -83,7 +93,8 @@ typedef enum {
     FP_ENROLL_PROCESSING = 2,   // Processing/merging
     FP_ENROLL_LIFT_FINGER = 3,  // Lift finger for next capture
     FP_ENROLL_COMPLETE = 4,     // Enrollment complete
-    FP_ENROLL_ADJUST = 5,       // Adjust finger angle for second slot
+    FP_ENROLL_ADJUST = 5,       // (legacy dual-slot, unused) Adjust finger angle
+    FP_ENROLL_OVERLAP = 6,      // (mode 1) too much overlap — shift finger, re-press
     FP_ENROLL_FAILED = 0xFF,    // Enrollment failed
 } fp_enroll_event_t;
 
@@ -339,6 +350,16 @@ int fp_sleep(void);
  * @return FP_OK on success, FP_ERR_* on failure
  */
 int fp_set_score_level(uint8_t level);
+
+/**
+ * Set enrollment logic mode (system register 3, via PS_WriteReg).
+ * 0 = no area control, 1 = require different area (0x28 on overlap),
+ * 2 = require similar area (0x08 if not similar).
+ * Register 3 is not exposed by ReadSysPara, so this cannot read-verify;
+ * it writes (with retries) and trusts the ack. Call once per init.
+ * @return FP_OK on success, FP_ERR_* on failure
+ */
+int fp_set_enroll_mode(uint8_t mode);
 
 /**
  * Set module password

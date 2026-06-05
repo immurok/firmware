@@ -6,7 +6,8 @@
  *   Block 0 (0x0000-0x0FFF): Security data (112B) + SSH section
  *   Block 1-3 (0x1000-0x3FFF): OTP section (133 entries)
  *   Block 4-5 (0x4000-0x5FFF): API section (51 entries)
- *   0x6000: OTA flag (reserved)
+ *   0x6000: OTA ImageFlag (page 0 of block 6, OTA_DATAFLASH_ADD)
+ *   0x6F00: tamper case_opened flag (last page of block 6, see tamper.c)
  *   0x7000: BLE SNV (reserved)
  */
 

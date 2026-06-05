@@ -28,6 +28,9 @@
 #include "ota.h"
 #include "hardware_pins.h"
 #include "version.h"
+#if HAS_TAMPER_DETECT
+#include "tamper.h"
+#endif
 #if HAS_VBAT_ADC
 #include "CH59x_adc.h"
 #endif
@@ -157,6 +160,14 @@ static uint8_t s_enroll_substate = 0;   // 0=send command, 1=poll response
 static uint32_t s_enroll_substate_start = 0;
 static uint32_t s_enroll_start = 0;     // Timeout tracking
 static uint8_t s_enroll_capture = 0;    // Current capture count (0 to FP_ENROLL_CAPTURES-1)
+static uint8_t s_enroll_overlap_retries = 0;  // (mode 1) consecutive 0x28 overlap rejects for current slice
+// Set when ENROLL_START was unlocked by an FP gate verify (existing finger
+// re-enroll). The verify finger is guaranteed still on the sensor when the
+// enroll state machine starts, so step 0 must wait for a lift before capture
+// 1 — relying on the flaky post-search 0x29 probe (50ms) instead would let a
+// timeout misdetect "no finger" and silently capture the held verify finger
+// as slice 1 (no green-blink wait shown, and slice 2 then overlaps → red).
+static uint8_t s_enroll_from_gate = 0;
 
 static uint8_t s_gate_preheat = 0;        // FP gate preheat: module powered, waiting for touch
 static uint8_t s_gate_fail_count = 0;      // FP match failure count in current gate session
@@ -334,6 +345,9 @@ static void apply_ble_pairing_mode(void)
 // GPIO interrupt flags (set in ISR, consumed in TMOS event loop)
 volatile uint8_t g_touch_irq_flag = 0;
 volatile uint8_t g_btn_irq_flag = 0;
+#if HAS_TAMPER_DETECT
+volatile uint8_t g_tamper_irq_flag = 0;
+#endif
 
 // BLE connection state (set/cleared in GAP state callback)
 static uint8_t s_ble_connected = 0;
@@ -1165,6 +1179,16 @@ void HidEmu_Init()
     TOUCH_SetITMode(GPIO_ITMode_RiseEdge);
     BTN_SetITMode(GPIO_ITMode_FallEdge);
     PFIC_EnableIRQ(BTN_TOUCH_IRQn);
+#if HAS_TAMPER_DETECT
+    // ANTI_OPEN tamper: FLOATING input — the external high-impedance divider
+    // (R16 series + R15 pulldown) sets the level: open≈3V (Q2 drives ~VBAT), closed
+    // 0V. Do NOT use IN_PD here: the ~20kΩ internal pulldown swamps the high-Z
+    // signal (measured PB10=0.231V on open while Q2-out=4.01V) so the pin never
+    // crosses VIH and no rising edge fires. Wake + IRQ on rising edge.
+    ANTI_OPEN_SetMode(GPIO_ModeIN_Floating);
+    ANTI_OPEN_SetITMode(GPIO_ITMode_RiseEdge);
+    PRINT("Tamper detect enabled (ANTI_OPEN rising edge)\n");
+#endif
     PRINT("GPIO interrupts enabled\n");
 
 #if HAS_RGB_LED
@@ -1177,6 +1201,17 @@ void HidEmu_Init()
 
     // Initialize keystore module
     immurok_keystore_init();
+
+#if HAS_TAMPER_DETECT
+    // Resume an interrupted tamper wipe: if case_opened is still set, a previous
+    // wipe lost power mid-way — finish it now (never returns). Boot does NOT
+    // check the live ANTI_OPEN level, so an open case during assembly/flashing
+    // (static high, no rising edge) boots normally.
+    if(tamper_is_flagged()) {
+        PRINT("TAMPER: case_opened set at boot, resuming wipe\n");
+        tamper_run_cleanup();
+    }
+#endif
 
     // Setup the GAP Peripheral Role Profile
     {
@@ -1282,6 +1317,68 @@ void HidEmu_Init()
     // Setup a delayed profile startup
     tmos_set_event(hidEmuTaskId, START_DEVICE_EVT);
 }
+
+#if HAS_TAMPER_DETECT
+/*********************************************************************
+ * @fn      tamper_run_cleanup
+ *
+ * @brief   Wipe everything, then halt blinking red until power cycle.
+ *          Never returns. Mirrors the FACTORY_RESET wipe order:
+ *          keys -> bonds -> fingerprints.
+ */
+__attribute__((noreturn)) void tamper_run_cleanup(void)
+{
+    PRINT("TAMPER: cleanup start\n");
+
+    // Solid red = wiping in progress; other LEDs off.
+    LED_GREEN_Off();
+    LED_BLUE_Off();
+    LED_RED_On();
+
+    // Transaction begin: mark case_opened so an interrupted wipe resumes on boot.
+    tamper_set_flag();
+    WWDG_SetCounter(0);
+
+    // 1) keys: pairing key + keystore (SSH/OTP/API)
+    immurok_security_factory_reset();
+    WWDG_SetCounter(0);
+
+    // 2) BLE bonds
+    HidDev_SetParameter(HIDDEV_ERASE_ALLBONDS, 0, NULL);
+    DelayMs(50);
+    WWDG_SetCounter(0);
+
+    // 3) fingerprint templates (power on FP, clear, power off)
+    if(fp_wake() == FP_OK) {
+        fp_clear_all();
+        fp_power_off();
+    }
+    WWDG_SetCounter(0);
+
+    // Transaction end: clear the flag.
+    tamper_clear_flag();
+    PRINT("TAMPER: wipe done, BLE off, blinking red, waiting for power cycle\n");
+
+    // Stop advertising (best-effort; do not block on it).
+    {
+        uint8_t adv_off = FALSE;
+        GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &adv_off);
+    }
+
+    // Halt: blink red forever, feed WDT. Never returns; user must power-cycle.
+    // Feed WDT after each 250ms delay (max interval 250ms << ~559ms WWDG timeout).
+    // Feeding only once per 500ms cycle is too tight; a WDT reset here would
+    // silently reboot into normal operation with the case still open.
+    while(1) {
+        LED_RED_On();
+        DelayMs(250);
+        WWDG_SetCounter(0);
+        LED_RED_Off();
+        DelayMs(250);
+        WWDG_SetCounter(0);
+    }
+}
+#endif
 
 /*********************************************************************
  * @fn      HidEmu_ProcessEvent
@@ -2593,6 +2690,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                         s_enroll_step = 0;
                         s_enroll_substate = 0;
                         s_enroll_capture = 0;
+                        s_enroll_from_gate = 1;  // verify finger is still on the sensor
                         s_enroll_active = 1;
                         tmos_set_event(hidEmuTaskId, FP_ENROLL_EVT);
                         rspBuf[0] = IMMUROK_RSP_OK;
@@ -2951,6 +3049,9 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
         #define ENROLL_TOTAL  FP_ENROLL_CAPTURES
         #define ENROLL_TIMEOUT_MS  20000   // 20s per-step timeout (waiting for finger)
+        // (mode 1) max consecutive 0x28 overlap rejects on one slice before we
+        // accept it anyway, so a finger that can't yield a new area can't deadlock.
+        #define ENROLL_OVERLAP_MAX_RETRY  4
 
         uint8_t rspBuf[4];
         uint8_t ack = 0xFF;
@@ -2988,17 +3089,27 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             fp_led_flash(FP_LED_GREEN, 10, 0);  // continuous fast flash
 #endif
 
-            // Probe whether a finger is currently on the sensor. When we just
-            // came through an FP-gate auth (re-enroll when bitmap != 0), the
-            // user almost always still has the auth finger pressed when the
-            // pending ENROLL_START fires — without this probe, the very next
-            // 0x29 in step 1 would capture that same finger as enroll slice 1
-            // and effectively re-enroll the OLD finger instead of the NEW
-            // one. Use the existing step-3 wait-lift loop in that case so
-            // App shows "lift finger, then press again" before capture.
-            fp_send_cmd(0x29, NULL, 0);
-            int probe = fp_recv_ack(&ack, NULL, NULL, 50);
-            uint8_t finger_on = (probe == FP_OK && ack == FP_ACK_SUCCESS);
+            // Decide whether to wait for a finger lift before capture 1.
+            // When ENROLL_START was unlocked by an FP gate verify (re-enroll,
+            // bitmap != 0), the verify finger is GUARANTEED still on the
+            // sensor — go straight to the step-3 wait-lift loop so capture 1
+            // comes from a fresh, deliberate press (App shows "lift, then
+            // press again"). We must NOT probe with 0x29 here: right after the
+            // gate SEARCH the sensor is busy and a 50ms probe often times out,
+            // misdetecting "no finger" → step 1 would then capture the held
+            // verify finger as slice 1 (no green-blink wait shown; slice 2
+            // overlaps it → spurious red). For first-ever enrollment there is
+            // no verify finger, so a short probe is still worthwhile to catch
+            // a user already resting a finger on the pad.
+            uint8_t finger_on;
+            if(s_enroll_from_gate) {
+                finger_on = 1;
+            } else {
+                fp_send_cmd(0x29, NULL, 0);
+                int probe = fp_recv_ack(&ack, NULL, NULL, 50);
+                finger_on = (probe == FP_OK && ack == FP_ACK_SUCCESS);
+            }
+            s_enroll_from_gate = 0;
 
             rspBuf[0] = 0x11;
             rspBuf[1] = finger_on ? FP_ENROLL_LIFT_FINGER : FP_ENROLL_WAITING;
@@ -3007,6 +3118,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             ImmurokService_SendResponse(rspBuf, 4);
 
             s_enroll_capture = 0;
+            s_enroll_overlap_retries = 0;
             s_enroll_step = finger_on ? 3 : 1;
             s_enroll_start = TMOS_GetSystemClock();
             tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 80);  // 50ms yield for BLE
@@ -3120,7 +3232,39 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 s_enroll_substate = 0;
             }
 
-            if(ret == FP_OK && ack == FP_ACK_SUCCESS) {
+            // (mode 1) 0x28 = current feature overlaps the previous one too much.
+            // Soft-retry (don't count) up to ENROLL_OVERLAP_MAX_RETRY, prompting
+            // the user to shift position; beyond that, accept this slice anyway
+            // (degrade to mode-0 behavior) so enrollment can't deadlock.
+            uint8_t accept = (ret == FP_OK && ack == FP_ACK_SUCCESS);
+            if(ret == FP_OK && ack == FP_ACK_OVERLAP) {
+                if(++s_enroll_overlap_retries >= ENROLL_OVERLAP_MAX_RETRY) {
+                    PRINT("ENROLL_EVT: overlap x%d, accepting capture %d anyway\n",
+                          s_enroll_overlap_retries, s_enroll_capture + 1);
+                    accept = 1;
+                } else {
+                    PRINT("ENROLL_EVT: GenChar overlap (0x28), shift finger (retry %d)\n",
+                          s_enroll_overlap_retries);
+                    // No red flash here: overlap is a soft "shift a bit" hint,
+                    // not a failure. Red is reserved for real enroll failures;
+                    // a red flash right after the gate verify reads as "auth
+                    // rejected". The green blink keeps running (set on the
+                    // previous lift / step 0) and the App shows the shake +
+                    // "shift your finger" prompt.
+                    rspBuf[0] = 0x11;
+                    rspBuf[1] = FP_ENROLL_OVERLAP;
+                    rspBuf[2] = s_enroll_capture;
+                    rspBuf[3] = ENROLL_TOTAL;
+                    ImmurokService_SendResponse(rspBuf, 4);
+                    s_enroll_step = 3;  // wait for lift, then recapture same slice
+                    s_enroll_substate = 0;
+                    tmos_start_task(hidEmuTaskId, FP_ENROLL_EVT, 480);  // 300ms pause
+                    break;
+                }
+            }
+
+            if(accept) {
+                s_enroll_overlap_retries = 0;
                 s_enroll_capture++;
                 PRINT("ENROLL_EVT: GenChar OK (capture %d/%d)\n", s_enroll_capture, ENROLL_TOTAL);
 
@@ -4503,6 +4647,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                     s_enroll_step = 0;
                     s_enroll_substate = 0;
                     s_enroll_capture = 0;
+                    s_enroll_from_gate = 0;  // first enrollment: no verify finger on sensor
                     s_enroll_active = 1;
                     tmos_set_event(hidEmuTaskId, FP_ENROLL_EVT);
                     rspBuf[0] = IMMUROK_RSP_OK;
@@ -5068,27 +5213,47 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
 
     case IMMUROK_CMD_GATE_CANCEL:
         PRINT("  GATE_CANCEL\n");
-        if(s_pending_cmd != 0) {
-            PRINT("  Clearing pending cmd 0x%02X\n", s_pending_cmd);
-            s_pending_cmd = 0;
-            s_pending_payload_len = 0;
-        }
-        if(immurok_security_has_pending_auth()) {
-            immurok_security_auth_cancel();
-        }
-        // Stop all gate-related activity
-        s_gate_fail_count = 0;
-        s_gate_preheat = 0;
-        s_search_active = 0;
-        s_wait_finger_lift = 0;
-        tmos_stop_task(hidEmuTaskId, FP_SEARCH_EVT);
-        tmos_stop_task(hidEmuTaskId, FP_AUTH_EVT);
-        tmos_stop_task(hidEmuTaskId, FP_WAKE_DONE_EVT);
+        {
+            // Was a gate actually pending? The App's gate controller calls
+            // cancelGateAndRelease() (→ GATE_CANCEL) on its reset() path even
+            // after a gate resolved SUCCESSFULLY — e.g. right after ENROLL_START
+            // unlocks (the FP match already cleared s_pending_cmd), or for a
+            // first enrollment where no gate was ever opened. In those cases
+            // there is nothing to cancel, so the red "cancelled" flash is wrong
+            // feedback. Worse: during enrollment it stomps the green capture
+            // blink with a solid 1s red and leaves the LED dark through the
+            // first capture (root cause of "验证后闪红 + 第1次无绿闪").
+            uint8_t had_gate = (s_pending_cmd != 0
+                                || immurok_security_has_pending_auth()
+                                || s_gate_preheat);
+            if(s_pending_cmd != 0) {
+                PRINT("  Clearing pending cmd 0x%02X\n", s_pending_cmd);
+                s_pending_cmd = 0;
+                s_pending_payload_len = 0;
+            }
+            if(immurok_security_has_pending_auth()) {
+                immurok_security_auth_cancel();
+            }
+            // Stop all gate-related activity (no-ops during enroll: search is
+            // not running and FP_POWER_OFF_EVT is gated on !s_enroll_active).
+            s_gate_fail_count = 0;
+            s_gate_preheat = 0;
+            s_search_active = 0;
+            s_wait_finger_lift = 0;
+            tmos_stop_task(hidEmuTaskId, FP_SEARCH_EVT);
+            tmos_stop_task(hidEmuTaskId, FP_AUTH_EVT);
+            tmos_stop_task(hidEmuTaskId, FP_WAKE_DONE_EVT);
 #if HAS_RGB_LED
-        led_solid('R', 1600);  // red 1s
+            // Red "cancelled" flash only when a gate was truly pending and we
+            // are not mid-enrollment — otherwise leave the LED alone so the
+            // enroll green-blink (or whatever owns it) survives.
+            if(had_gate && !s_enroll_active) {
+                led_solid('R', 1600);  // red 1s
+            }
 #endif
-        fp_reset_power_timer();
-        rspBuf[0] = IMMUROK_RSP_OK;
+            fp_reset_power_timer();
+            rspBuf[0] = IMMUROK_RSP_OK;
+        }
         break;
 
     default:
@@ -5342,11 +5507,19 @@ static void OTA_IAP_DataDeal(void)
 
             PRINT("OTA ERASE: addr=%08x blocks=%d\n", (int)addr, (int)block_num);
 
-            // Verify address range
-            if(addr < IMAGE_B_START_ADD ||
-               (addr + (block_num - 1) * FLASH_BLOCK_SIZE) > IMAGE_IAP_START_ADD)
+            // Verify address range. block_num==0 must be rejected explicitly:
+            // the old (block_num-1) form underflowed to 0xFFFFFFFF and the
+            // multiply wrapped uint32, passing the check — and the erase event
+            // erases one block *before* testing count>=blocks, so a "0 block"
+            // request still wiped one Image B block. Use an overflow-safe form:
+            // guard addr inside [B_START, IAP_START) first, then bound the
+            // count by how many whole blocks fit (no multiply that can wrap).
+            if(block_num == 0 ||
+               addr < IMAGE_B_START_ADD || addr >= IMAGE_IAP_START_ADD ||
+               block_num > (IMAGE_IAP_START_ADD - addr) / FLASH_BLOCK_SIZE)
             {
-                PRINT("OTA ERASE: address out of range\n");
+                PRINT("OTA ERASE: invalid range (addr=%08x blocks=%d)\n",
+                      (int)addr, (int)block_num);
                 OTA_IAP_SendStatus(0xFF);
                 break;
             }
@@ -5614,11 +5787,18 @@ void BTN_TOUCH_IRQHandler(void)
         BTN_ClearITFlag();
         g_btn_irq_flag = 1;
     }
+#if HAS_TAMPER_DETECT
+    if(ANTI_OPEN_ReadITFlag())
+    {
+        ANTI_OPEN_ClearITFlag();
+        g_tamper_irq_flag = 1;   // ISR 只置标志，擦写在主循环执行
+    }
+#endif
 }
 
 
-#if defined(HARDWARE_VER1) || defined(HARDWARE_VER2) || defined(HARDWARE_VER3) || defined(HARDWARE_VER5)
-// VER1/VER2/VER3/VER5: BTN/TOUCH on GPIOB - stub GPIOA handler prevents
+#if defined(HARDWARE_VER1) || defined(HARDWARE_VER2) || defined(HARDWARE_VER3) || defined(HARDWARE_VER5) || defined(HARDWARE_VER6)
+// VER1/VER2/VER3/VER5/VER6: BTN/TOUCH on GPIOB - stub GPIOA handler prevents
 // stray GPIOA interrupts hitting default infinite-loop -> watchdog reset
 __INTERRUPT
 __HIGH_CODE

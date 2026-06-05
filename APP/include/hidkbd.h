@@ -20,6 +20,7 @@ extern "C" {
 /*********************************************************************
  * INCLUDES
  */
+#include "hardware_pins.h"
 
 /*********************************************************************
  * CONSTANTS
@@ -65,6 +66,16 @@ extern void HidEmu_Init(void);
  * Task Event Processor for the BLE Application
  */
 extern uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events);
+
+/*
+ * GPIO interrupt flags (set in ISR, consumed in TMOS event loop)
+ */
+extern volatile uint8_t g_touch_irq_flag;
+extern volatile uint8_t g_btn_irq_flag;
+#if HAS_TAMPER_DETECT
+extern volatile uint8_t g_tamper_irq_flag;
+extern void tamper_run_cleanup(void) __attribute__((noreturn));   // implemented in hidkbd.c
+#endif
 
 /*********************************************************************
 *********************************************************************/

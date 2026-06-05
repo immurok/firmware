@@ -123,9 +123,13 @@ done:
 }
 #endif
 
-// GPIO interrupt flags (defined in hidkbd.c, set in BTN_TOUCH_IRQHandler)
+// GPIO interrupt flags (defined in hidkbd.c, set in BTN_TOUCH_IRQHandler;
+// also declared in hidkbd.h which main.c includes — listed here for clarity)
 extern volatile uint8_t g_touch_irq_flag;
 extern volatile uint8_t g_btn_irq_flag;
+#if HAS_TAMPER_DETECT
+extern volatile uint8_t g_tamper_irq_flag;
+#endif
 // hidEmu task ID (needed to fire events from main loop)
 extern uint8_t hidEmuTaskId;
 
@@ -143,9 +147,16 @@ const uint8_t MacAddr[6] = {0x84, 0xC2, 0xE4, 0x03, 0x02, 0x02};
  *
  * @brief   Main loop
  *
+ * Runs from Flash (.text), NOT __HIGH_CODE. The flash-power-down/wake handling
+ * lives inside the BLE lib's LowPower_Sleep (RAM-resident); its caller
+ * CH59x_LowPower (SLEEP.c) is itself plain .text and already executes from
+ * Flash immediately after wake — proof that Flash is ready before control
+ * returns up to this loop. Keeping the loop in Flash frees ~96B of RAM
+ * (.highcode) needed by the VER6 tamper feature; the only cost is a few flash
+ * wait-states per loop iteration (negligible vs BLE/radio timing).
+ *
  * @return  none
  */
-__HIGH_CODE
 __attribute__((noinline))
 void Main_Circulation()
 {
@@ -165,6 +176,13 @@ void Main_Circulation()
             g_btn_irq_flag = 0;
             tmos_set_event(hidEmuTaskId, BUTTON_SCAN_EVT);
         }
+#if HAS_TAMPER_DETECT
+        if(g_tamper_irq_flag)
+        {
+            g_tamper_irq_flag = 0;
+            tamper_run_cleanup();   // never returns (halts blinking red)
+        }
+#endif
 
         WWDG_SetCounter(0);  // 喂狗：计数器清零
     }
@@ -195,11 +213,18 @@ int main(void)
     GPIOA_ModeCfg(PIN_VBAT, GPIO_ModeIN_PD);
 #endif
 #ifdef PIN_ANTI_OPEN
-    // Tamper-switch pin: the blanket GPIOB IN_PU above would leak ~73µA
-    // through the switch to GND whenever the case is closed (switch shorts
-    // PB10 to GND). Force pull-down — with the switch either side of its
-    // travel the pin and PD sit at the same potential, so no leakage.
+#if HAS_TAMPER_DETECT
+    // VER6: ANTI_OPEN is driven by a high-impedance external divider (open≈3V via
+    // Q2→R16; closed 0V). FLOAT the pin (undo the blanket GPIOB IN_PU above) so the
+    // divider sets the level — IN_PD would collapse the high-Z "open" to ~0.2V and
+    // detection would never fire.
+    GPIOB_ModeCfg(PIN_ANTI_OPEN, GPIO_ModeIN_Floating);
+#else
+    // VER5: tamper switch shorts PB10 to GND when closed; the blanket GPIOB IN_PU
+    // above would leak ~73µA through the closed switch. Force pull-down so the pin
+    // and PD sit at the same potential — no leakage.
     GPIOB_ModeCfg(PIN_ANTI_OPEN, GPIO_ModeIN_PD);
+#endif
 #endif
 #endif
 #ifdef DEBUG

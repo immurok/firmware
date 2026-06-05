@@ -1053,6 +1053,12 @@ int fp_init(void)
         fp_set_score_level(FP_TARGET_SCORE_LEVEL);
     }
 
+    // Enrollment logic mode (system register 3). Mode 1 = require a different
+    // finger area on each capture; GenChar returns 0x28 when overlap is too
+    // high, which hidkbd's enroll SM turns into a "shift finger" re-prompt.
+    // Register 3 isn't read-back-able, so we write unconditionally once here.
+    fp_set_enroll_mode(FP_ENROLL_LOGIC_MODE);
+
     return FP_OK;
 }
 
@@ -1181,6 +1187,38 @@ int fp_set_score_level(uint8_t level)
 
     PRINT("ScoreLevel write FAILED after 3 attempts — sensor at level %d\n",
           s_cur_score_level);
+    return FP_ERR_FAIL;
+}
+
+int fp_set_enroll_mode(uint8_t mode)
+{
+    if (!s_powered_on || mode > 2) {
+        return FP_ERR_INVALID;
+    }
+
+    // PS_WriteReg (0x0E): [reg_id=3 (enroll logic mode)] [value=mode].
+    // Register 3 is NOT returned by ReadSysPara, so unlike ScoreLevel we
+    // cannot read-verify — write with retries and trust the ack. Written
+    // once per fp_init; mode 1 makes GenChar reject (0x28) captures that
+    // overlap the previous one too much, forcing broad-coverage enrollment.
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint8_t params[2] = { 3, mode };
+        fp_send_cmd(CMD_WRITE_REG, params, 2);
+
+        uint8_t ack;
+        int ret = fp_recv_ack(&ack, NULL, NULL, UART_TIMEOUT_MS);
+        if (ret != FP_OK) {
+            PRINT("WriteReg EnrollMode timeout (attempt %d)\n", attempt + 1);
+            continue;
+        }
+        if (ack == FP_ACK_SUCCESS) {
+            PRINT("EnrollMode set to %d\n", mode);
+            return FP_OK;
+        }
+        PRINT("WriteReg EnrollMode ack=0x%02X (attempt %d)\n", ack, attempt + 1);
+    }
+
+    PRINT("EnrollMode write FAILED after 3 attempts\n");
     return FP_ERR_FAIL;
 }
 

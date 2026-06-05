@@ -37,6 +37,7 @@ C_SOURCES = \
 	$(APP_DIR)/fingerprint.c \
 	$(APP_DIR)/immurok_security.c \
 	$(APP_DIR)/immurok_keystore.c \
+	$(APP_DIR)/tamper.c \
 	$(APP_DIR)/ws2812.c \
 	LIB/sha1.c \
 	LIB/sha256.c \
@@ -86,12 +87,12 @@ C_INCLUDES = \
 	-I$(SRC_PATH)/StdPeriphDriver/inc \
 	-I$(SRC_PATH)/RVMSIS
 
-# Hardware version (default: latest = 5)
-# Usage: make VER=0 / VER=1 / VER=2 / VER=3 / VER=5
+# Hardware version (default: latest = 6)
+# Usage: make VER=0 / VER=1 / VER=2 / VER=3 / VER=5 / VER=6
 ifdef VER
 HW_VER = $(VER)
 endif
-HW_VER ?= 5
+HW_VER ?= 6
 
 BLE_MEMHEAP = 5632
 

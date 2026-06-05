@@ -7,8 +7,9 @@
  * VER3: Rev.2 board + R599S fingerprint module
  * VER5: Rev.3 board — all RGB on GPIOB, BATT on PA12 (1/4 divider),
  *       anti-tamper switch on PB10, VCC2 sense on PB12
+ * VER6: Rev.3 board (same pins as VER5) + tamper detection (ANTI_OPEN) enabled
  *
- * Select via Makefile: make VER=0 / VER=1 / VER=2 / VER=3 / VER=5
+ * Select via Makefile: make VER=0 / VER=1 / VER=2 / VER=3 / VER=5 / VER=6
  */
 
 #ifndef HARDWARE_PINS_H
@@ -30,23 +31,37 @@
 // Version-specific pins
 // ============================================================================
 
-#if defined(HARDWARE_VER5)
+#if defined(HARDWARE_VER5) || defined(HARDWARE_VER6)
 
-// --- VER5 Pin Assignments (Rev.3 board) ---
+// --- VER5 / VER6 Pin Assignments (Rev.3 board) ---
+// VER6 引脚与 VER5 完全相同；区别仅在 VER6 启用防拆检测（HAS_TAMPER_DETECT）。
 // All RGB on GPIOB, BATT stays on PA14 but divider is now 1/4 (R2=3M/R3=1M),
 // BTN back to PB4, SENSOR_EN moved to PB12.
-// PB10 has an anti-tamper switch wired in HW; detection logic is deferred on
-// this revision, but the pin must be clamped to IN_PD at boot so the blanket
-// GPIOB pull-up doesn't leak 73µA into the closed switch.
+// PB10 has an anti-tamper switch wired in HW. VER5: detection deferred, pin
+// only clamped to IN_PD. VER6: tamper detection enabled (HAS_TAMPER_DETECT).
+// Either way the pin is clamped to IN_PD at boot so the blanket GPIOB pull-up
+// doesn't leak 73µA into the closed switch.
 // PB11, PA15, PA13, PA12, PA4 all NC.
 // PB14/PB15 go to PCB test points (system debug), not GPIO-usable.
 #define PIN_FP_PWR          GPIO_Pin_12     // PB12 - SENSOR_EN (active high)
 #define PIN_TOUCH           GPIO_Pin_13     // PB13 - DETECT (active high)
 #define PIN_BTN             GPIO_Pin_4      // PB4  - Button (active low, HW RC debounce)
-#define PIN_ANTI_OPEN       GPIO_Pin_10     // PB10 - Tamper switch (input-only, no IRQ logic yet)
+#define PIN_ANTI_OPEN       GPIO_Pin_10     // PB10 - Tamper switch (low=closed; VER6 detects rising edge)
+// Tamper detection (VER6 only). ANTI_OPEN: low = case closed (normal),
+// high = case opened (tamper). IN_PD + rising-edge IRQ + wake source.
+#if defined(HARDWARE_VER6)
+#define HAS_TAMPER_DETECT   1
+#else
+#define HAS_TAMPER_DETECT   0
+#endif
+#define ANTI_OPEN_SetMode(m)        GPIOB_ModeCfg(PIN_ANTI_OPEN, m)
+#define ANTI_OPEN_SetITMode(m)      GPIOB_ITModeCfg(PIN_ANTI_OPEN, m)
+#define ANTI_OPEN_ReadPin()         (GPIOB_ReadPortPin(PIN_ANTI_OPEN) & PIN_ANTI_OPEN)
+#define ANTI_OPEN_ReadITFlag()      GPIOB_ReadITFlagBit(PIN_ANTI_OPEN)
+#define ANTI_OPEN_ClearITFlag()     GPIOB_ClearITFlagBit(PIN_ANTI_OPEN)
 #define PIN_VBAT            GPIO_Pin_14     // PA14 - Battery voltage (1/4 divider: R2=3M/R3=1M) → AIN4
 #define VBAT_ADC_CH         CH_EXTIN_4      // ADC channel 4
-#define VBAT_DIV_RATIO      4               // 1/4 resistor divider (VER5 only; VER2/3 use 1/2)
+#define VBAT_DIV_RATIO      4               // 1/4 resistor divider (VER5/VER6; VER2/3 use 1/2)
 // Divider Thevenin = R2∥R3 = 3M∥1M = 750kΩ, C7 = 100nF → RC=75ms.
 // 6.7τ → C7 settles to 99.87% of target (vs 99.33% at 5τ); knocks the
 // systematic undershoot at the top end from ~28mV to ~5mV.
