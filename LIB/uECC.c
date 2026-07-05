@@ -1585,6 +1585,11 @@ int uECC_verify(const uint8_t *public_key,
 
     for (i = num_bits - 2; i >= 0; --i) {
         uECC_word_t index;
+        /* Feed the watchdog during the ~256-iteration double-scalar mult: unlike
+         * EccPoint_mult (make_key/sign), uECC_verify has its own loop that
+         * otherwise never kicks, so the WDT fires mid-verify and resets the MCU
+         * (observed: OTA install resets after "flash SHA256 OK", before ECDSA). */
+        if ((i & 7) == 0) { uECC_KICK_WATCHDOG(); }
         curve->double_jacobian(rx, ry, z, curve);
 
         index = (!!uECC_vli_testBit(u1, i)) | ((!!uECC_vli_testBit(u2, i)) << 1);

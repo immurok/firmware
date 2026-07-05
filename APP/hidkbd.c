@@ -26,6 +26,7 @@
 #include "immurok_keystore.h"
 #include "otaprofile.h"
 #include "ota.h"
+#include "../LIB/uECC.h"
 #include "hardware_pins.h"
 #include "version.h"
 #if HAS_TAMPER_DETECT
@@ -374,10 +375,65 @@ static uint32_t s_ota_erase_count = 0;
 static uint8_t s_ota_verify_status = 0;
 uint8_t s_ota_active = 0;  // OTA mode: suppress all non-OTA functionality (non-static: extern'd by hiddev.c)
 static uint8_t s_ota_reboot_pending = 0;  // Deferred reboot after OTA verification
+static volatile uint8_t s_ota_verify_pending = 0;  // Deferred ECDSA verify (heavy → runs in OTA_FLASH_ERASE_EVT, not the GATT callback)
+static volatile uint8_t s_ota_verifying = 0;       // Set during the ~1-2s verify; gates re-entrant OTA cmds from the keepalive pump
 
 // OTA secure context (for encrypted .imfw upgrades)
 #include "ota_keys.h"
 static ota_secure_ctx_t s_ota_sec = {0};
+
+// uECC keepalive during the OTA ECDSA verify. Pumps the BLE link layer via
+// TMOS_SystemProcess() (reentrancy-guarded, same pattern as keystore's kick).
+// s_ota_verifying gates OTA_IAP_DataDeal so a re-entrant OTA command dispatched
+// by the pump cannot corrupt the non-reentrant sha256 / uECC static state.
+extern void uECC_set_watchdog_cb(void (*cb)(void));
+// uECC keepalive during the OTA ECDSA verify: feed the WDT ONLY. Do NOT pump
+// TMOS_SystemProcess() from inside uECC — that nests an event dispatch on top
+// of uECC's deep call frame and overflows the 512B stack (observed: device
+// resets mid-verify, before ECDSA completes; IAP then boots the old image).
+// uECC_verify is <~2s (well under the 6s BLE supervision timeout) and the
+// device reboots right after, so no link keep-alive is needed — same as the
+// pairing ECC path (immurok_security.c), which also only feeds the WDT.
+static void ota_verify_watchdog_kick(void)
+{
+    WWDG_SetCounter(0);
+}
+
+// Reverse 32 bytes in place. uECC is built with NATIVE_LITTLE_ENDIAN=1 (Makefile)
+// so it reads keys/hash/signature as little-endian, but the .imfw stores them
+// big-endian (standard; how the signer/python produces them). Byte-reverse each
+// 32-byte field before uECC_verify — same LE bridge as keystore sign (hash_le).
+static void ota_rev32(uint8_t *b)
+{
+    for(int k = 0; k < 16; k++) { uint8_t t = b[k]; b[k] = b[31 - k]; b[31 - k] = t; }
+}
+
+// Read the persisted monotonic SVN floor from DataFlash. Returns 0 when the
+// page is uninitialized (erased / wrong magic) — i.e. accept any SVN >= 0 and
+// let the first install establish the floor.
+static uint16_t ota_svn_floor_read(void)
+{
+    uint32_t v[2] __attribute__((aligned(4))) = {0, 0};
+    uint32_t saved = __risc_v_disable_irq();   // EEPROM_READ fault-into-IAP guard
+    EEPROM_READ(OTA_SVN_FLOOR_ADDR, v, sizeof(v));
+    __risc_v_enable_irq(saved);
+    if(v[0] != OTA_SVN_FLOOR_MAGIC)
+        return 0;
+    return (uint16_t)v[1];
+}
+
+// Advance the SVN floor to `svn` if it is higher. Own 256B page-erase, so the
+// OTA ImageFlag (0x6000) and tamper flag (0x6F00) in the same block are
+// untouched. Monotonic: never lowers the floor.
+static void ota_svn_floor_bump(uint16_t svn)
+{
+    if(svn <= ota_svn_floor_read())
+        return;
+    uint32_t v[2] __attribute__((aligned(4))) = { OTA_SVN_FLOOR_MAGIC, svn };
+    WWDG_SetCounter(0);
+    EEPROM_ERASE(OTA_SVN_FLOOR_ADDR, EEPROM_PAGE_SIZE);
+    EEPROM_WRITE(OTA_SVN_FLOOR_ADDR, v, sizeof(v));
+}
 
 /*********************************************************************
  * RGB LED Indicator (VER2 board)
@@ -3835,6 +3891,144 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             return (events ^ OTA_FLASH_ERASE_EVT);
         }
 
+        // Deferred OTA verification (heavy: flash-readback SHA256 + ECDSA
+        // P-256 + anti-rollback). Runs here in the main loop — NOT the GATT
+        // callback — and pumps TMOS to keep BLE alive. On pass it schedules the
+        // reboot commit; on fail it sends the status and aborts OTA.
+        if(s_ota_verify_pending)
+        {
+            s_ota_verify_pending = 0;
+            s_ota_verifying = 1;  // gate re-entrant OTA cmds from the keepalive pump
+
+            static uint8_t computed[32];
+            // Reuse s_ota_sec.sha256_ctx (the streamed hash is no longer used —
+            // we verify against flash, not the stream) to avoid extra BSS.
+            sha256_ctx_t *vctx = &s_ota_sec.sha256_ctx;
+            uint8_t ok = 0;
+            uint8_t err = OTA_ERR_SHA256_MISMATCH;
+            // Read the SVN floor NOW, before the ECC verify below: any EEPROM
+            // access right after uECC_* faults into the IAP bootloader on this
+            // chip (same post-ECC hazard keystore/security defer 200ms for).
+            uint16_t floor = ota_svn_floor_read();
+
+            // 1. Hash what ACTUALLY landed in Image B (not the streamed bytes),
+            //    so a silent FLASH_ROM_WRITE failure cannot pass verification.
+            //    Code flash is memory-mapped, so read it directly in chunks and
+            //    pump TMOS between them to keep BLE alive across the ~216KB hash.
+            sha256_init(vctx);
+            {
+                uint32_t remaining = s_ota_sec.header.fw_size;
+                uint32_t faddr = IMAGE_B_START_ADD;
+                while(remaining)
+                {
+                    uint32_t chunk = (remaining > 1024) ? 1024 : remaining;
+                    sha256_update(vctx, (const uint8_t *)faddr, chunk);
+                    faddr += chunk;
+                    remaining -= chunk;
+                    WWDG_SetCounter(0);  // feed WDT only — no TMOS pump (see ota_verify_watchdog_kick)
+                }
+            }
+            sha256_final(vctx, computed);
+
+            if(memcmp(computed, s_ota_sec.header.fw_sha256, 32) == 0)
+            {
+                PRINT("OTA verify: flash SHA256 OK\n");
+
+                // 2. ECDSA P-256 over SHA256(header[0:0x40]). uECC reads the
+                //    hash/pubkey/sig as big-endian (LITTLE_ENDIAN=0), matching
+                //    the build-side signer — no byte reversal.
+                static uint8_t hhash[32];
+                sha256_init(vctx);
+                sha256_update(vctx, (const uint8_t *)&s_ota_sec.header, 0x40);
+                sha256_final(vctx, hhash);
+
+                // Convert BE (.imfw) → LE (uECC NATIVE_LITTLE_ENDIAN=1).
+                // Reuse the 4KB stack-guard work buffer (no keystore op runs
+                // during OTA) instead of adding BSS that overflows the stack.
+                extern uint8_t immurok_keystore_work_buf[];
+                uint8_t *pub_le = immurok_keystore_work_buf;
+                memcpy(pub_le, OTA_PUBLIC_KEY, 64);
+                ota_rev32(pub_le);          ota_rev32(pub_le + 32);          // X||Y → LE
+                ota_rev32(hhash);                                            // hash → LE
+                ota_rev32(s_ota_sec.header.ecdsa_sig);                       // r → LE
+                ota_rev32(s_ota_sec.header.ecdsa_sig + 32);                  // s → LE
+
+                PRINT("OTA verify: hdr SHA done, calling uECC_verify...\n");
+                uECC_set_watchdog_cb(ota_verify_watchdog_kick);
+                WWDG_SetCounter(0);
+                int vr = uECC_verify(pub_le, hhash, 32,
+                                     s_ota_sec.header.ecdsa_sig, uECC_secp256r1());
+                WWDG_SetCounter(0);
+                uECC_set_watchdog_cb(NULL);
+                PRINT("OTA verify: uECC_verify returned %d\n", vr);
+
+                if(vr == 1)
+                {
+                    PRINT("OTA verify: ECDSA OK\n");
+                    // 3. Anti-rollback: reject SVN below the persisted floor
+                    //    (floor was read before the ECC verify, above).
+                    if(s_ota_sec.header.sec_version >= floor)
+                    {
+                        ok = 1;
+                    }
+                    else
+                    {
+                        PRINT("OTA verify: SVN %d < floor %d (rollback)\n",
+                              s_ota_sec.header.sec_version, floor);
+                        err = OTA_ERR_VERSION_ROLLBACK;
+                    }
+                }
+                else
+                {
+                    PRINT("OTA verify: ECDSA FAIL\n");
+                    err = OTA_ERR_SIG_INVALID;
+                }
+            }
+            else
+            {
+                PRINT("OTA verify: flash SHA256 mismatch\n");
+                err = OTA_ERR_SHA256_MISMATCH;
+            }
+
+            s_ota_verifying = 0;
+
+            if(ok)
+            {
+                PRINT("OTA verify: PASS — committing reboot\n");
+                s_ota_sec.active = 0;
+#if HAS_RGB_LED
+                led_solid('G', 0);  // green until reboot
+#elif HAS_FP_LED
+                fp_led_flash(FP_LED_GREEN, 25, 2);
+#endif
+                s_ota_reboot_pending = 1;
+                // Defer the reboot commit ~200ms: it writes the IAP flag via
+                // EEPROM_ERASE/WRITE, which faults into the IAP bootloader when
+                // done right after the ECC verify (chip resets before the flag
+                // is set → IAP boots the OLD image, OTA silently no-ops). Same
+                // mitigation as the post-ECC keystore/security EEPROM saves.
+                tmos_start_task(hidEmuTaskId, OTA_FLASH_ERASE_EVT, 320);  // ~200ms
+            }
+            else
+            {
+                s_ota_sec.active = 0;
+                s_ota_active = 0;
+#if HAS_RGB_LED
+                led_solid('R', 1600);  // 1s red — verify failed
+#elif HAS_FP_LED
+                fp_led_flash(FP_LED_RED, 15, 5);
+#endif
+                GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
+                    DEFAULT_DESIRED_MIN_CONN_INTERVAL,
+                    DEFAULT_DESIRED_MAX_CONN_INTERVAL,
+                    DEFAULT_DESIRED_SLAVE_LATENCY,
+                    DEFAULT_DESIRED_CONN_TIMEOUT,
+                    hidEmuTaskId);
+                OTA_IAP_SendStatus(err);
+            }
+            return (events ^ OTA_FLASH_ERASE_EVT);
+        }
+
         // Deferred OTA reboot: write IAP flag to DataFlash EEPROM, then reset
         if(s_ota_reboot_pending)
         {
@@ -3861,6 +4055,11 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             EEPROM_READ(OTA_DATAFLASH_ADD, (uint32_t *)block_buf, 4);
             PRINT("  verify: 0x%02X %s\n", block_buf[0],
                   (block_buf[0] == IMAGE_IAP_FLAG) ? "OK" : "FAIL!");
+
+            // Advance the anti-rollback floor — the image is verified and about
+            // to be promoted. Own DataFlash page, so the IAP flag just written
+            // is untouched.
+            ota_svn_floor_bump(s_ota_sec.header.sec_version);
 
             PRINT("OTA REBOOT: resetting...\n");
             DelayMs(10);
@@ -5339,6 +5538,16 @@ static void OTA_IAP_DataDeal(void)
     uint32_t addr, len;
     uint8_t status;
 
+    // Reject re-entrant OTA commands while the deferred ECDSA verify runs: it
+    // pumps TMOS, which can dispatch a freshly-arrived OTA write back into here,
+    // and sha256/uECC use non-reentrant static state. Legit peers are idle
+    // (waiting for the END response) during this window.
+    if(s_ota_verifying)
+    {
+        OTA_IAP_SendStatus(0xEE);  // busy — verify in progress
+        return;
+    }
+
     // Refresh inactivity watchdog on every OTA cmd received during an
     // active session. The CMD_IAP_ERASE case arms the timer on first entry;
     // subsequent HEADER/PROM/VERIFY/END refresh it here. CMD_IAP_INFO
@@ -5348,12 +5557,13 @@ static void OTA_IAP_DataDeal(void)
     }
 
     // OTA does NOT require an enrolled fingerprint:
-    // - HMAC-SHA256 over the .imfw header is the actual security gate;
-    //   anything not signed by OTA_SIGNING_KEY is rejected at CMD_IAP_END.
+    // - The ECDSA P-256 signature over the .imfw header is the actual security
+    //   gate; anything not signed by the offline private key is rejected at
+    //   the deferred verify (flash-readback SHA256 + ECDSA + anti-rollback).
     // - Fresh device (just unboxed, no FP enrolled yet) needs to be able to
     //   take a server-pushed firmware update before the user finishes
     //   provisioning — the prior FP gate broke that OOBE flow.
-    // - Worst case without signing key: attacker erases Image B (B is the
+    // - Worst case without the private key: attacker erases Image B (B is the
     //   inactive image; A keeps running) and never finishes — recoverable
     //   by disconnect. Image A is never touched mid-OTA.
 
@@ -5413,13 +5623,14 @@ static void OTA_IAP_DataDeal(void)
             }
 
             {
-                // Decrypt in-place, update SHA256
+                // Decrypt in-place. (No streamed SHA256 here — END verifies the
+                // hash by reading Image B back from flash, which also catches a
+                // silent flash-write failure. s_ota_sec.sha256_ctx is reused as
+                // scratch by that verify.)
                 uint32_t stream_offset = s_ota_sec.bytes_written;
                 aes128_ctr_xcrypt(&s_ota_sec.aes_ctx, s_ota_sec.header.iv,
                                   stream_offset,
                                   s_ota_iap_data.program.buf, (size_t)len);
-                sha256_update(&s_ota_sec.sha256_ctx,
-                              s_ota_iap_data.program.buf, (size_t)len);
                 s_ota_sec.bytes_written += len;
             }
 
@@ -5456,6 +5667,16 @@ static void OTA_IAP_DataDeal(void)
             {
                 PRINT("OTA HEADER: bad magic 0x%08lx\n", (unsigned long)s_ota_sec.header.magic);
                 OTA_IAP_SendStatus(0xFD);
+                break;
+            }
+            // Reject any non-v2 (e.g. v1/HMAC) package. Also the anti-downgrade
+            // gate: a 1.6.0+ device never accepts a symmetric-era image, so a
+            // leaked HMAC key cannot push firmware to it.
+            if(s_ota_sec.header.version != IMFW_VERSION)
+            {
+                PRINT("OTA HEADER: bad format version %d (need %d)\n",
+                      s_ota_sec.header.version, IMFW_VERSION);
+                OTA_IAP_SendStatus(OTA_ERR_BAD_FORMAT);
                 break;
             }
             if(s_ota_sec.header.hw_id != IMFW_HARDWARE_ID)
@@ -5624,82 +5845,18 @@ static void OTA_IAP_DataDeal(void)
                 break;
             }
 
-            {
-                // Verify SHA256 + HMAC before accepting
-                // Static to avoid stack overflow (BLE callback chain ~200B + HMAC ~112B = ~500B/512B)
-                static uint8_t computed[32];
-
-                // Step 1: Verify SHA256 of decrypted firmware
-                sha256_final(&s_ota_sec.sha256_ctx, computed);
-                if(memcmp(computed, s_ota_sec.header.fw_sha256, 32) != 0)
-                {
-                    PRINT("OTA END: SHA256 mismatch!\n");
-                    s_ota_sec.active = 0;
-                    s_ota_active = 0;
-#if HAS_RGB_LED
-                    led_solid('R', 1600);  // 1s red — verify failed
-#elif HAS_FP_LED
-                    fp_led_flash(FP_LED_RED, 15, 5);
-#endif
-                    GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
-                        DEFAULT_DESIRED_MIN_CONN_INTERVAL,
-                        DEFAULT_DESIRED_MAX_CONN_INTERVAL,
-                        DEFAULT_DESIRED_SLAVE_LATENCY,
-                        DEFAULT_DESIRED_CONN_TIMEOUT,
-                        hidEmuTaskId);
-                    OTA_IAP_SendStatus(OTA_ERR_SHA256_MISMATCH);
-                    break;
-                }
-                PRINT("OTA END: SHA256 OK\n");
-
-                // Step 2: Verify HMAC-SHA256 of header[0:0x40]
-                static uint8_t computed_hmac[32];
-                immurok_hmac_sha256(OTA_SIGNING_KEY, sizeof(OTA_SIGNING_KEY),
-                                    (const uint8_t *)&s_ota_sec.header, 0x40,
-                                    computed_hmac);
-                if(memcmp(computed_hmac, s_ota_sec.header.hmac, 32) != 0)
-                {
-                    PRINT("OTA END: HMAC mismatch!\n");
-                    s_ota_sec.active = 0;
-                    s_ota_active = 0;
-#if HAS_RGB_LED
-                    led_solid('R', 1600);  // 1s red — signature failed
-#elif HAS_FP_LED
-                    fp_led_flash(FP_LED_RED, 15, 5);
-#endif
-                    GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
-                        DEFAULT_DESIRED_MIN_CONN_INTERVAL,
-                        DEFAULT_DESIRED_MAX_CONN_INTERVAL,
-                        DEFAULT_DESIRED_SLAVE_LATENCY,
-                        DEFAULT_DESIRED_CONN_TIMEOUT,
-                        hidEmuTaskId);
-                    OTA_IAP_SendStatus(OTA_ERR_HMAC_MISMATCH);
-                    break;
-                }
-                PRINT("OTA END: HMAC OK - firmware verified!\n");
-
-                s_ota_sec.active = 0;
-            }
-
-            PRINT("OTA END - scheduling reboot\n");
-
-            // Cancel the OTA inactivity watchdog. tmos_set_event below schedules
-            // the reboot for the next event loop iteration, so 10s is plenty of
-            // margin — but explicitly stopping the watchdog removes the race
-            // entirely (watchdog would otherwise call ota_abort_to_idle which
-            // stops OTA_FLASH_ERASE_EVT and would cancel the pending reboot).
+            // Heavy verification — flash-readback SHA256 + ECDSA P-256 over
+            // the header + anti-rollback SVN check — runs hundreds of ms and
+            // pumps TMOS to stay alive, neither of which is safe in this GATT
+            // write callback. Defer it to OTA_FLASH_ERASE_EVT, which sends the
+            // status response on failure or commits the flag + reboots on
+            // success.
+            //
+            // Stop the OTA inactivity watchdog now (FP_POWER_OFF_EVT): the
+            // deferred verify can exceed the 10s window, and the watchdog would
+            // otherwise call ota_abort_to_idle() mid-verify.
             tmos_stop_task(hidEmuTaskId, FP_POWER_OFF_EVT);
-
-            // Verify success — switch from blue progress to solid green so the
-            // user sees "done, rebooting" before the actual reset wipes LED.
-#if HAS_RGB_LED
-            led_solid('G', 0);  // stay on until reboot
-#elif HAS_FP_LED
-            fp_led_flash(FP_LED_GREEN, 25, 2);
-#endif
-
-            // Defer EEPROM write + reset to TMOS event (not safe in GATT callback)
-            s_ota_reboot_pending = 1;
+            s_ota_verify_pending = 1;
             tmos_set_event(hidEmuTaskId, OTA_FLASH_ERASE_EVT);
             break;
         }

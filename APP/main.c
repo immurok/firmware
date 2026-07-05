@@ -260,7 +260,19 @@ int main(void)
         fp_power_off();
         PRINT("Fingerprint power management enabled\n");
     } else {
+        // Module returned unexpected info (missing / not responding / bad ack).
+        // Blink the red LED rapidly to signal startup failure.
         PRINT("Fingerprint init failed: %d\n", fp_ret);
+#if HAS_RGB_LED
+        for (int i = 0; i < 6; i++) {
+            LED_RED_On();
+            DelayMs(120);
+            LED_RED_Off();
+            DelayMs(120);
+            WWDG_SetCounter(0);  // Feed watchdog during blocking blink
+        }
+#endif
+        fp_power_off();
     }
 
     // Touch INT input (active high). Idle default is IN_PD for all HW revs —

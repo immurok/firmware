@@ -68,10 +68,6 @@
 #define CMD_SOFT_RST            0x3D
 #define CMD_AUTO_LED_CONTROL    0x60
 
-// Password Salt (for device-specific password derivation)
-#define FP_SALT_HIGH    0xAAAAAAAAUL
-#define FP_SALT_LOW     0x55555555UL
-
 // Timeouts
 #define UART_TIMEOUT_MS         200
 #define INIT_TIMEOUT_MS         200
@@ -88,8 +84,6 @@ volatile uint8_t g_sleep_inhibit = 0;  // Reference count: >0 suppresses HAL_SLE
 static uint32_t s_power_on_tick = 0;  // RTC tick at power-on (for timing measurement)
 static bool s_initialized = false;
 static bool s_password_verified = false;
-static uint32_t s_cached_password = 0;
-static bool s_password_cached = false;
 static uint32_t s_module_addr = FP_DEFAULT_ADDR;
 static uint8_t s_rx_buf[FP_RX_BUF_SIZE];
 static uint16_t s_rx_total = 0;      // Total bytes from last uart_recv
@@ -466,7 +460,11 @@ int fp_try_parse_packet(uint8_t *ack_code, uint8_t *params, uint16_t *param_len)
             }
             uint16_t pkt_len = ((uint16_t)s_parser.buf[7] << 8) | s_parser.buf[8];
             // pkt_len includes ack(1) + params + checksum(2) — minimum 3 bytes.
-            if (pkt_len < 3 || (uint16_t)(9 + pkt_len) > sizeof(s_parser.buf)) {
+            // Bound pkt_len directly. The old form (uint16_t)(9 + pkt_len) truncated
+            // the sum: pkt_len in [0xFFF7,0xFFFF] wrapped to 0..8, slipped past the
+            // upper bound, and total_sz wrapped below pos so calc_checksum() ran with
+            // a ~65528 length → OOB read past s_parser.buf → HardFault/WDT.
+            if (pkt_len < 3 || pkt_len > sizeof(s_parser.buf) - 9) {
                 fp_parser_reset();
                 return FP_ERR_FAIL;
             }
@@ -771,28 +769,17 @@ int fp_complete_wake(void)
         PRINT("Module 0x55 NOT received (complete_wake)\n");
     }
 
-    // Verify password if not yet verified
+    // Verify the module's default password if not yet verified. Only the
+    // default password (0x00000000) is supported — the device never programs
+    // a non-default password, so a failure here means the module is missing
+    // or not responding as expected.
     if (!s_password_verified) {
-        // Try default password first
         int ret = fp_verify_password(0x00000000);
         if (ret == FP_OK) {
             PRINT("Default password OK (complete_wake)\n");
-            s_password_verified = true;
         } else {
-            // Fallback to device-specific password
-            if (!s_password_cached) {
-                s_cached_password = fp_get_device_password();
-                s_password_cached = true;
-            }
-            ret = fp_verify_password(s_cached_password);
-            if (ret == FP_OK) {
-                PRINT("Device password OK, resetting to default...\n");
-                fp_set_password(0x00000000);
-                s_password_verified = true;
-            } else {
-                PRINT("Password verify failed: %d\n", ret);
-                return ret;
-            }
+            PRINT("Default password verify failed: %d\n", ret);
+            return ret;
         }
     }
 
@@ -821,29 +808,14 @@ int fp_start_verify(void)
     // 0x55 already consumed by FP_WAKE_DONE_EVT poll in hidkbd.c
     uart_flush();
 
-    // Try default password (0x00000000) first — fastest path
+    // Only the default password (0x00000000) is supported.
     int ret = fp_verify_password(0x00000000);
     if (ret == FP_OK) {
         PRINT("Default password OK\n");
-        s_password_verified = true;
         return FP_OK;
     }
 
-    // Default failed — try device-specific password
-    if (!s_password_cached) {
-        s_cached_password = fp_get_device_password();
-        s_password_cached = true;
-    }
-
-    ret = fp_verify_password(s_cached_password);
-    if (ret == FP_OK) {
-        PRINT("Device password OK, resetting to default...\n");
-        fp_set_password(0x00000000);
-        s_password_verified = true;
-        return FP_OK;
-    }
-
-    PRINT("All passwords failed in start_verify\n");
+    PRINT("Default password failed in start_verify\n");
     s_password_verified = false;
     return FP_ERR_FAIL;
 }
@@ -892,28 +864,15 @@ int fp_wake(void)
         }
     }
 
-    // Verify password if not yet verified
+    // Verify the module's default password if not yet verified.
     if (!s_password_verified) {
         int ret = fp_verify_password(0x00000000);
         WWDG_SetCounter(0);  // Feed watchdog after UART command
         if (ret == FP_OK) {
             PRINT("Default password OK (wake)\n");
-            s_password_verified = true;
         } else {
-            if (!s_password_cached) {
-                s_cached_password = fp_get_device_password();
-                s_password_cached = true;
-            }
-            ret = fp_verify_password(s_cached_password);
-            WWDG_SetCounter(0);
-            if (ret == FP_OK) {
-                PRINT("Device password OK, resetting to default...\n");
-                fp_set_password(0x00000000);
-                s_password_verified = true;
-            } else {
-                PRINT("Password verify failed: %d\n", ret);
-                return ret;
-            }
+            PRINT("Default password verify failed: %d\n", ret);
+            return ret;
         }
     }
 
@@ -967,25 +926,13 @@ int fp_init(void)
             }
         }
 
-        // Verify password if not yet verified
+        // Verify the module's default password if not yet verified.
         if (!s_password_verified) {
             ret = fp_verify_password(0x00000000);
             if (ret == FP_OK) {
                 PRINT("Default password OK (init fast path)\n");
-                s_password_verified = true;
             } else {
-                if (!s_password_cached) {
-                    s_cached_password = fp_get_device_password();
-                    s_password_cached = true;
-                }
-                ret = fp_verify_password(s_cached_password);
-                if (ret == FP_OK) {
-                    PRINT("Device password OK, resetting to default...\n");
-                    fp_set_password(0x00000000);
-                    s_password_verified = true;
-                } else {
-                    PRINT("Password verify failed\n");
-                }
+                PRINT("Default password verify failed\n");
             }
         }
         return FP_OK;
@@ -1020,11 +967,15 @@ int fp_init(void)
         PRINT("No ready signal, continuing anyway...\n");
     }
 
-    // Setup password protection FIRST (before other commands)
+    // Verify the module's default password FIRST (before other commands).
+    // This doubles as the module-presence / health check: a healthy module
+    // ACKs the VerifyPassword command, while a missing or malfunctioning
+    // module times out or returns garbage. Treat that as "unexpected info"
+    // and fail init so the caller can signal failure (red LED).
     ret = setup_password_protection();
     if (ret != FP_OK) {
-        PRINT("Password protection setup failed\n");
-        // Don't fail init - module may work without password
+        PRINT("Default password verify failed — module not as expected, init FAILED\n");
+        return FP_ERR_FAIL;
     }
 
     // Now try handshake
@@ -1098,55 +1049,6 @@ int fp_handshake(void)
 // ============================================================================
 // Password Protection
 // ============================================================================
-
-uint32_t fp_get_device_password(void)
-{
-    // Get device MAC address (use chip unique ID as substitute)
-    uint8_t mac[6];
-
-    // CH592F unique ID is at 0x7F018
-    uint8_t *uid = (uint8_t *)0x7F018;
-    memcpy(mac, uid, 6);
-
-    // Build password from salt + MAC using simple XOR mixing (same as ESP32)
-    uint32_t password = FP_SALT_HIGH ^ FP_SALT_LOW;
-    password ^= ((uint32_t)mac[0] << 24) | ((uint32_t)mac[1] << 16) |
-                ((uint32_t)mac[2] << 8)  | ((uint32_t)mac[3]);
-    password ^= ((uint32_t)mac[4] << 8)  | ((uint32_t)mac[5]);
-    password = (password * 0x9E3779B9) ^ (password >> 16);  // Simple hash mixing
-
-    PRINT("Device password derived\n");
-    return password;
-}
-
-int fp_set_password(uint32_t password)
-{
-    if (!s_powered_on) {
-        return FP_ERR_FAIL;
-    }
-
-    uint8_t params[4];
-    params[0] = (password >> 24) & 0xFF;
-    params[1] = (password >> 16) & 0xFF;
-    params[2] = (password >> 8) & 0xFF;
-    params[3] = password & 0xFF;
-
-    fp_send_cmd(CMD_SET_PWD, params, 4);
-
-    uint8_t ack;
-    int ret = fp_recv_ack(&ack, NULL, NULL, UART_TIMEOUT_MS);
-    if (ret != FP_OK) {
-        return ret;
-    }
-
-    if (ack == FP_ACK_SUCCESS) {
-        PRINT("Password set successfully\n");
-        return FP_OK;
-    }
-
-    PRINT("Set password failed: 0x%02X\n", ack);
-    return FP_ERR_FAIL;
-}
 
 int fp_set_score_level(uint8_t level)
 {
@@ -1253,68 +1155,20 @@ int fp_verify_password(uint32_t password)
     return FP_ERR_FAIL;
 }
 
-// Setup password protection (called from fp_init)
-// Strategy: use default password (0x00000000) for fast wake-up.
-// If module has a non-default password, reset it to default.
+// Verify the module's default password (called from fp_init).
+// Only the default password (0x00000000) is supported — the device never
+// programs a non-default password. A failure here means the module is not
+// present or not responding as expected.
 static int setup_password_protection(void)
 {
-    int ret;
-
-    // Try default password first — this is the target state
     PRINT("Verifying default password...\n");
-    ret = fp_verify_password(0x00000000);
+    int ret = fp_verify_password(0x00000000);
     if (ret == FP_OK) {
         PRINT("Default password OK\n");
         return FP_OK;
     }
 
-    // Try device-specific password — module may have been set previously
-    uint32_t password = fp_get_device_password();
-    PRINT("Trying device password...\n");
-    ret = fp_verify_password(password);
-    if (ret == FP_OK) {
-        PRINT("Device password OK, resetting to default...\n");
-        fp_set_password(0x00000000);
-        return FP_OK;
-    }
-
-    // Try some old test passwords
-    PRINT("Trying old test passwords...\n");
-
-    // Old algorithm: simple XOR
-    uint8_t *uid = (uint8_t *)0x7F018;
-    uint32_t old_pwd = ((uint32_t)uid[2] << 24) | ((uint32_t)uid[3] << 16) |
-                       ((uint32_t)uid[4] << 8) | (uint32_t)uid[5];
-    old_pwd ^= 0xA5A5A5A5;
-    old_pwd = ((old_pwd << 13) | (old_pwd >> 19)) ^ 0x5A5A5A5A;
-
-    ret = fp_verify_password(old_pwd);
-    if (ret == FP_OK) {
-        PRINT("Old password OK, resetting to default...\n");
-        fp_set_password(0x00000000);
-        return FP_OK;
-    }
-
-    // Try passwords from other chips that may have locked this sensor
-    {
-        static const uint32_t other_chip_passwords[] = {
-            0x4C4FBE82,  // legacy chip password (current algo)
-            0xD06B3942,  // legacy chip password (old algo)
-        };
-        int n = sizeof(other_chip_passwords) / sizeof(other_chip_passwords[0]);
-        for (int i = 0; i < n; i++) {
-            PRINT("Trying other chip password [%d/%d]: 0x%08X\n", i + 1, n, other_chip_passwords[i]);
-            ret = fp_verify_password(other_chip_passwords[i]);
-            if (ret == FP_OK) {
-                PRINT("Other chip password matched! Resetting to default...\n");
-                fp_set_password(0x00000000);
-                return FP_OK;
-            }
-        }
-    }
-
-    PRINT("All password attempts failed\n");
-    // Continue anyway - module may not require password for basic ops
+    PRINT("Default password verify failed\n");
     s_password_verified = false;
     return FP_ERR_FAIL;
 }

@@ -362,24 +362,12 @@ int fp_set_score_level(uint8_t level);
 int fp_set_enroll_mode(uint8_t mode);
 
 /**
- * Set module password
- * @param password 4-byte password
- * @return FP_OK on success
- */
-int fp_set_password(uint32_t password);
-
-/**
- * Verify module password
+ * Verify the module's default password (0x00000000).
+ * Only the default password is supported.
  * @param password Password to verify
  * @return FP_OK if correct
  */
 int fp_verify_password(uint32_t password);
-
-/**
- * Get device-derived password
- * @return Password derived from device MAC
- */
-uint32_t fp_get_device_password(void);
 
 // ============================================================================
 // LED Control

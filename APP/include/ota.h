@@ -69,8 +69,17 @@
 #define IAP_LEN                247
 
 /* OTA security error codes (returned in END response) */
-#define OTA_ERR_SHA256_MISMATCH  0xF1  /* Firmware SHA256 mismatch */
-#define OTA_ERR_HMAC_MISMATCH    0xF2  /* Header HMAC signature invalid */
+#define OTA_ERR_SHA256_MISMATCH  0xF1  /* Firmware SHA256 (flash readback) mismatch */
+#define OTA_ERR_SIG_INVALID      0xF2  /* Header ECDSA signature invalid */
+#define OTA_ERR_VERSION_ROLLBACK 0xF3  /* sec_version below the persisted floor */
+/* 0xF4 = SEC_ERR_LOW_BATTERY (hidkbd.c) */
+#define OTA_ERR_BAD_FORMAT       0xF5  /* Wrong header format version (not v2) */
+
+/* DataFlash address (block 6, own 256B page) for the monotonic anti-rollback
+ * SVN floor. Distinct page from OTA ImageFlag (0x6000) and tamper (0x6F00),
+ * so each is page-erased independently. */
+#define OTA_SVN_FLOOR_ADDR       0x6E00
+#define OTA_SVN_FLOOR_MAGIC      0x53564E31UL  /* "SVN1" — marks an initialized floor */
 
 /* OTA DataFlash structure */
 typedef struct {
@@ -129,21 +138,27 @@ typedef union {
  * ============================================================================ */
 
 #define IMFW_MAGIC          0x494D4657  /* "IMFW" */
-#define IMFW_VERSION        0x01
+#define IMFW_VERSION        0x02        /* v2 = ECDSA P-256 signed (1.6.0+) */
 #define IMFW_HARDWARE_ID    0x0592
-#define IMFW_HEADER_SIZE    96
+#define IMFW_HEADER_SIZE    128
 
-/* .imfw file header (96 bytes) */
+/* .imfw file header (v2, 128 bytes).
+ * 1.6.0+ accepts ONLY this format; v1 (HMAC) packages are rejected, which is
+ * also the anti-downgrade guard back into the symmetric-key era. The signature
+ * covers header[0:0x40] (which includes fw_sha256, chaining the firmware) and
+ * is verified with the embedded EC public key. */
 typedef struct __attribute__((packed)) {
     uint32_t magic;           /* 0x00: "IMFW" (0x494D4657) */
-    uint8_t  version;         /* 0x04: Format version (0x01) */
+    uint8_t  version;         /* 0x04: Format version (0x02) */
     uint8_t  flags;           /* 0x05: Reserved */
     uint16_t hw_id;           /* 0x06: Hardware ID (0x0592) */
     uint32_t fw_size;         /* 0x08: Firmware size (plaintext) */
-    uint32_t reserved;        /* 0x0C: Reserved */
+    uint16_t sec_version;     /* 0x0C: Security version (SVN, anti-rollback) */
+    uint16_t reserved;        /* 0x0E: Reserved */
     uint8_t  iv[16];          /* 0x10: AES-128-CTR IV */
     uint8_t  fw_sha256[32];   /* 0x20: SHA256 of plaintext firmware */
-    uint8_t  hmac[32];        /* 0x40: HMAC-SHA256(signing_key, header[0:0x40]) */
+    uint8_t  ecdsa_sig[64];   /* 0x40: ECDSA P-256 over SHA256(header[0:0x40]),
+                                       raw big-endian r||s */
 } imfw_header_t;
 
 /* OTA secure context (active during encrypted OTA) */
