@@ -67,23 +67,10 @@
 // HID idle timeout in msec; set to zero to disable timeout
 #define DEFAULT_HID_IDLE_TIMEOUT             60000
 
-// Minimum connection interval (units of 1.25ms)
-// 24 = 30ms
-#define DEFAULT_DESIRED_MIN_CONN_INTERVAL    24
-
-// Maximum connection interval (units of 1.25ms)
-// 48 = 60ms
-#define DEFAULT_DESIRED_MAX_CONN_INTERVAL    48
-
-// Slave latency to use if parameter update request
-// 20 = skip up to 20 intervals; effective idle interval = 60ms * 21 = 1.26s
-// Keystroke wakes immediately, latency drops back to 30-60ms
-#define DEFAULT_DESIRED_SLAVE_LATENCY        20
-
-// Supervision timeout value (units of 10ms)
-// Apple requires: timeout > intervalMax * (latency + 1) * 3 = 60ms * 21 * 3 = 3780ms
-// 600 = 6s (Apple max = 6s)
-#define DEFAULT_DESIRED_CONN_TIMEOUT         600
+// DEFAULT_DESIRED_* (the params we request) and LONG_OP_* / PARAM_OK_*
+// (the thresholds we judge the granted params against) all live in hidkbd.h —
+// hiddev.c's param negotiation callback needs the same values and the two
+// files must not drift apart.
 
 // Default passcode
 #define DEFAULT_PASSCODE                     0
@@ -388,12 +375,17 @@ static ota_secure_ctx_t s_ota_sec = {0};
 // by the pump cannot corrupt the non-reentrant sha256 / uECC static state.
 extern void uECC_set_watchdog_cb(void (*cb)(void));
 // uECC keepalive during the OTA ECDSA verify: feed the WDT ONLY. Do NOT pump
-// TMOS_SystemProcess() from inside uECC — that nests an event dispatch on top
-// of uECC's deep call frame and overflows the 512B stack (observed: device
-// resets mid-verify, before ECDSA completes; IAP then boots the old image).
-// uECC_verify is <~2s (well under the 6s BLE supervision timeout) and the
-// device reboots right after, so no link keep-alive is needed — same as the
-// pairing ECC path (immurok_security.c), which also only feeds the WDT.
+// TMOS_SystemProcess() from inside uECC_verify — that nests an event dispatch
+// on top of uECC_verify's deep call frame and overflows the 512B stack
+// (observed: device resets mid-verify, before ECDSA completes; IAP then boots
+// the old image). No link keep-alive is needed here anyway: the device reboots
+// right after a successful verify.
+//
+// This applies to uECC_verify ONLY. The pairing/keystore path deliberately
+// does pump TMOS from its callback (keystore_watchdog_kick) and that is what
+// keeps the link up through ECDH — measured on VER=6/1.6.2: make_key 1783ms
+// and shared_secret 1918ms both completed with the link alive at a 2000ms
+// supervision timeout. uECC_verify's double-scalar loop simply runs deeper.
 static void ota_verify_watchdog_kick(void)
 {
     WWDG_SetCounter(0);
@@ -440,6 +432,27 @@ static void ota_svn_floor_bump(uint16_t svn)
  */
 #if HAS_RGB_LED
 static uint8_t s_led_task_id;
+
+/* s_led_task_id EVENT BIT ALLOCATION — keep this table in sync.
+ *
+ * This task's event space is SEPARATE from hidEmuTaskId's (hidkbd.h), so the
+ * same numeric value in both is fine. What is NOT fine is two events sharing a
+ * bit within this task: LED_ProcessEvent tests bits in source order and each
+ * handler consumes its bit with `return events ^ ...`, so the later handler
+ * simply never runs. PAIR_BTN_TIMEOUT_EVT sat on LED_ACCESS_OFF_EVT's 0x0020
+ * that way until 1.6.3 and was dead the whole time.
+ *
+ *   0x0001  LED_BLINK_EVT
+ *   0x0002  LED_OFF_EVT
+ *   0x0004  LOCK_HOLD_EVT
+ *   0x0008  FP_SLEEP_RETRY_EVT
+ *   0x0010  EEPROM_SAVE_EVT
+ *   0x0020  LED_ACCESS_OFF_EVT
+ *   0x0040  KEYSTORE_COMMIT_EVT
+ *   0x0080  PARAM_NOTIFY_EVT
+ *   0x0100  PAIR_BTN_TIMEOUT_EVT
+ *   0x0200..0x4000 free   (0x8000 reserved by SYS_EVENT_MSG)
+ */
 #define LED_BLINK_EVT       0x0001
 #define LED_OFF_EVT         0x0002
 // LOCK_HOLD_EVT: scheduled on TOUCH rising edge; fires LOCK_HOLD_TICKS later.
@@ -467,8 +480,34 @@ static uint8_t s_led_task_id;
 // PAIR_BTN_TIMEOUT_EVT: 30s window after PAIR_INIT for the user to physically
 // press the device button to confirm pairing. Started in the PAIR_INIT GATT
 // handler, cleared on button press / long-press cancel / disconnect.
-#define PAIR_BTN_TIMEOUT_EVT    0x0020
+//
+// Was 0x0020 until 1.6.3 — the same bit as LED_ACCESS_OFF_EVT, on the same
+// task. LED_ProcessEvent tests LED_ACCESS_OFF_EVT first and consumes the bit,
+// so this handler was unreachable: the 30s timeout never fired, the white
+// pairing blink never stopped, s_pair_wait_button was never cleared and the
+// [0x34,0x00] timeout notification was never sent (the App's 45s outer
+// timeout masked it). A bulk keystore read during a pairing wait also
+// cancelled the pairing timeout, and vice versa.
+#define PAIR_BTN_TIMEOUT_EVT    0x0100
 #define PAIR_BTN_TIMEOUT_TICKS  48000   // 30s @ 625us/tick
+
+// PARAM_NOTIFY_EVT: re-report the current connection params to the App shortly
+// after it enables notifications.
+//
+// Connection params are negotiated in the first ~2s after link establishment,
+// but the daemon typically subscribes tens of seconds later (36s in one
+// measured trace). Every 0xF0 param notification emitted before that is
+// dropped with "TX DROPPED: CCC notify not enabled", so the App log never
+// contains the params that were actually negotiated — precisely the data
+// needed to diagnose a central that imposes its own. Replaying the cached
+// values once on subscribe closes that hole with no protocol change; the App
+// already parses 0xF0.
+//
+// Deferred via TMOS rather than sent inline from the CCC write callback, so
+// the notification is not injected in the middle of the ATT transaction that
+// enabled it.
+#define PARAM_NOTIFY_EVT        0x0080
+#define PARAM_NOTIFY_DELAY      160     // 100ms @ 625us/tick
 
 // FP_SLEEP_RETRY_EVT: async PS_Sleep + VCC-cut state machine.
 //
@@ -848,6 +887,15 @@ static uint16_t LED_ProcessEvent(uint8_t task_id, uint16_t events)
         return events ^ KEYSTORE_COMMIT_EVT;
     }
 
+    if(events & PARAM_NOTIFY_EVT)
+    {
+        // App just subscribed — replay the connection params it missed.
+        PRINT("Param replay to App: interval=%d, latency=%d, timeout=%dms\n",
+              s_conn_interval, s_conn_latency, s_conn_timeout * 10);
+        ImmurokNotify_ConnParams();
+        return events ^ PARAM_NOTIFY_EVT;
+    }
+
     if(events & PAIR_BTN_TIMEOUT_EVT)
     {
         // 30s elapsed without the user pressing the button — abort pairing.
@@ -1053,10 +1101,42 @@ uint8_t s_param_update_retries = 0;
 uint8_t s_latency_accepted = 0;
 // Current supervision timeout in units of 10ms (extern'd by hiddev.c, updated on every param change)
 uint16_t s_conn_timeout = 0;
+// Current interval (units of 1.25ms) and peripheral latency, cached alongside
+// s_conn_timeout so the params can be re-reported to the App after it
+// subscribes. Extern'd by hiddev.c.
+uint16_t s_conn_interval = 0;
+uint16_t s_conn_latency = 0;
+// One param replay per connection (see HidEmu_ImmurokCccChangeCB). Cleared on
+// disconnect so each new connection replays once.
+static uint8_t s_param_replay_done = 0;
+
+// Emit the current connection params to the App:
+//   [0xF0][interval_hi][interval_lo][latency][timeout_hi][timeout_lo]
+// Called from hiddev.c whenever the params change, and again from
+// PARAM_NOTIFY_EVT once the App subscribes (see that event's comment — the
+// change-time notifications are usually dropped because nobody is listening
+// yet). Silently no-ops via ImmurokService_SendResponse when CCC is off.
+void ImmurokNotify_ConnParams(void)
+{
+    static uint8_t paramNotif[6];  // static: GATT callback stack is only 512B
+    paramNotif[0] = 0xF0;  // PARAM_UPDATE tag
+    paramNotif[1] = (uint8_t)(s_conn_interval >> 8);
+    paramNotif[2] = (uint8_t)(s_conn_interval & 0xFF);
+    paramNotif[3] = (uint8_t)s_conn_latency;
+    paramNotif[4] = (uint8_t)(s_conn_timeout >> 8);
+    paramNotif[5] = (uint8_t)(s_conn_timeout & 0xFF);
+    ImmurokService_SendResponse(paramNotif, 6);
+}
 // Sticky: set once Phase 2 (slave latency + timeout ≥ 2s) has been accepted.
 // Signals discovery is done, so degradation recovery can skip Phase 1 and
 // request full params directly. Cleared on disconnect. Extern'd by hiddev.c.
 uint8_t s_post_discovery = 0;
+// Post-override param re-request (see hidkbd.h). _count bounds how many times
+// we may fight the central per connection; _armed lets the
+// START_PARAM_UPDATE_EVT handler bypass its "params are already good enough"
+// early return for one attempt. Both cleared on disconnect. Extern'd by hiddev.c.
+uint8_t s_post_override_retry_count = 0;
+uint8_t s_post_override_retry_armed = 0;
 // Long op param wait state (reset on disconnect)
 static uint8_t s_long_op_param_requested = 0;
 static uint32_t s_long_op_wait_start = 0;
@@ -1482,9 +1562,10 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             return (events ^ START_PARAM_UPDATE_EVT);
         }
         // Fully done: current params are both latency-accepted AND timeout-adequate.
-        // Must check both — macOS periodic resets can push (timeout<200, latency>0)
-        // which keeps s_latency_accepted=1 but still needs re-request.
-        if(s_latency_accepted && s_conn_timeout >= 200)
+        // Must check both — macOS periodic resets can push (short timeout,
+        // latency>0) which keeps s_latency_accepted=1 but still needs re-request.
+        if(s_latency_accepted && s_conn_timeout >= PARAM_OK_CONN_TIMEOUT
+           && !s_post_override_retry_armed)
         {
             return (events ^ START_PARAM_UPDATE_EVT);
         }
@@ -1499,7 +1580,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         // resets can be recovered in one round trip — skip Phase 1.
         uint16_t req_latency;
         uint32_t retry_delay;
-        if(!s_post_discovery && s_conn_timeout < 200)
+        if(!s_post_discovery && s_conn_timeout < PARAM_OK_CONN_TIMEOUT)
         {
             req_latency = 0;
             retry_delay = PARAM_UPDATE_PHASE1_RETRY;
@@ -1521,6 +1602,18 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                                              DEFAULT_DESIRED_CONN_TIMEOUT,
                                              hidEmuTaskId);
 
+        if(s_post_override_retry_armed)
+        {
+            // This was a post-override attempt. Do not schedule the periodic
+            // retry on top of it — the only thing that may queue another one is
+            // hiddev.c observing a fresh override, and that path is bounded by
+            // POST_OVERRIDE_RETRY_MAX. Result shows up as the next
+            // "Params updated" line (or silence, if the central ignores us).
+            s_post_override_retry_armed = 0;
+            PRINT("Post-override retry %d/%d sent\n",
+                  s_post_override_retry_count, POST_OVERRIDE_RETRY_MAX);
+            return (events ^ START_PARAM_UPDATE_EVT);
+        }
         tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, retry_delay);
 
         return (events ^ START_PARAM_UPDATE_EVT);
@@ -3746,32 +3839,73 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 return (events ^ OTA_FLASH_ERASE_EVT);
             }
 
-            // ECC (~2s) needs supervision timeout >= 5s to avoid disconnect.
-            // Reject with 0xE1 if timeout too short — lets App diagnose param issues.
-            // s_conn_timeout is in units of 10ms, so 500 = 5000ms = 5s.
-            if(s_conn_timeout < 500)
+            // ECC (~1.8s) wants an adequate supervision timeout. If the current
+            // one is short, ask for a better one and retry shortly — do NOT
+            // reject outright. A hard 0xE1 here is what turned macOS 27's
+            // 2000ms into an unrecoverable "Secure Pair never works": the
+            // central had already stopped granting anything better, so every
+            // retry hit the same wall forever.
+            if(s_conn_timeout < LONG_OP_MIN_CONN_TIMEOUT)
             {
-                PRINT("Long op REJECTED: timeout=%dms (need >=5000ms)\n", s_conn_timeout * 10);
+                if(!s_long_op_param_requested)
+                {
+                    s_long_op_param_requested = 1;
+                    s_long_op_wait_start = TMOS_GetSystemClock();
+                    // Hold the lock for the whole wait so no other command
+                    // runs between polls. Every exit below either sets it
+                    // (proceed) or clears it (reject); GAP_LINK_TERMINATED
+                    // clears it too, so a disconnect mid-wait cannot strand it.
+                    s_long_op_busy = 1;
+                    tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                    PRINT("Long op: timeout=%dms too short, requesting update\n",
+                          s_conn_timeout * 10);
+                }
+
+                uint32_t waited_ms =
+                    (TMOS_GetSystemClock() - s_long_op_wait_start) * 625 / 1000;
+                if(waited_ms < LONG_OP_PARAM_WAIT_MS)
+                {
+                    // Still waiting for the central to answer — re-check soon.
+                    tmos_start_task(hidEmuTaskId, OTA_FLASH_ERASE_EVT,
+                                    LONG_OP_PARAM_POLL_TICKS);
+                    return (events ^ OTA_FLASH_ERASE_EVT);
+                }
+
+                // Waited long enough. The central is not going to improve the
+                // link. Proceed anyway as long as the timeout still clears the
+                // absolute floor — the uECC keepalive services the link every
+                // ~56ms, so even a few hundred ms of supervision timeout is
+                // ample (see hidkbd.h). Only a genuinely broken link is worth
+                // failing for.
                 s_long_op_param_requested = 0;
                 s_long_op_wait_start = 0;
-                uint8_t rspErr[1] = { 0xE1 };
-                ImmurokService_SendResponse(rspErr, 1);
-                s_pending_cmd = 0;
-                // FP-match dispatch (KEY_SIGN/KEY_GENERATE) sets s_long_op_busy=1
-                // before scheduling this event to lock out duplicate matches.
-                // If we early-return here, that flag stays stuck and every
-                // subsequent command gets rejected with 0xFD until disconnect.
-                // led_stop() too: gate flow leaves LED in green-flash/blue-solid
-                // state that would otherwise persist with no further trigger.
-                s_long_op_busy = 0;
+                if(s_conn_timeout < LONG_OP_FLOOR_CONN_TIMEOUT)
+                {
+                    PRINT("Long op REJECTED: timeout=%dms below floor %dms\n",
+                          s_conn_timeout * 10, LONG_OP_FLOOR_CONN_TIMEOUT * 10);
+                    uint8_t rspErr[1] = { 0xE1 };
+                    ImmurokService_SendResponse(rspErr, 1);
+                    s_pending_cmd = 0;
+                    // FP-match dispatch (KEY_SIGN/KEY_GENERATE) sets
+                    // s_long_op_busy=1 before scheduling this event to lock out
+                    // duplicate matches. If we early-return here, that flag
+                    // stays stuck and every subsequent command gets rejected
+                    // with 0xFD until disconnect. led_stop() too: gate flow
+                    // leaves LED in green-flash/blue-solid state that would
+                    // otherwise persist with no further trigger.
+                    s_long_op_busy = 0;
 #if HAS_RGB_LED
-                led_stop();
+                    led_stop();
 #endif
-                return (events ^ OTA_FLASH_ERASE_EVT);
+                    return (events ^ OTA_FLASH_ERASE_EVT);
+                }
+                PRINT("Long op: no better params after %dms, proceeding at %dms\n",
+                      (int)waited_ms, s_conn_timeout * 10);
             }
             s_long_op_param_requested = 0;
             s_long_op_wait_start = 0;
-            PRINT("Long op: param accepted, proceeding\n");
+            PRINT("Long op: proceeding, timeout=%dms latency_accepted=%d\n",
+                  s_conn_timeout * 10, s_latency_accepted);
 
             // Lock out concurrent commands during ECC (~2s)
             s_long_op_busy = 1;
@@ -3793,7 +3927,15 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             {
                 // ECDH key generation (~2s)
                 uint8_t rspBuf[34];
-                if(immurok_security_pair_make_key() == 0) {
+                // TEST BUILD instrumentation: how long does the blocking ECC
+                // actually take, and did the link survive it at this timeout?
+                uint32_t ecc_t0 = TMOS_GetSystemClock();
+                (void)ecc_t0;  // PRINT compiles out in RELEASE
+                int mk_ret = immurok_security_pair_make_key();
+                PRINT("ECDH make_key took %dms (conn alive=%d, timeout=%dms)\n",
+                      (int)((TMOS_GetSystemClock() - ecc_t0) * 625 / 1000),
+                      s_ble_connected, s_conn_timeout * 10);
+                if(mk_ret == 0) {
                     rspBuf[0] = IMMUROK_CMD_PAIR_INIT;
                     immurok_security_pair_get_pubkey(&rspBuf[1]);
                     ImmurokService_SendResponse(rspBuf, 34);
@@ -3814,7 +3956,13 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 // ECDH shared secret computation (~2s)
                 uint8_t rspBuf[2];
                 rspBuf[0] = IMMUROK_CMD_PAIR_CONFIRM;
-                if(immurok_security_pair_compute_secret() == 0) {
+                uint32_t ecc_t0 = TMOS_GetSystemClock();
+                (void)ecc_t0;  // PRINT compiles out in RELEASE
+                int cs_ret = immurok_security_pair_compute_secret();
+                PRINT("ECDH shared_secret took %dms (conn alive=%d, timeout=%dms)\n",
+                      (int)((TMOS_GetSystemClock() - ecc_t0) * 625 / 1000),
+                      s_ble_connected, s_conn_timeout * 10);
+                if(cs_ret == 0) {
                     rspBuf[1] = SEC_OK;
                     PRINT("ECDH PAIR_CONFIRM response sent (success)\n");
                 } else {
@@ -4241,6 +4389,8 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 // never fire. Without this, s_conn_timeout stays 0 and PAIR_INIT
                 // is rejected with 0xE1.
                 s_conn_timeout = event->connTimeout;
+                s_conn_interval = event->connInterval;
+                s_conn_latency = event->connLatency;
                 if(event->connLatency > 0)
                 {
                     s_latency_accepted = 1;
@@ -4288,6 +4438,10 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 s_latency_accepted = 0;
                 s_conn_timeout = 0;
                 s_post_discovery = 0;
+                s_post_override_retry_count = 0;
+                s_post_override_retry_armed = 0;
+                s_param_replay_done = 0;
+                tmos_stop_task(s_led_task_id, PARAM_NOTIFY_EVT);
                 extern volatile uint8_t g_sleep_inhibit;
                 g_sleep_inhibit = 0;  // Reset all sleep inhibit holds on disconnect
                 s_long_op_param_requested = 0;
@@ -4566,6 +4720,21 @@ static void HidEmu_ImmurokCccChangeCB(uint8_t enabled)
     if(!enabled && s_app_connected) {
         s_app_connected = 0;
         PRINT("App disconnected (CCCD notify disabled)\n");
+    }
+
+    // Enable is unreliable as an "app connected" signal (see above), but it IS
+    // exactly the moment notifications start getting through — so it is the
+    // right trigger for replaying the params the App missed. Deferred so we do
+    // not notify from inside the ATT write that enabled the CCC.
+    //
+    // Once per connection: this callback fires more than once per subscribe
+    // (GAPBondMgr restores the persisted CCCD on reconnect in addition to the
+    // App's own setNotifyValue), which produced three duplicate replays in
+    // testing. Anything the App needs after this point arrives through the
+    // normal change notification from hiddev.c.
+    if(enabled && !s_param_replay_done) {
+        s_param_replay_done = 1;
+        tmos_start_task(s_led_task_id, PARAM_NOTIFY_EVT, PARAM_NOTIFY_DELAY);
     }
 }
 
@@ -4936,8 +5105,10 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 break;
             }
 
-            // ECDH needs timeout >= 5s; request param update early
-            if(s_conn_timeout < 500) {
+            // ECDH needs an adequate supervision timeout; request one early.
+            // (On macOS 27 this request is granted and then overridden ~1.7s
+            // later by the central's own HID params — see LONG_OP_MIN_CONN_TIMEOUT.)
+            if(s_conn_timeout < LONG_OP_MIN_CONN_TIMEOUT) {
                 tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
             }
 

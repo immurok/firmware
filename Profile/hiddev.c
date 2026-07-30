@@ -847,30 +847,25 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
           connSlaveLatency,
           connTimeout, connTimeout * 10);
 
-    // Notify App of param change: [0xF0, interval_hi, interval_lo, latency, timeout_hi, timeout_lo]
-    {
-        uint8_t paramNotif[6];
-        paramNotif[0] = 0xF0;  // PARAM_UPDATE tag
-        paramNotif[1] = (uint8_t)(connInterval >> 8);
-        paramNotif[2] = (uint8_t)(connInterval & 0xFF);
-        paramNotif[3] = (uint8_t)connSlaveLatency;
-        paramNotif[4] = (uint8_t)(connTimeout >> 8);
-        paramNotif[5] = (uint8_t)(connTimeout & 0xFF);
-        ImmurokService_SendResponse(paramNotif, 6);
-    }
-
-    // Track current connection parameters for ECC safety check.
-    // ECC signing (~2s) requires supervision timeout >= 5s to avoid disconnect.
-    extern uint8_t s_latency_accepted;
-    extern uint16_t s_conn_timeout;  // current timeout in units of 10ms
-    extern uint8_t s_post_discovery; // sticky: set once Phase 2 accepted
+    // Track current connection parameters for the ECC gate in hidkbd.c.
+    // PARAM_OK_CONN_TIMEOUT (the point at which we stop asking for better) must
+    // stay >= LONG_OP_MIN_CONN_TIMEOUT (the point at which ECC will run), or
+    // the device deadlocks — see the threshold block in hidkbd.h.
+    // s_conn_* / s_latency_accepted / s_post_discovery / s_post_override_*
+    // are declared in hidkbd.h.
     extern uint8_t hidEmuTaskId;
     s_conn_timeout = connTimeout;
+    s_conn_interval = connInterval;
+    s_conn_latency = connSlaveLatency;
+
+    // Notify App of the change. Usually dropped this early (the daemon has not
+    // subscribed yet) — PARAM_NOTIFY_EVT replays the cached values once it does.
+    ImmurokNotify_ConnParams();
     if(connSlaveLatency > 0)
     {
         s_latency_accepted = 1;
         PRINT("Latency accepted (timeout=%dms)!\n", connTimeout * 10);
-        if(connTimeout >= 200)
+        if(connTimeout >= PARAM_OK_CONN_TIMEOUT)
         {
             s_post_discovery = 1;  // sticky until disconnect
         }
@@ -884,10 +879,33 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
     // latency can cause supervision timeout and disconnect.
     extern volatile uint8_t g_sleep_inhibit;
     extern uint8_t s_param_update_retries;
-    if(connTimeout >= 200) {
+    if(connTimeout >= PARAM_OK_CONN_TIMEOUT) {
         if(g_sleep_inhibit > 0) g_sleep_inhibit--;  // Release BLE-timeout hold
         if(connSlaveLatency > 0) {
-            // Phase 2 accepted — fully done.
+            // Phase 2 accepted — good enough, stop asking. We would prefer the
+            // 6s we request, but Apple is explicit that the central may
+            // override whenever it likes and that continuous renegotiation is
+            // harmful. macOS 27 settles on 2000ms for HID keyboards no matter
+            // what we (or the PPCP) ask for; that clears the ECC gate, so we
+            // take it rather than fight for a value we will not win.
+            // ...unless the central handed us a SHORTER interval than we asked
+            // for, which means it overrode us rather than honoured us. Asking
+            // again 30s later is accepted on macOS 27 (see hidkbd.h), so it is
+            // worth the round trip. Bounded by POST_OVERRIDE_RETRY_MAX so a
+            // central that insists on its own params cannot turn this into an
+            // endless tug of war.
+            if(connInterval < DEFAULT_DESIRED_MIN_CONN_INTERVAL &&
+               s_post_override_retry_count < POST_OVERRIDE_RETRY_MAX)
+            {
+                s_post_override_retry_count++;
+                s_post_override_retry_armed = 1;
+                PRINT("Override detected (interval=%d < %d), re-request %d/%d in 30s\n",
+                      connInterval, DEFAULT_DESIRED_MIN_CONN_INTERVAL,
+                      s_post_override_retry_count, POST_OVERRIDE_RETRY_MAX);
+                tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT,
+                                POST_OVERRIDE_RETRY_DELAY);
+                return;
+            }
             tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
         } else {
             // Phase 1 done (timeout extended, latency still 0). Schedule

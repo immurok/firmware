@@ -3,7 +3,7 @@
 
 #define FW_VERSION_MAJOR 1
 #define FW_VERSION_MINOR 6
-#define FW_VERSION_PATCH 2
+#define FW_VERSION_PATCH 3
 
 // OTA security version (SVN) for anti-rollback. Bump ONLY when shipping a
 // fix for a security issue — not on every release. The device persists a
@@ -18,6 +18,6 @@
 #endif
 
 // Version string: "1.2.2" (build number shown separately in logs)
-#define FW_VERSION_STRING "1.6.2"
+#define FW_VERSION_STRING "1.6.3"
 
 #endif
