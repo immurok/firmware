@@ -861,7 +861,9 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
     // Notify App of the change. Usually dropped this early (the daemon has not
     // subscribed yet) — PARAM_NOTIFY_EVT replays the cached values once it does.
     ImmurokNotify_ConnParams();
-    if(connSlaveLatency > 0)
+    // latency>=5 才算"够省电"(MIN_ACCEPTABLE_SLAVE_LATENCY,hidkbd.h)。被 central
+    // 压成 0..4 时不算接受,下方继续 schedule 协商把它谈回 DEFAULT_DESIRED(20)。
+    if(connSlaveLatency >= MIN_ACCEPTABLE_SLAVE_LATENCY)
     {
         s_latency_accepted = 1;
         PRINT("Latency accepted (timeout=%dms)!\n", connTimeout * 10);
@@ -881,8 +883,9 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
     extern uint8_t s_param_update_retries;
     if(connTimeout >= PARAM_OK_CONN_TIMEOUT) {
         if(g_sleep_inhibit > 0) g_sleep_inhibit--;  // Release BLE-timeout hold
-        if(connSlaveLatency > 0) {
-            // Phase 2 accepted — good enough, stop asking. We would prefer the
+        if(connSlaveLatency >= MIN_ACCEPTABLE_SLAVE_LATENCY) {
+            // Phase 2 accepted (latency>=5 = 够省电) — good enough, stop asking.
+            // latency=1..4 落到下方 else,继续 schedule 协商谈回 20。We would prefer the
             // 6s we request, but Apple is explicit that the central may
             // override whenever it likes and that continuous renegotiation is
             // harmful. macOS 27 settles on 2000ms for HID keyboards no matter

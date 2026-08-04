@@ -49,7 +49,23 @@ typedef enum {
 // ============================================================================
 
 int  immurok_security_init(void);
+
+/* 任一槽已配对即为 true —— 设备全局的「被认领过没有」，用于 BLE bond
+ * 模式和未配对命令白名单。回答「跟我说话的这台主机」请用下面那个。 */
 bool immurok_security_is_paired(void);
+
+/* 仅活动槽已配对时为 true —— 主机按槽的 BLE 地址连进来，活动槽就是对方
+ * 的槽，所以这才是 GET_STATUS / PAIR_STATUS 该报给 app 的那一位。 */
+bool immurok_security_active_slot_paired(void);
+
+/* ---- 双主机槽位 ----
+ * 对外 HMAC 接口签名不变；内部一律使用「活跃槽」的密钥。
+ * 槽 1 的密钥仍在 storage_v3_t 原地（block 0 一字节不改，已出货设备
+ * 零迁移），槽 2 在 DataFlash 0x6200。 */
+uint8_t immurok_security_active_slot(void);
+int     immurok_security_load_active_slot(void);   /* 开机调一次 */
+bool    immurok_security_slot_occupied(uint8_t slot);
+int     immurok_security_slot_clear(uint8_t slot);
 
 // ECDH pairing state machine (called from GATT handler + TMOS event)
 int  immurok_security_pair_init(void);           // Start key generation (returns 0, actual compute in TMOS)
@@ -64,6 +80,18 @@ int  immurok_security_pair_compute_secret(void); // Called from TMOS event — b
 // PAIR_CONFIRM response, then schedules a separate TMOS event later to
 // call immurok_security_pair_save() once the call stack has unwound.
 extern volatile uint8_t immurok_security_pair_save_pending;
+
+/* 下一次 pair_save() 把密钥写进哪个槽。默认 IMMUROK_SLOT_1。
+ * 槽 2 登记前由 hidkbd 设置；save 完自动复位为槽 1。
+ * 必须在 PAIR_CONFIRM 之前设置 —— pair_compute_secret() 会把结果写进
+ * s_data.shared_key（仅内存），pair_save() 再按目标槽决定落到哪里。 */
+void immurok_security_pair_set_target_slot(uint8_t slot);
+
+/* 槽 2 落盘：把内存里刚算出的 ECDH 密钥写进 0x6200，再从 flash 重载
+ * 复原槽 1 的内存副本。由 pair_save() 在 target 为槽 2 时调用。
+ * （曾是「两段式提交」的后半段，配合临时 PIN 的 proof；2026-08-03 登记
+ * 改为指纹 + 按键后，授权在 PAIR_INIT 就完成，不再有扣住的中间态。） */
+int  immurok_security_slot2_commit(void);
 int  immurok_security_pair_save(void);
 
 immurok_ecdh_state_t immurok_security_get_ecdh_state(void);

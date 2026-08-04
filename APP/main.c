@@ -18,6 +18,8 @@
 #include "hidkbd.h"
 #include "version.h"
 #include "fingerprint.h"
+#include "immurok_ble_init.h"
+#include "immurok_slots.h"
 #include "hardware_pins.h"
 #include "ws2812.h"
 
@@ -243,9 +245,10 @@ int main(void)
 
 #if HAS_RGB_LED
     LED_RGB_Init();
-    LED_RED_On();
-    DelayMs(200);   // Red flash once = system startup
-    LED_RED_Off();
+    LED_BLUE_On();
+    DelayMs(200);   // Blue flash once = system startup（原为红，红留给错误态，
+                    // 避免切槽重启时的开机红闪被误当成故障）
+    LED_BLUE_Off();
 #endif
 
     // Initialize fingerprint module
@@ -279,7 +282,13 @@ int main(void)
     // fp_power_on() toggles to Floating for R599S during active sensor use.
     TOUCH_SetMode(GPIO_ModeIN_PD);
     PRINT("%s [fw:" FW_VERSION_STRING ".%04X build:%s %s]\n", VER_LIB, FW_BUILD_NUMBER, __DATE__, __TIME__);
-    CH59x_BLEInit();
+    // 双主机：每个槽用不同的 BLE 地址，两台主机各自维护独立 bond。
+    // 空白标记页 = 槽 1 = 出厂 MAC，与出货固件行为一致。
+    {
+        uint8_t slot_mac[6];
+        immurok_ble_slot_mac(immurok_slots_active(), slot_mac);
+        immurok_BLEInit(slot_mac);
+    }
     HAL_Init();
     GAPRole_PeripheralInit();
     HidDev_Init();

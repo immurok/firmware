@@ -23,7 +23,10 @@
 #include "immurokservice.h"
 #include "fingerprint.h"
 #include "immurok_security.h"
+#include "immurok_slots.h"
+#include "immurok_scratch.h"
 #include "immurok_keystore.h"
+#include "slot_meta.h"
 #include "otaprofile.h"
 #include "ota.h"
 #include "../LIB/uECC.h"
@@ -322,7 +325,16 @@ static uint16_t fp_user_bitmap(void)
 // FACTORY_RESET we reboot, so init re-applies the (now-unpaired) state.
 static void apply_ble_pairing_mode(void)
 {
-    uint8_t mode = immurok_security_is_paired()
+    /* 按**活动槽**决定，不是按整机。
+     *
+     * 已配对的槽拒绝新 bond（防盗贼把设备另配到自己机器上）；空槽放行，
+     * 因为第二台主机必须先能 bond 才谈得上后面的 ECDH。要让设备停在空槽
+     * 本身就得按切换指纹，那已经是一道生物特征门，真正的授权在 PAIR_INIT
+     * 的指纹 + 按键两道门上。
+     *
+     * 曾经这里是「整机已配对 && PIN 窗口没开 → NO_PAIRING」。PIN 链路
+     * 2026-08-03 移除后改成现在这样。 */
+    uint8_t mode = immurok_security_active_slot_paired()
         ? GAPBOND_PAIRING_MODE_NO_PAIRING
         : GAPBOND_PAIRING_MODE_WAIT_FOR_REQ;
     GAPBondMgr_SetParameter(GAPBOND_PERI_PAIRING_MODE, sizeof(uint8_t), &mode);
@@ -629,6 +641,16 @@ static void led_blink_start(uint8_t c)
 {
     if(s_led_blink && s_led_color == c) return;
     led_blink_start_ex(c, LED_BLINK_TICKS, LED_BLINK_TICKS);
+}
+
+/* 广播期的 LED 颜色按当前槽位取：槽 1 蓝、槽 2 白。
+ *
+ * 设备没有显示屏，主机也未必连着（空槽时根本没有主机），这是用户判断
+ * 「现在在哪个槽」的唯一手段 —— 尤其在切到未配对的槽 2 之后，除了灯
+ * 没有任何其它反馈。 */
+static uint8_t adv_led_color(void)
+{
+    return (immurok_security_active_slot() == IMMUROK_SLOT_2) ? 'W' : 'B';
 }
 
 // Kick the async PS_Sleep + VCC-cut state machine. Use instead of fp_power_off
@@ -1004,7 +1026,7 @@ static void adv_restart_fast_cycle(void)
     GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &adv_enable);
     tmos_start_task(hidEmuTaskId, SLOW_ADV_EVT, SLOW_ADV_DELAY);
 #if HAS_RGB_LED
-    led_blink_start('B');
+    led_blink_start(adv_led_color());
 #endif
 }
 
@@ -1038,18 +1060,8 @@ static void OTA_IAP_SendStatus(uint8_t status);
 static uint8_t scanRspData[] = {
     0x0D,                           // length of this data (12 + 1)
     GAP_ADTYPE_LOCAL_NAME_COMPLETE, // AD Type = Complete local name
-    'i',
-    'm',
-    'm',
-    'u',
-    'r',
-    'o',
-    'k',
-    ' ',
-    'I',
-    'K',
-    '-',
-    '1',  // connection interval range
+    'i', 'm', 'm', 'u', 'r', 'o', 'k', ' ', 'I', 'K', '-', '1',
+    // connection interval range
     0x05, // length of this data
     GAP_ADTYPE_SLAVE_CONN_INTERVAL_RANGE,
     LO_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL), // 100ms
@@ -1140,6 +1152,7 @@ uint8_t s_post_override_retry_armed = 0;
 // Long op param wait state (reset on disconnect)
 static uint8_t s_long_op_param_requested = 0;
 static uint32_t s_long_op_wait_start = 0;
+static uint8_t s_long_op_req_count = 0;  // 本轮长 ECC 门已发的 param 请求数(限 ban)
 // s_long_op_busy / s_keygen_commit_pending / s_keygen_new_idx are defined
 // near the LED task so its KEYSTORE_COMMIT_EVT handler can see them.
 
@@ -1328,12 +1341,19 @@ void HidEmu_Init()
     PRINT("GPIO interrupts enabled\n");
 
 #if HAS_RGB_LED
+    // 只注册任务，先不起闪 —— adv_led_color() 要读活跃槽，而它由
+    // immurok_security_init() 里的 load_active_slot() 填充。在此之前
+    // s_active_slot 还是静态初值 SLOT_1，起闪会永远是蓝色。
     s_led_task_id = TMOS_ProcessEventRegister(LED_ProcessEvent);
-    led_blink_start('B');  // Blue blink = advertising
 #endif
 
     // Initialize security module
     immurok_security_init();
+
+#if HAS_RGB_LED
+    // 活跃槽已就绪，现在颜色才是对的：槽 1 蓝闪 / 槽 2 白闪
+    led_blink_start(adv_led_color());
+#endif
 
     // Initialize keystore module
     immurok_keystore_init();
@@ -1641,7 +1661,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             uint8_t adv_enable = TRUE;
             GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &adv_enable);
 #if HAS_RGB_LED
-            led_blink_start_ex('B', LED_ADV_SLOW_ON, LED_ADV_SLOW_OFF);
+            led_blink_start_ex(adv_led_color(), LED_ADV_SLOW_ON, LED_ADV_SLOW_OFF);
 #endif
             // Schedule next sub-tick (60s) to count toward 60min
             tmos_start_task(hidEmuTaskId, SLOW_ADV_EVT, SLOW_TICK_DELAY);
@@ -1863,7 +1883,13 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 // Wait for finger to be lifted before allowing new search
                 tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 48);  // poll 30ms
             }
-            else if(!s_ble_connected) {
+            // 双主机例外（同下面 !s_app_connected 那道门，两道必须一起放行）：
+            // 停在空槽时根本没有任何 BLE 连接 —— 没人 bond 过那个地址 ——
+            // 于是触摸在这里就被丢掉，走不到下面那道门。切换指纹是纯本地
+            // 动作，不需要任何连接。1.6.6 只改了下面一道，结果设备照样
+            // 卡死在空槽；2026-08-03 真机复现。
+            else if(!s_ble_connected
+                    && !(g_cached_fp_bitmap & (1u << FP_SWITCH_SLOT))) {
                 PRINT("Touch ignored: BLE not connected\n");
                 s_wait_finger_lift = 1;
 #if HAS_RGB_LED
@@ -1895,7 +1921,21 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 160);
                 }
             }
-            else if(!s_app_connected && s_pending_cmd == 0 && !immurok_security_has_pending_auth()) {
+            // 双主机例外：登记了切换指纹时，即使没有 app 连着也要照常扫描。
+            //
+            // 切换指纹是**纯本地动作**，不需要投递给任何主机。而原来这道门
+            // 会把触摸在扫描之前就丢掉，导致：
+            //   1. 停在空槽（如登记前的槽 2）时无法切回来 —— 设备卡死，
+            //      因为切换指纹本该是唯一的逃生口
+            //   2. 更常见的：要离开的那台主机睡眠/关机时切不走 —— 多主机
+            //      切换在最典型的场景下失效
+            // 2026-08-03 真机踩到。
+            //
+            // 代价是没有 app 连着时每次触摸多一次传感器扫描。只在**已登记
+            // 切换指纹**时才放行，没登记的设备行为一字不变。
+            else if(!s_app_connected && s_pending_cmd == 0
+                    && !immurok_security_has_pending_auth()
+                    && !(g_cached_fp_bitmap & (1u << FP_SWITCH_SLOT))) {
                 // BLE connected but daemon/app has not subscribed to GATT
                 // notifications — FP result cannot be delivered.
                 PRINT("Touch ignored: app not connected\n");
@@ -2703,17 +2743,20 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     led_stop();
 #endif
                     if(!s_enroll_active) {
-                        fp_power_off();
+                        bool slept = fp_power_off();
 #if HAS_R599S
-                        // R599S can latch DETECT HIGH if PS_Sleep raced with
-                        // the just-completed GET_IMAGE — sensor's MCU state
-                        // corrupts on VCC cut and next touch IRQ never fires.
-                        // If DETECT is still high after the power-off path
-                        // returned, the chip is stuck; trigger the touch-reset
-                        // sequence (power on → 0x55 → PS_Sleep → off) used by
-                        // the button-recovery path.
-                        if(TOUCH_ReadPin()) {
-                            PRINT("DETECT latched post lift, touch-reset\n");
+                        // 两种 race 都会让下次 touch-wake 失效,都要跑 touch-reset
+                        // 恢复(power on → 0x55 → PS_Sleep → off,即按钮恢复那套):
+                        // (1) DETECT latch HIGH：PS_Sleep 撞上刚完成的 GET_IMAGE,
+                        //     VCC 一切芯片 MCU 状态损坏,touch IRQ 不再触发。
+                        // (2) sleep no-ack(!slept)：CMD_SLEEP 没被确认,R599S 没进
+                        //     wake-on-touch standby;2-step pair 期间 BLE 高负载会把
+                        //     sleep 的 ack 窗口挤掉(TMOS_SystemProcess 阻塞几百 ms),
+                        //     是高发场景。此时 TOUCH 已被 IN_PD 拉低,只看
+                        //     TOUCH_ReadPin() 会漏判,必须靠 !slept 兜住。
+                        if(TOUCH_ReadPin() || !slept) {
+                            PRINT("post-lift touch recovery (DETECT=%d slept=%d)\n",
+                                  TOUCH_ReadPin(), slept);
                             s_touch_reset = 1;
                             fp_power_on();
                             s_fp_power_on_tick = RTC_GetCycle32k();
@@ -2776,6 +2819,56 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
                 // Convert physical slot to user finger ID
                 uint16_t page_id = FP_FINGER_ID(raw_page_id);
+
+                // 双主机：专用切换指纹只切主机，绝不落入下面任何一条认证
+                // 路径。放在这里（LED / 优先级分发之前）就是为了让它无法
+                // 被当成认证使用。
+                if(page_id == FP_SWITCH_SLOT) {
+                    uint8_t target = (immurok_security_active_slot() == IMMUROK_SLOT_1)
+                                   ? IMMUROK_SLOT_2 : IMMUROK_SLOT_1;
+
+                    // spec §9：ECDH / proof 交易进行中拒绝切换，避免状态机
+                    // 竞态。登记窗口本身不拦 —— 流程正需要在窗口内切过去。
+                    // （登记只剩 ECDH 一个异步阶段，这一条就覆盖了整个交易期。）
+                    if(immurok_security_get_ecdh_state() != ECDH_STATE_IDLE) {
+                        PRINT("Switch finger ignored: pairing in progress\n");
+#if HAS_RGB_LED
+                        led_solid('R', LED_FLASH_TICKS);
+#endif
+                        fp_reset_power_timer();
+                        break;
+                    }
+                    // 目标槽是否已配对**不做检查**：切换是无条件的循环，
+                    // 跟多主机蓝牙键盘的通道切换一样。切到空槽只是广播一个
+                    // 没有主机 bond 过的地址（看起来没反应），再按一下就
+                    // 切回来了 —— 切换指纹本身就是逃生口。
+                    // 这也正是新增主机所必需的：登记时槽 2 尚未配对，
+                    // 设备必须能以槽 2 的地址广播，主机 2 才发现得了它。
+                    PRINT("Switch finger: slot %d -> %d (occupied=%d), resetting\n",
+                          immurok_security_active_slot(), target,
+                          immurok_security_slot_occupied(target));
+                    // spec §7.3：设备无显示屏，LED 是用户判断当前主机的唯一
+                    // 即时反馈。与广播期配色保持一致：槽 1 蓝、槽 2 白 ——
+                    // 切换瞬间闪的颜色，就是接下来广播时会一直闪的颜色。
+#if HAS_RGB_LED
+                    led_solid((target == IMMUROK_SLOT_1) ? 'B' : 'W', LED_FLASH_TICKS);
+                    DelayMs(200);
+                    led_stop();
+#endif
+                    immurok_slots_set_active(target);
+                    DelayMs(50);
+                    SYS_ResetExecute();   // BLE 地址在 init 时消费，须重启
+                }
+
+                // 走到这里说明不是切换指纹。若没有 app 接收结果，就按原来的
+                // 省电意图早退 —— 上面放宽 TOUCH 门只是为了让切换指纹能用，
+                // 普通认证指纹在无 app 时照旧不该浪费后续流程。
+                if(!s_app_connected && s_pending_cmd == 0
+                   && !immurok_security_has_pending_auth()) {
+                    PRINT("FP match ignored: not switch finger, app not connected\n");
+                    fp_reset_power_timer();
+                    break;
+                }
 #if HAS_RGB_LED
                 // Gate / pending-auth: brief green flash bridges from the
                 // pre-match green-blink state to the upcoming blue "computing"
@@ -2939,18 +3032,73 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                         }
                         break;
                     }
+                    case IMMUROK_CMD_SLOT_CLEAR:
+                    {
+                        /* 清另一个槽的指纹门过了。不重启 —— 本槽的密钥完好，
+                         * 连接照旧，重启反而把用户踢下线。
+                         *
+                         * 解绑另一台:用登记时记下的对端地址精确回收其 SNV
+                         * bond。spec §6.3:不回收会让 SNV 满时 ERASE_AUTO
+                         * 全擦、误伤在用主机。地址缺失(从未在本机连接过、
+                         * 或迁移自旧固件)按 spec §7.3 降级为跳过 SNV 回收，
+                         * 只记日志，不阻断本次解绑。 */
+                        uint8_t target = s_pending_payload[0];
+                        {
+                            uint8_t ptype, paddr[6];
+                            if(slot_meta_get_peer(target, &ptype, paddr) == 0) {
+                                uint8_t eb[7];
+                                eb[0] = ptype;
+                                tmos_memcpy(&eb[1], paddr, 6);
+                                uint8_t bcBefore = 0, bcAfter = 0;
+                                GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bcBefore);
+                                GAPBondMgr_SetParameter(GAPBOND_ERASE_SINGLEBOND, sizeof(eb), eb);
+                                GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bcAfter);
+                                PRINT("SLOT_CLEAR other: SNV reclaim bond_count %d->%d\n", bcBefore, bcAfter);
+                                if(bcAfter >= bcBefore) {
+                                    PRINT("SLOT_CLEAR other: WARNING SNV reclaim may have failed "
+                                          "(peer addr may be RPA, not identity addr)\n");
+                                }
+                            } else {
+                                PRINT("SLOT_CLEAR other: no stored peer for slot %d, skip SNV reclaim\n",
+                                      target);   /* 迁移降级,spec §7.3 */
+                            }
+                        }
+                        int ret = immurok_security_slot_clear(target);
+                        PRINT("SLOT_CLEAR slot=%d (other) ret=%d\n", target, ret);
+                        /* bump gen 仅在 slot_clear 确认成功后才做，否则会停在
+                         * 「新地址 + 旧密钥仍有效」的死状态(spec §7.1 同一顺序
+                         * 约束，参照 own 分支 ~5437 行的既有写法)。 */
+                        if(ret == 0) {
+                            slot_meta_bump_gen(target);
+                        }
+                        /* 指纹门的结果一律是**1 字节状态**，不带命令码 ——
+                         * app 的门结果分发直接读 data[0] 判成败。发 2 字节
+                         * 会被读成 0x3C（命令码）从而永远判失败。 */
+                        rspBuf[0] = (ret == 0) ? IMMUROK_RSP_OK
+                                               : IMMUROK_RSP_INVALID_PARAM;
+                        ImmurokService_SendResponse(rspBuf, 1);
+                        break;
+                    }
                     case IMMUROK_CMD_PAIR_INIT:
                     {
-                        if(immurok_security_pair_init() == 0) {
-                            // Delay matches LED_FLASH_TICKS so green-flash
-                            // completes before EXEC starts the blue blink.
-                            tmos_start_task(hidEmuTaskId, FP_GATE_EXEC_EVT, 320);
-                            // Response sent from TMOS event handler
-                        } else {
-                            rspBuf[0] = IMMUROK_CMD_PAIR_INIT;
-                            rspBuf[1] = SEC_ERR_INTERNAL;
-                            ImmurokService_SendResponse(rspBuf, 2);
+                        /* 登记第二台主机的第一重（指纹）过了 —— 接着挂第二重
+                         * 按键门，和首次配对走同一条路：短按由 BUTTON_SCAN_EVT
+                         * 消费，在那里才真正启动 ECDH。 */
+                        PRINT("Slot enroll: FP ok, waiting for button\n");
+                        s_pair_wait_button = 1;
+                        /* 告诉 app「第一步过了，现在等按键」。没有这条通知，
+                         * app 只能靠猜来点亮引导框里的第一步 —— 猜出来的
+                         * 勾是假的。旧 app 收到未知状态码走 default 忽略。 */
+                        {
+                            uint8_t ntf[2] = { IMMUROK_NTF_PAIR_BUTTON, 0x03 };
+                            ImmurokService_SendResponse(ntf, 2);
                         }
+#if HAS_RGB_LED
+                        led_blink_start_ex('W', 320, 320);
+                        tmos_stop_task(s_led_task_id, PAIR_BTN_TIMEOUT_EVT);
+                        tmos_start_task(s_led_task_id, PAIR_BTN_TIMEOUT_EVT,
+                                        PAIR_BTN_TIMEOUT_TICKS);
+#endif
                         break;
                     }
                     default:
@@ -3839,6 +3987,106 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 return (events ^ OTA_FLASH_ERASE_EVT);
             }
 
+            // ── 长 ECC 操作(~2s)前确保 supervision timeout 够长 ────────────
+            // 覆盖三种阻塞 ~2s 的 ECC:KEY_SIGN(ECDSA 签名)、配对的 MAKE_KEY 与
+            // SHARED_SECRET。macOS 27 重连/刚开机的 override 窗口强制
+            // latency=22/timeout=2000ms,比 2s 计算短 → 阻塞期 LL 不发包 →
+            // supervision 超时断链(Reason:8)。签名现象:提示按指纹→signing→跳密码
+            // 框(结果丢在断链上);配对现象:make_key「勉强活下来随即断」(hidkbd.h
+            // 118-122 实机记录)。修复:计算前主动申请 latency=20/timeout=6000ms,
+            // 等 macOS grant(实测~1s)再算。latency=20 本身省电,全程低功耗、无需
+            // 事后恢复。等不到(5s)按操作类型回错误:KEY_SIGN 回 0xE1(app fallback
+            // 密码);配对回 [PAIR_INIT/PAIR_CONFIRM, SEC_ERR_INTERNAL](app 显示配对
+            // 失败,可重试)——不能裸回 0xE1,那会在 button-wait 阶段被 app 丢弃
+            // (1.6.3 坑)。详见 hidkbd.h 的 KEY_SIGN_PARAM_WAIT_MS 注释。
+            immurok_ecdh_state_t long_ecc_st = immurok_security_get_ecdh_state();
+            uint8_t is_long_ecc =
+                (s_pending_cmd == IMMUROK_CMD_KEY_SIGN)
+                || (long_ecc_st == ECDH_STATE_MAKE_KEY)
+                || (long_ecc_st == ECDH_STATE_SHARED_SECRET);
+            if(is_long_ecc
+               && s_conn_timeout < PARAM_OK_CONN_TIMEOUT + 100 /*< 3000ms*/)
+            {
+                if(!s_long_op_param_requested)
+                {
+                    s_long_op_param_requested = 1;
+                    s_long_op_wait_start = TMOS_GetSystemClock();
+                    s_long_op_req_count = 1;  // 首发(计入 LONG_OP_MAX_PARAM_REQ)
+                    // 锁住整个等待期,避免其它命令挤进来。下面每个出口要么设
+                    // (proceed)要么清(reject)它;GAP_LINK_TERMINATED 也会清,断链
+                    // 不会把它卡住。
+                    s_long_op_busy = 1;
+                    GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
+                        DEFAULT_DESIRED_MIN_CONN_INTERVAL,
+                        DEFAULT_DESIRED_MAX_CONN_INTERVAL,
+                        DEFAULT_DESIRED_SLAVE_LATENCY,
+                        DEFAULT_DESIRED_CONN_TIMEOUT, hidEmuTaskId);
+                    PRINT("LONG_ECC: timeout=%dms too short, req latency=20 timeout=6000ms\n",
+                          s_conn_timeout * 10);
+                }
+
+                if(s_conn_timeout >= PARAM_OK_CONN_TIMEOUT + 100)
+                {
+                    // macOS 已把 timeout 提上来 —— 落到下方原门(会跳过)后计算。
+                    PRINT("LONG_ECC: timeout now %dms, proceeding\n",
+                          s_conn_timeout * 10);
+                    s_long_op_param_requested = 0;
+                    s_long_op_wait_start = 0;
+                }
+                else
+                {
+                    uint32_t waited =
+                        (TMOS_GetSystemClock() - s_long_op_wait_start) * 625 / 1000;
+                    if(waited < KEY_SIGN_PARAM_WAIT_MS)
+                    {
+                        // 重发(防首包被丢),但总请求数受 LONG_OP_MAX_PARAM_REQ
+                        // 限制,超过后只 poll 不再发 —— 短时反复请求会被 central ban
+                        // (Apple 明确"不应持续重协商")。实测 ~1s grant,首发+2 重发够。
+                        if(s_long_op_req_count < LONG_OP_MAX_PARAM_REQ)
+                        {
+                            GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
+                                DEFAULT_DESIRED_MIN_CONN_INTERVAL,
+                                DEFAULT_DESIRED_MAX_CONN_INTERVAL,
+                                DEFAULT_DESIRED_SLAVE_LATENCY,
+                                DEFAULT_DESIRED_CONN_TIMEOUT, hidEmuTaskId);
+                            s_long_op_req_count++;
+                        }
+                        tmos_start_task(hidEmuTaskId, OTA_FLASH_ERASE_EVT,
+                                        LONG_OP_PARAM_POLL_TICKS);
+                        return (events ^ OTA_FLASH_ERASE_EVT);
+                    }
+                    // 等够 5s 仍没拿到长 timeout —— 不冒险计算(必断链),按操作类型
+                    // 回错误。清锁与 LED,同下方原门 REJECT 分支。
+                    PRINT("LONG_ECC REJECTED: no adequate timeout after %dms (cur=%dms)\n",
+                          (int)waited, s_conn_timeout * 10);
+                    s_long_op_param_requested = 0;
+                    s_long_op_wait_start = 0;
+                    if(s_pending_cmd == IMMUROK_CMD_KEY_SIGN)
+                    {
+                        // 签名:回 0xE1 → app fallback 到密码。
+                        uint8_t rspErr[1] = { 0xE1 };
+                        ImmurokService_SendResponse(rspErr, 1);
+                        s_pending_cmd = 0;
+                    }
+                    else
+                    {
+                        // 配对:回 app 认得的错误格式(同 make_key/compute 内部失败),
+                        // app 显示配对失败可重试。裸 0xE1 会在 button-wait 阶段被丢。
+                        uint8_t rspErr[2];
+                        rspErr[0] = (long_ecc_st == ECDH_STATE_SHARED_SECRET)
+                                    ? IMMUROK_CMD_PAIR_CONFIRM
+                                    : IMMUROK_CMD_PAIR_INIT;
+                        rspErr[1] = SEC_ERR_INTERNAL;
+                        ImmurokService_SendResponse(rspErr, 2);
+                    }
+                    s_long_op_busy = 0;
+#if HAS_RGB_LED
+                    led_stop();
+#endif
+                    return (events ^ OTA_FLASH_ERASE_EVT);
+                }
+            }
+
             // ECC (~1.8s) wants an adequate supervision timeout. If the current
             // one is short, ask for a better one and retry shortly — do NOT
             // reject outright. A hard 0xE1 here is what turned macOS 27's
@@ -4352,7 +4600,7 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 // only set default blink if no phase-specific pattern is active
                 if(s_adv_phase <= ADV_PHASE_FAST && !s_led_blink)
                 {
-                    led_blink_start('B');
+                    led_blink_start(adv_led_color());
                 }
 #endif
             }
@@ -4366,6 +4614,24 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 // get connection handle
                 hidEmuConnHandle = event->connectionHandle;
                 ImmurokService_SetConnHandle(event->connectionHandle);
+                // Record this connection's peer address against the active
+                // slot (flash-backed, "only write on change" — see
+                // slot_meta.h). This SDK's CH59xBLE_LIB.h only exposes
+                // linkDB_Register/State/PerformFunc/Up — there is no
+                // linkDB_Find(connHandle) to look the peer address up on
+                // demand later — so it must be captured here, at the one
+                // point the stack hands it to us (gapEstLinkReqEvent_t),
+                // and persisted rather than cached in RAM: RAM is at 0
+                // slack in this build (.bss butts directly against
+                // .stack_guard/.stack, see keng.md), so a new static byte
+                // buffer here doesn't link. SLOT_CLEAR's "own" branch reads
+                // it back via slot_meta_get_peer() for ERASE_SINGLEBOND.
+                // NOTE: runs BEFORE pairing/auth; unauthenticated peer with
+                // rotating addresses can force 0x6300 page writes, but only
+                // that page (never SSH keys), and dedup prevents writes on
+                // unchanged address (spec §5.3).
+                slot_meta_set_peer(immurok_security_active_slot(),
+                                    event->devAddrType, event->devAddr);
                 tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, START_PARAM_UPDATE_EVT_DELAY);
                 // Cancel advertising cycle timer, mark as connected (not advertising)
                 tmos_stop_task(hidEmuTaskId, SLOW_ADV_EVT);
@@ -4391,7 +4657,9 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 s_conn_timeout = event->connTimeout;
                 s_conn_interval = event->connInterval;
                 s_conn_latency = event->connLatency;
-                if(event->connLatency > 0)
+                // latency>=5 才算"够省电"(见 MIN_ACCEPTABLE_SLAVE_LATENCY);低于此
+                // 不标记 accepted,让 param 协商在后台继续把它谈回 20。
+                if(event->connLatency >= MIN_ACCEPTABLE_SLAVE_LATENCY)
                 {
                     s_latency_accepted = 1;
                 }
@@ -4427,7 +4695,7 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 s_touch_reset = 0;
                 PRINT("Disconnected.. Reason:%x\n", pEvent->linkTerminate.reason);
 #if HAS_RGB_LED
-                led_blink_start('B');
+                led_blink_start(adv_led_color());
 #endif
                 // Clear ALL session state for clean reconnect
                 s_pending_cmd = 0;
@@ -4775,16 +5043,26 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
     // write keystore entries, or trigger AUTH_REQUEST / FACTORY_RESET on a
     // device that hasn't been claimed by its legitimate owner yet — leaving
     // persistent state behind that survives the eventual real PAIR_INIT.
-    if(!immurok_security_is_paired()) {
+    //
+    // 判据必须是**活动槽**已配对，不是「任一槽」。设备停在空槽时
+    // apply_ble_pairing_mode() 会 WAIT_FOR_REQ 放行新 bond（登记第二台主机
+    // 所必需），此时若这里用 is_paired()（任一槽），只要另一个槽有货整个
+    // 白名单就被跳过 —— 一个从未配对过的对端 bond 上来后能读 KEY_READ /
+    // KEY_COUNT / FP_LIST，甚至触发无指纹门的 SLOT_CLEAR。改用活动槽后，
+    // 空槽驻留期只放行下面这几条登记握手命令，一条不多。
+    // （曾因 SLOT_PAIR(0x3B) 不在白名单里而不能这么收；那条命令随 PIN 方案
+    //  一起删了，白名单现有的 6 条恰好就是第二台主机登记所需的全部。）
+    if(!immurok_security_active_slot_paired()) {
         switch(cmd) {
         case IMMUROK_CMD_GET_STATUS:    // App probes "am I paired?"
         case IMMUROK_CMD_GET_BATT_RAW:  // read-only batt calibration data
         case IMMUROK_CMD_PAIR_INIT:     // start ECDH
         case IMMUROK_CMD_PAIR_CONFIRM:  // exchange App pubkey
         case IMMUROK_CMD_PAIR_STATUS:   // read pairing flag
+        case IMMUROK_CMD_SLOT_STATUS:   // 新主机据此得知自己是第几台
             break;  // allowed pre-pair
         default:
-            PRINT("  Rejected (not paired): cmd=0x%02X\n", cmd);
+            PRINT("  Rejected (slot unpaired): cmd=0x%02X\n", cmd);
             rspBuf[0] = cmd;
             rspBuf[1] = SEC_ERR_NOT_PAIRED;
             rspLen = 2;
@@ -4813,6 +5091,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
         case IMMUROK_CMD_ENROLL_CANCEL:
         case IMMUROK_CMD_FP_MATCH_ACK:
         case IMMUROK_CMD_PAIR_STATUS:
+        case IMMUROK_CMD_SLOT_STATUS:     // read-only slot bitmap
         case IMMUROK_CMD_PAIR_INIT:       // re-pair (will hit needs_reset gate inside)
         case IMMUROK_CMD_PAIR_CONFIRM:
         case IMMUROK_CMD_FACTORY_RESET:   // recovery escape hatch
@@ -4888,7 +5167,8 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             // (fp_wake blocks ~300ms which overflows the 512B stack in sleep mode)
             rspBuf[0] = IMMUROK_RSP_OK;
             rspBuf[1] = (uint8_t)fp_user_bitmap();  // 5 slots fit in 1 byte
-            rspBuf[2] = immurok_security_is_paired() ? 1 : 0;
+            // 活动槽，不是「任一槽」：连进来的主机问的是「我配对了没有」。
+            rspBuf[2] = immurok_security_active_slot_paired() ? 1 : 0;
             // Read battery from the cache populated by the 5-min periodic
             // measurement (BATT_PERIODIC_EVT in hiddev.c). Inline
             // Batt_MeasLevel() blocks ~250-500ms in vbat_settle_delay (5τ
@@ -5096,7 +5376,17 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             // to reach this case with non-empty keystore is post-pair user
             // action — re-pair from that state still requires factory_reset
             // because the FP bitmap check below covers the common case.)
-            if(fp_user_bitmap() != 0) {
+            /* 双主机例外：PIN 登记窗口开着、且槽 2 还空，说明物主已在
+             * 主机 1 上授权新增一台主机。此时设备显然没换主人，原注释
+             * 担心的「孤儿指纹模板」不成立，放行 ECDH 并把落盘目标指向
+             * 槽 2。其余情况维持原样：有指纹就必须先 factory reset。 */
+            /* 「本槽是空的，但设备已经被别的槽认领过」== 正在登记第二台主机。
+             * 判据不再依赖 PIN 窗口 —— 2026-08-03 起登记改为指纹 + 按键，
+             * PIN 整条链路已移除。要走到空槽本身就得按切换指纹，那已经是
+             * 一道生物特征门；这里再加指纹 + 按键两道物理在场门。 */
+            uint8_t slot2_enroll = !immurok_security_active_slot_paired() &&
+                                   immurok_security_is_paired();
+            if(fp_user_bitmap() != 0 && !slot2_enroll) {
                 PRINT("  PAIR_INIT rejected: FP bitmap=0x%02X (need factory reset)\n",
                       fp_user_bitmap());
                 rspBuf[0] = IMMUROK_CMD_PAIR_INIT;
@@ -5104,12 +5394,38 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                 rspLen = 2;
                 break;
             }
+            immurok_security_pair_set_target_slot(
+                slot2_enroll ? immurok_security_active_slot() : IMMUROK_SLOT_1);
 
             // ECDH needs an adequate supervision timeout; request one early.
             // (On macOS 27 this request is granted and then overridden ~1.7s
             // later by the central's own HID params — see LONG_OP_MIN_CONN_TIMEOUT.)
-            if(s_conn_timeout < LONG_OP_MIN_CONN_TIMEOUT) {
+            //
+            // 阈值用 PAIR_PREFERRED 而不是 LONG_OP_MIN：后者是 ECC 的**下限**
+            // (1000ms)，链路停在 2000ms 时不触发请求，ECDH 就在薄余量上跑，
+            // 算完随即 supervision timeout 断开。配对后面还有指纹 + 按键两道
+            // 人类操作，请求早发出去有的是时间落地。
+            if(s_conn_timeout < PAIR_PREFERRED_CONN_TIMEOUT) {
                 tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+            }
+
+            /* 登记第二台主机：先指纹（证明是物主），再按键（证明在场）。
+             * 指纹通过后 FP 匹配分发里的 case PAIR_INIT 会接着挂按键门，
+             * 按下才跑 ECDH。
+             *
+             * 这里回 WAIT_BUTTON 而不是 WAIT_FP：app 拿它作为「装上 pubkey
+             * 等待器」的信号，真正解除等待的是 ECDH 算完发出的
+             * [0x30][33B pubkey] 通知，与首次配对路径完全一致。 */
+            if(slot2_enroll) {
+                PRINT("  PAIR_INIT: enrolling this slot, FP gate first\n");
+                s_pending_cmd = IMMUROK_CMD_PAIR_INIT;
+                s_pending_cmd_start = TMOS_GetSystemClock();
+                s_pending_payload_len = 0;
+                fp_gate_enter();
+                rspBuf[0] = IMMUROK_CMD_PAIR_INIT;
+                rspBuf[1] = SEC_ERR_WAIT_BUTTON;
+                rspLen = 2;
+                break;
             }
 
             // Require a physical button press before running ECDH. Tells the
@@ -5155,7 +5471,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
         PRINT("  PAIR_STATUS\n");
         {
             rspBuf[0] = IMMUROK_CMD_PAIR_STATUS;
-            rspBuf[1] = immurok_security_is_paired() ? 0x01 : 0x00;
+            rspBuf[1] = immurok_security_active_slot_paired() ? 0x01 : 0x00;
             rspLen = 2;
         }
         break;
@@ -5176,6 +5492,105 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             }
         }
         break;
+
+    case IMMUROK_CMD_SLOT_STATUS:
+        {
+            uint8_t bitmap = 0;
+            if(immurok_security_slot_occupied(IMMUROK_SLOT_1)) bitmap |= 0x01;
+            if(immurok_security_slot_occupied(IMMUROK_SLOT_2)) bitmap |= 0x02;
+            rspBuf[0] = IMMUROK_CMD_SLOT_STATUS;
+            rspBuf[1] = IMMUROK_RSP_OK;
+            rspBuf[2] = bitmap;
+            rspBuf[3] = immurok_security_active_slot();
+            rspLen = 4;
+            PRINT("  SLOT_STATUS bitmap=0x%02X active=%d\n", bitmap, rspBuf[3]);
+        }
+        break;
+
+    /* 曾有 case SLOT_PIN_ISSUE(0x3A) / SLOT_PAIR(0x3B) —— 双主机登记的
+     * 临时 PIN 签发与 proof 提交。2026-08-03 登记简化为「指纹 + 设备
+     * 按键」后整条 PIN 链路移除，两个命令码不再实现（app 也不再发）。 */
+
+    case IMMUROK_CMD_SLOT_CLEAR:
+        /* payload 可选 [slot]；缺省清自己所在的槽。
+         *
+         * 清**另一个**槽要按一次已登记指纹。原设计是「只能清自己的槽，主机
+         * 之间不能互相吊销」（spec D4），但登记流程 2026-08-03 改成指纹 +
+         * 按键之后那条立论就塌了：任何持有指纹的人拿着设备走到任意一台电脑
+         * 前都能**加**一台主机，唯独删除还卡着「必须那台机器自己来」，不一致
+         * 且没保护到什么。丢了主机 2 却只能 factory reset（连带毁掉全部 SSH
+         * 私钥）才是真实伤害。统一到「指纹 + 在场」。 */
+        {
+            uint8_t active = immurok_security_active_slot();
+            uint8_t target = (payloadLen >= 1) ? pData[2] : active;
+
+            if(target != IMMUROK_SLOT_1 && target != IMMUROK_SLOT_2) {
+                rspBuf[0] = IMMUROK_CMD_SLOT_CLEAR;
+                rspBuf[1] = IMMUROK_RSP_INVALID_PARAM;
+                rspLen = 2;
+                break;
+            }
+
+            if(target != active) {
+                PRINT("  SLOT_CLEAR slot=%d (other), FP gate\n", target);
+                s_pending_cmd = IMMUROK_CMD_SLOT_CLEAR;
+                s_pending_cmd_start = TMOS_GetSystemClock();
+                s_pending_payload[0] = target;
+                s_pending_payload_len = 1;
+                fp_gate_enter();
+                rspBuf[0] = IMMUROK_RSP_WAIT_FP;
+                rspLen = 1;
+                break;
+            }
+
+            /* 清自己的槽：不要指纹。本槽的密钥马上就没了，再要一次生物
+             * 特征也拦不住任何人 —— 命令本身已经走在这条槽的加密链路上。
+             *
+             * 回收顺序见 spec §7.1：ERASE_SINGLEBOND(当前 peer) → slot_clear
+             * → bump gen → 重启。任一步中断都不会停在「新地址 + 旧密钥」的
+             * 死状态 —— bump gen 只在 slot_clear 确认成功后才做，否则密钥
+             * 还在但地址已经换了，重启后老主机反而连不上仍然有效的密钥。
+             *
+             * peer 地址从 slot_meta（flash）取，不缓存在 RAM：本连接建立
+             * 时已经用 slot_meta_set_peer() 记过（见 GAP_LINK_ESTABLISHED_
+             * EVENT 处理），active 槽此刻就是这条连接，理论上必中；仍做
+             * -1 兜底防御性跳过，不让一次读失败拖累 slot_clear 本身。 */
+            {
+                uint8_t ptype, paddr[6];
+                if(slot_meta_get_peer(active, &ptype, paddr) == 0) {
+                    uint8_t eb[7];
+                    eb[0] = ptype;
+                    tmos_memcpy(&eb[1], paddr, 6);
+                    uint8_t bcBefore = 0, bcAfter = 0;
+                    GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bcBefore);
+                    GAPBondMgr_SetParameter(GAPBOND_ERASE_SINGLEBOND, sizeof(eb), eb);
+                    GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bcAfter);
+                    PRINT("  SLOT_CLEAR own: SNV reclaim bond_count %d->%d\n", bcBefore, bcAfter);
+                    if(bcAfter >= bcBefore) {
+                        PRINT("  SLOT_CLEAR own: WARNING SNV reclaim may have failed "
+                              "(peer addr may be RPA, not identity addr)\n");
+                    }
+                } else {
+                    PRINT("  SLOT_CLEAR own: no stored peer for slot %d, skip SNV reclaim\n", active);
+                }
+            }
+            int ret = immurok_security_slot_clear(active);
+            PRINT("  SLOT_CLEAR slot=%d (own) ret=%d\n", active, ret);
+            rspBuf[0] = IMMUROK_CMD_SLOT_CLEAR;
+            rspBuf[1] = (ret == 0) ? IMMUROK_RSP_OK : IMMUROK_RSP_INVALID_PARAM;
+            ImmurokService_SendResponse(rspBuf, 2);
+            if(ret == 0) {
+                /* 本槽密钥已失效：bump gen 让重启后广播新地址，再复位回到
+                 * 干净状态。沿用本文件既有的延迟复位写法。 */
+                slot_meta_bump_gen(active);
+#if HAS_RGB_LED
+                led_stop();
+#endif
+                DelayMs(50);
+                SYS_ResetExecute();
+            }
+            return;
+        }
 
     case IMMUROK_CMD_FP_MATCH_ACK:
         PRINT("  FP_MATCH_ACK received\n");

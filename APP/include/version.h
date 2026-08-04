@@ -3,7 +3,7 @@
 
 #define FW_VERSION_MAJOR 1
 #define FW_VERSION_MINOR 6
-#define FW_VERSION_PATCH 3
+#define FW_VERSION_PATCH 20
 
 // OTA security version (SVN) for anti-rollback. Bump ONLY when shipping a
 // fix for a security issue — not on every release. The device persists a
@@ -17,7 +17,14 @@
 #define FW_BUILD_NUMBER 0
 #endif
 
-// Version string: "1.2.2" (build number shown separately in logs)
-#define FW_VERSION_STRING "1.6.3"
+// Version string 由上面的数字宏派生，不要手写 —— 曾经是独立的字符串
+// 常量，结果版本号一路 bump 到 1.6.9 而它还停在 1.6.3：GET_STATUS 报
+// 1.6.9、启动日志打 1.6.3，排查时对不上号。2026-08-03 发现。
+#define _FW_VER_STR2(x) #x
+#define _FW_VER_STR(x)  _FW_VER_STR2(x)
+#define FW_VERSION_STRING \
+    _FW_VER_STR(FW_VERSION_MAJOR) "." \
+    _FW_VER_STR(FW_VERSION_MINOR) "." \
+    _FW_VER_STR(FW_VERSION_PATCH)
 
 #endif

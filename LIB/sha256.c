@@ -179,3 +179,47 @@ void sha256(const uint8_t *data, size_t len, uint8_t *digest)
     sha256_update(&ctx, data, len);
     sha256_final(&ctx, digest);
 }
+
+/* ==========================================================================
+ * HMAC-SHA256
+ *
+ * 原本是 APP/immurok_security.c 里的 static 函数。它是通用原语，放在那里
+ * 导致 immurok_pin.c 等模块无法复用（且那个文件依赖 SDK 头，主机测不了）。
+ * 移到这里导出，immurok_security.c 照常调用。
+ *
+ * 静态缓冲区是刻意的：本函数会从 BLE 回调调用，而 CH592F 栈仅 512B。
+ * ========================================================================== */
+void hmac_sha256(const uint8_t *key, size_t key_len,
+                        const uint8_t *data, size_t data_len,
+                        uint8_t *out)
+{
+    static sha256_ctx_t ctx;           // 104B → BSS (stack-critical path)
+    static uint8_t k_pad[SHA256_BLOCK_SIZE];  // 64B → BSS (called from BLE callback, 512B stack)
+    static uint8_t tk[SHA256_DIGEST_SIZE];    // 32B → BSS
+
+    if (key_len > SHA256_BLOCK_SIZE) {
+        sha256(key, key_len, tk);
+        key = tk;
+        key_len = SHA256_DIGEST_SIZE;
+    }
+
+    // Inner hash: H((K ^ ipad) || data)
+    memset(k_pad, 0x36, SHA256_BLOCK_SIZE);
+    for (size_t i = 0; i < key_len; i++)
+        k_pad[i] ^= key[i];
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, k_pad, SHA256_BLOCK_SIZE);
+    sha256_update(&ctx, data, data_len);
+    sha256_final(&ctx, tk);
+
+    // Outer hash: H((K ^ opad) || inner)
+    memset(k_pad, 0x5c, SHA256_BLOCK_SIZE);
+    for (size_t i = 0; i < key_len; i++)
+        k_pad[i] ^= key[i];
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, k_pad, SHA256_BLOCK_SIZE);
+    sha256_update(&ctx, tk, SHA256_DIGEST_SIZE);
+    sha256_final(&ctx, out);
+}

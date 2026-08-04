@@ -673,10 +673,11 @@ void fp_finish_off(void)
     PRINT("Fingerprint power OFF\n");
 }
 
-void fp_power_off(void)
+bool fp_power_off(void)
 {
-    if (!s_powered_on) return;
+    if (!s_powered_on) return true;
 
+    bool slept = true;  // 非 R599S 无 sleep 步骤,视为已就绪(不触发 touch-reset)
 #if HAS_R599S
     // R599S: must send PS_Sleep(0x33) before cutting VCC-MCU power, otherwise
     // sensor stays in mA-level current and touch becomes unresponsive on the
@@ -708,7 +709,8 @@ void fp_power_off(void)
             s_in_uart_tmos_kick = 0;
         }
     }
-    if (got == FP_OK && ack == FP_ACK_SUCCESS) {
+    slept = (got == FP_OK && ack == FP_ACK_SUCCESS);
+    if (slept) {
         PRINT("R599S sleep OK, cutting VCC-MCU\n");
     } else {
         uint32_t waited_ms = ((uint32_t)(RTC_GetCycle32k() - start) * 1000) / 32768;
@@ -718,6 +720,9 @@ void fp_power_off(void)
 #endif
 
     fp_finish_off();
+    // slept=false → R599S 没进 standby,touch-wake 会失效。抬指路径据此跑
+    // touch-reset 恢复(2-step pair 期间 BLE 高负载挤掉 sleep ack 是高发场景)。
+    return slept;
 }
 
 bool fp_is_powered(void)

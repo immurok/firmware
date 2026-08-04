@@ -12,6 +12,7 @@
  */
 
 #include "immurok_keystore.h"
+#include "immurok_scratch.h"
 #include "CH59x_common.h"
 #include "CONFIG.h"
 #include "../LIB/uECC.h"
@@ -45,6 +46,24 @@ extern void uECC_set_watchdog_cb(void (*cb)(void));
 
 // 4KB work buffer for read-modify-write operations (also used by immurok_security.c)
 uint8_t immurok_keystore_work_buf[4096] __attribute__((section(".stack_guard"), aligned(4)));
+
+/* 双主机借用了 work_buf 的头 288 字节当临时 scratch（见
+ * APP/include/immurok_scratch.h）。keystore 的块操作会用掉整块，两者
+ * 不得同时在飞行中。DEBUG 下用这个标志把违规抓在测试阶段而不是现场。 */
+static uint8_t s_scratch_busy = 0;
+
+void immurok_scratch_mark_busy(uint8_t busy) { s_scratch_busy = busy; }
+
+void immurok_scratch_assert_free(const char *who)
+{
+#ifdef DEBUG
+    if (s_scratch_busy) {
+        PRINT("!! work_buf conflict: %s while dual-host scratch live\n", who);
+    }
+#else
+    (void)who;
+#endif
+}
 
 // Staging buffer for incoming entry data (largest entry = 160B for API)
 static uint8_t s_stage_buf[160] __attribute__((aligned(4)));
@@ -544,6 +563,11 @@ int immurok_keystore_sign(uint8_t idx, const uint8_t *hash32, uint8_t *sig64)
 
     uECC_Curve curve = uECC_secp256r1();
     PRINT("ECDSA sign...\n");
+    // 每次签名前重设 BLE 保活 kick —— OTA verify(hidkbd.c)会把它清成 NULL,
+    // 而 keystore_init 只在开机设一次(s_initialized 挡住重设)。不重设的话
+    // OTA 之后 uECC_sign 裸跑 ~2s 无保活,重连后 supervision=2000ms 下必断链
+    // (签名成功但结果发不回)。见 keng.md / project_macos27_conn_params。
+    uECC_set_watchdog_cb(keystore_watchdog_kick);
     WWDG_SetCounter(0);
     int ret = uECC_sign(s_ecc_privkey, hash_le, 32, sig64, curve);
     WWDG_SetCounter(0);

@@ -49,6 +49,13 @@ extern "C" {
 #define IMMUROK_CMD_GATE_CANCEL    0x37
 #define IMMUROK_CMD_CHALLENGE      0x38  // Challenge-response device verification
 
+// 双主机槽位（spec docs/superpowers/specs/2026-08-03-dual-host-design.md）
+// 刻意不扩展 GET_STATUS —— 它的响应格式两个 app 都在按下标解析，加字段风险高。
+#define IMMUROK_CMD_SLOT_STATUS    0x39  // -> [0x39][OK][bitmap][active]
+#define IMMUROK_CMD_SLOT_PIN_ISSUE 0x3A  // 主机1 签发 PIN: [nonce:8][ct:4][tag:8]
+#define IMMUROK_CMD_SLOT_PAIR      0x3B  // 主机2 提交: [host_pub:33][proof:8]
+#define IMMUROK_CMD_SLOT_CLEAR     0x3C  // 清除调用方自己所在的槽
+
 // Keystore commands
 #define IMMUROK_CMD_KEY_COUNT      0x60
 #define IMMUROK_CMD_KEY_READ       0x61
@@ -69,6 +76,11 @@ extern "C" {
 #define IMMUROK_RSP_BUSY            0xFD
 #define IMMUROK_RSP_INVALID_PARAM   0xFE
 #define IMMUROK_RSP_UNKNOWN_CMD     0xFF
+
+// 双主机
+#define IMMUROK_RSP_SLOT_FULL       0xF5  // 两个槽都已占用
+#define IMMUROK_RSP_PIN_BAD         0xF6  // proof 不符，响应第 3 字节为剩余次数
+#define IMMUROK_RSP_PIN_NONE        0xF7  // 无有效 PIN / 已过期
 
 // Callback function types
 typedef void (*immurokCommandCB_t)(uint16_t connHandle, uint8_t *pData, uint8_t len);

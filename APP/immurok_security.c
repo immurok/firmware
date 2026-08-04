@@ -5,50 +5,13 @@
 
 #include "immurok_security.h"
 #include "immurok_keystore.h"
+#include "immurok_slots.h"
+#include "slot_meta.h"
 #include "CH59x_common.h"
 #include "CONFIG.h"
 #include "../LIB/sha256.h"
 #include "../LIB/uECC.h"
 #include <string.h>
-
-// ============================================================================
-// HMAC-SHA256 Implementation
-// ============================================================================
-
-static void hmac_sha256(const uint8_t *key, size_t key_len,
-                        const uint8_t *data, size_t data_len,
-                        uint8_t *out)
-{
-    static sha256_ctx_t ctx;           // 104B → BSS (stack-critical path)
-    static uint8_t k_pad[SHA256_BLOCK_SIZE];  // 64B → BSS (called from BLE callback, 512B stack)
-    static uint8_t tk[SHA256_DIGEST_SIZE];    // 32B → BSS
-
-    if (key_len > SHA256_BLOCK_SIZE) {
-        sha256(key, key_len, tk);
-        key = tk;
-        key_len = SHA256_DIGEST_SIZE;
-    }
-
-    // Inner hash: H((K ^ ipad) || data)
-    memset(k_pad, 0x36, SHA256_BLOCK_SIZE);
-    for (size_t i = 0; i < key_len; i++)
-        k_pad[i] ^= key[i];
-
-    sha256_init(&ctx);
-    sha256_update(&ctx, k_pad, SHA256_BLOCK_SIZE);
-    sha256_update(&ctx, data, data_len);
-    sha256_final(&ctx, tk);
-
-    // Outer hash: H((K ^ opad) || inner)
-    memset(k_pad, 0x5c, SHA256_BLOCK_SIZE);
-    for (size_t i = 0; i < key_len; i++)
-        k_pad[i] ^= key[i];
-
-    sha256_init(&ctx);
-    sha256_update(&ctx, k_pad, SHA256_BLOCK_SIZE);
-    sha256_update(&ctx, tk, SHA256_DIGEST_SIZE);
-    sha256_final(&ctx, out);
-}
 
 // ============================================================================
 // HKDF-SHA256 (Extract + Expand, single output block = 32 bytes)
@@ -105,6 +68,26 @@ typedef struct __attribute__((aligned(4))) {
 // ============================================================================
 
 static storage_v3_t s_data __attribute__((aligned(4))) = {0};
+static uint8_t s_active_slot = IMMUROK_SLOT_1;
+static bool    s_active_valid = false;
+
+/* 下一次 pair_save() 把新密钥写进哪个槽。默认槽 1（原有行为）。
+ * 槽 2 登记时由 hidkbd 设置，save 完自动复位。 */
+static uint8_t s_pair_target_slot = IMMUROK_SLOT_1;
+
+/* 槽 2 登记「扣着待提交」的状态直接由 s_pair_target_slot 表达，不另设
+ * 标志位 —— target 停在 SLOT_2 就说明这一轮登记还没提交/放弃。
+ * （CH592F 的 RAM 以字节计，一个对齐后占 4B 的 bool 就够让
+ * release-debug 链接不过。）
+ *
+ * 语义：ECDH 算完的密钥先扣在 s_data.shared_key（仅内存），必须等
+ * SLOT_PAIR 的 proof 与指纹第二重都通过才真正落盘。不这样做的话，PIN
+ * 窗口一开，任何能 bond 上的设备跑一遍正常配对流程，延迟落盘就会把槽 2
+ * 直接给它 —— PIN 和指纹形同虚设。
+ *
+ * 扣着期间禁止 save_security_data()：此刻 s_data.shared_key 装的可能是
+ * 槽 2 的新密钥，写下去会覆盖 block 0 里槽 1 的密钥。 */
+
 static immurok_auth_state_t s_auth_state = AUTH_STATE_IDLE;
 static bool s_initialized = false;
 
@@ -143,7 +126,9 @@ int immurok_security_init(void)
     s_ecdh_state = ECDH_STATE_IDLE;
     s_initialized = true;
 
-    PRINT("Security: paired=%d\n", s_data.paired);
+    immurok_security_load_active_slot();
+
+    PRINT("Security: paired=%d, active_slot=%d\n", s_data.paired, s_active_slot);
     return 0;
 }
 
@@ -151,9 +136,114 @@ int immurok_security_init(void)
 // Pairing Status
 // ============================================================================
 
+/* 「设备被认领过没有」—— 任一槽有货即为真。
+ *
+ * 这是**设备全局**的防盗语义，用于 BLE bond 模式和未配对命令白名单：
+ * 小偷切到空槽也不该能自由 bond / 走一遍 PAIR_INIT。不要拿它回答
+ * 「跟我说话的这台主机配对了没有」—— 那是 active_slot_paired()。 */
 bool immurok_security_is_paired(void)
 {
-    return s_data.paired == 0x01;
+    return immurok_security_slot_occupied(IMMUROK_SLOT_1) ||
+           immurok_security_slot_occupied(IMMUROK_SLOT_2);
+}
+
+/* 「当前连着的这台主机配对了没有」—— 只看活动槽。
+ *
+ * 主机按槽的 BLE 地址连进来，所以活动槽就是对方的槽。GET_STATUS /
+ * PAIR_STATUS 必须报这个：曾经报 is_paired()，结果主机 2 走空的槽 2 连上
+ * 来也被告知「已配对」，app 于是按主机 1 视角渲染（绿色 paired + 签发 PIN
+ * 按钮），却拿不出共享密钥做验证，红字 Device verification failed，而真正
+ * 该出现的「输入配对码」入口反倒不显示。2026-08-03 实机发现。 */
+bool immurok_security_active_slot_paired(void)
+{
+    return immurok_security_slot_occupied(s_active_slot);
+}
+
+uint8_t immurok_security_active_slot(void) { return s_active_slot; }
+
+bool immurok_security_slot_occupied(uint8_t slot)
+{
+    if (slot == IMMUROK_SLOT_1) return (s_data.paired == 0x01);
+    if (slot == IMMUROK_SLOT_2) return immurok_slots_slot2_occupied();
+    return false;
+}
+
+/* 活跃槽的密钥 —— 按需取，不在 RAM 里另存一份副本。
+ *
+ * 槽 1：s_data.shared_key 开机就已在 RAM（block 0 的内存副本），零成本，
+ *       与双主机改造之前的原始路径完全一致。
+ * 槽 2：从 flash 0x6200 读进 work_buf 的 SLOTS 分区，用完即弃。
+ *
+ * 返回的指针只在紧接着的这一次使用中有效（下一次 immurok_slots_* 调用
+ * 就会覆盖它），所有调用点都是「取出来立刻喂给 hmac_sha256」。
+ *
+ * 关于「EEPROM_READ 紧接 ECC 会把芯片打进 IAP」那条既有的坑：不适用。
+ * ECC 跑在 FP_GATE_EXEC_EVT 这个独立 TMOS 事件里，本函数的调用者
+ * （sign_fp_match / challenge_response）在指纹匹配路径，两者不同事件、
+ * 栈已完全展开，不构成「紧接着」。 */
+static const uint8_t *active_key(void)
+{
+    if (!s_active_valid) return 0;
+    if (s_active_slot == IMMUROK_SLOT_2) {
+        return immurok_slots_slot2_key_ptr();
+    }
+    return s_data.shared_key;
+}
+
+int immurok_security_load_active_slot(void)
+{
+    uint8_t slot = immurok_slots_active();
+
+    s_active_valid = false;
+
+    /* 槽位只由「按切换指纹」改变。开机照标记页走，不做任何回落 ——
+     * 标记页是「当前在哪个槽」的唯一真源。
+     *
+     * 曾经这里有个「空槽就回落到有效槽」的逻辑，用意是防止卡死。但那会
+     * 造成两个真源打架：main.c 选 BLE 地址用的是 immurok_slots_active()
+     * 的原值，回落只改了这里的 s_active_slot，结果设备用槽 2 的地址广播
+     * 却报告自己在槽 1，LED 也跟着显示错误的颜色。2026-08-03 真机发现。
+     *
+     * 而防卡死已经由别的机制解决：切换指纹在没有 BLE / app 连接时也能
+     * 工作（hidkbd.c 那两道触摸门的双主机例外），它本身就是逃生口。 */
+    s_active_slot = slot;
+
+    /* 停在空槽是合法状态（登记中，或用户手动切过去了）：广播照旧，
+     * 只是没有密钥可用，所有 HMAC 会干净地失败。 */
+    if (slot == IMMUROK_SLOT_2) {
+        if (immurok_slots_slot2_key_ptr() == 0) return -1;
+    } else {
+        if (s_data.paired != 0x01) return -1;
+    }
+    s_active_valid = true;
+    return 0;
+}
+
+int immurok_security_slot2_commit(void)
+{
+    int ret;
+    if (s_pair_target_slot != IMMUROK_SLOT_2) return -1;
+
+    /* s_data.shared_key 此刻装的是 ECDH 刚算出的槽 2 密钥（仅内存）。
+     * 写进 0x6200 后从 flash 重载 s_data 复原槽 1 —— block 0 全程未被
+     * 写入，已出货设备的槽 1 配对完好无损。 */
+    ret = immurok_slots_slot2_set_key(s_data.shared_key);
+    s_pair_target_slot = IMMUROK_SLOT_1;
+    load_security_data();
+    immurok_security_load_active_slot();
+    return ret;
+}
+
+int immurok_security_slot_clear(uint8_t slot)
+{
+    int i;
+    if (slot == IMMUROK_SLOT_2) return immurok_slots_slot2_clear();
+    if (slot != IMMUROK_SLOT_1) return -1;
+    s_data.paired = 0;
+    for (i = 0; i < 32; i++) s_data.shared_key[i] = 0;
+    int ret = save_security_data();
+    immurok_security_load_active_slot();   /* 同上：状态必须跟着变 */
+    return ret;
 }
 
 // ============================================================================
@@ -197,11 +287,22 @@ int immurok_security_pair_make_key(void)
 }
 
 // Step 3: Get device compressed pubkey in BE (for sending to App)
+/* 刻意不查 s_ecdh_state。
+ *
+ * SLOT_PAIR 要用设备公钥算 proof，而那时 pair_compute_secret() 已把状态
+ * 清回 IDLE —— 原来那句 `state != KEY_READY → return -1` 让 SLOT_PAIR 一律
+ * 回 0xFE，槽 2 永远配不上（2026-08-03 实机）。
+ *
+ * 判据换成「s_ecdh_pub 还在不在」：pair_init() 把它清零，make_key 填上，
+ * 之后只有私钥被擦除。重新压缩一次即可，uECC_compress 只是取坐标，没有
+ * make_key 那种秒级标量乘开销。缓存一份压缩结果更直接，但那 34B bss 会把
+ * .stack_guard 顶进 .stack，链接不过。 */
 int immurok_security_pair_get_pubkey(uint8_t *compressed33)
 {
-    if (s_ecdh_state != ECDH_STATE_KEY_READY) {
-        return -1;
-    }
+    uint8_t nz = 0;
+    int i;
+    for (i = 0; i < 64; i++) nz |= s_ecdh_pub[i];
+    if (!nz) return -1;
 
     uECC_Curve curve = uECC_secp256r1();
 
@@ -234,10 +335,32 @@ int immurok_security_pair_confirm(const uint8_t *app_compressed33)
 // must schedule the save.
 volatile uint8_t immurok_security_pair_save_pending = 0;
 
+void immurok_security_pair_set_target_slot(uint8_t slot)
+{
+    s_pair_target_slot = (slot == IMMUROK_SLOT_2) ? IMMUROK_SLOT_2
+                                                  : IMMUROK_SLOT_1;
+}
+
 int immurok_security_pair_save(void)
 {
-    PRINT("ECDH deferred save start\n");
-    return save_security_data();
+    PRINT("ECDH deferred save start (target slot %d)\n", s_pair_target_slot);
+
+    if (s_pair_target_slot == IMMUROK_SLOT_2)
+    {
+        /* 直接落盘。曾经这里只「扣住」，等 SLOT_PAIR 的 PIN proof 才写；
+         * 2026-08-03 登记改为指纹 + 按键后，两道门都在 PAIR_INIT 之前过完，
+         * 走到这里就已经授权完毕，没有可等的第二阶段了。 */
+        return immurok_security_slot2_commit();
+    }
+
+    int ret = save_security_data();
+    /* 必须刷新活跃槽：所有 HMAC 现在走 active_key()，它的可用性由
+     * s_active_valid 决定，而后者只在 load_active_slot() 里置位。
+     * 漏掉这一行会让设备「配对成功但认证不了」直到下次重启 ——
+     * 2026-08-03 真机实测踩到（challenge-response 失败 → app 报设备
+     * 未验证 → AGENT_APPROVE 返回 ERROR）。 */
+    immurok_security_load_active_slot();
+    return ret;
 }
 
 int immurok_security_pair_compute_secret(void)
@@ -325,7 +448,8 @@ void immurok_security_auth_cancel(void)
 
 int immurok_security_sign_fp_match(uint16_t page_id, uint8_t *out_buf)
 {
-    if (!s_data.paired) {
+    const uint8_t *k = active_key();
+    if (k == 0) {
         return -1;
     }
 
@@ -336,7 +460,7 @@ int immurok_security_sign_fp_match(uint16_t page_id, uint8_t *out_buf)
 
     // HMAC-SHA256(shared_key, 0x21 || page_id), truncate to 8 bytes
     uint8_t hmac_full[32];
-    hmac_sha256(s_data.shared_key, 32, out_buf, 3, hmac_full);
+    hmac_sha256(k, 32, out_buf, 3, hmac_full);
     memcpy(&out_buf[3], hmac_full, 8);
 
     return 11;  // Total notification size
@@ -348,13 +472,14 @@ int immurok_security_sign_fp_match(uint16_t page_id, uint8_t *out_buf)
 
 int immurok_security_challenge_response(const uint8_t *nonce, uint8_t *out_hmac8)
 {
-    if (!s_data.paired) {
+    const uint8_t *k = active_key();
+    if (k == 0) {
         return -1;
     }
 
     // HMAC-SHA256(shared_key, nonce[8]), truncate to 8 bytes
     uint8_t hmac_full[32];
-    hmac_sha256(s_data.shared_key, 32, nonce, 8, hmac_full);
+    hmac_sha256(k, 32, nonce, 8, hmac_full);
     memcpy(out_hmac8, hmac_full, 8);
 
     return 0;
@@ -375,6 +500,16 @@ int immurok_security_factory_reset(void)
     uint8_t ret = EEPROM_ERASE(SECURITY_DATA_ADDR, EEPROM_BLOCK_SIZE);
     PRINT("Factory reset: EEPROM_ERASE ret=%d\n", ret);
     (void)ret;
+
+    /* 双主机的三页在 block 6，不在 keystore 的擦除范围（0x1000-0x6000）
+     * 内，也不在上面 block 0 的擦除范围内，必须显式清除 —— 否则恢复出厂
+     * 后槽 2 仍持有旧密钥、标记页仍指向槽 2，设备会以槽 2 的 BLE 地址
+     * 广播却没有任何主机认识它。 */
+    immurok_slots_slot2_clear();
+    slot_meta_reset();   /* 0x6300：两槽 gen 回 0、peer 清空 → 地址回出厂 MAC */
+    immurok_slots_set_active(IMMUROK_SLOT_1);
+    s_active_valid = false;
+    s_active_slot = IMMUROK_SLOT_1;
 
     immurok_keystore_reset();
 
@@ -422,6 +557,13 @@ extern uint8_t immurok_keystore_work_buf[4096];
 
 static int save_security_data(void)
 {
+    /* 槽 2 登记扣住期间，s_data.shared_key 装的是槽 2 的新密钥。
+     * 此时写 block 0 会覆盖槽 1 的密钥 —— 直接拒绝，把脚枪变成可捕获的
+     * 错误。正常流程里这一条永不触发（提交/放弃都会先复原 s_data）。 */
+    if (s_pair_target_slot == IMMUROK_SLOT_2) {
+        PRINT("!! refusing save_security_data: slot 2 enrollment in flight\n");
+        return -1;
+    }
     uint8_t ret;
 
     s_data.magic = STORAGE_MAGIC_V3;

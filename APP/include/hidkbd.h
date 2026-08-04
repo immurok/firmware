@@ -110,11 +110,47 @@ extern "C" {
 // stop asking rather than fight macOS for the 6s we would prefer.
 #define PARAM_OK_CONN_TIMEOUT     200
 
+// ECDH 偏好的 supervision timeout。**不是闸门** —— 达不到照样跑（闸门是
+// LONG_OP_MIN_CONN_TIMEOUT，1000ms）。它的作用是让 PAIR_INIT **提早发出**
+// 参数更新请求：配对要人按指纹再按按钮，中间有好几秒人类时间，足够 macOS
+// 把 6000ms 谈下来，ECDH 就能跑在宽裕的链路上。
+//
+// 2026-08-04 实机：链路停在 2000ms 时 make_key 耗时 1746ms「勉强活下来」，
+// 随后 220ms 内就 Reason:8（supervision timeout）断开 —— 余量薄到最后一个
+// 锚点刚好落在边界外。而 hiddev.c 在 >= PARAM_OK_CONN_TIMEOUT(2000ms) 后
+// 就不再请求了，没人会把它推到 6000ms，PAIR_INIT 原来也只在 < 1000ms 时才
+// 请求，于是 2000ms 成了一个没人管的稳定坑。
+//
+// 只在配对路径用。KEY_SIGN 不能照搬 —— 那会给每次 sudo/ssh 加上等待。
+#define PAIR_PREFERRED_CONN_TIMEOUT  600
+
 // How long a long op waits for a requested param update to land before either
 // proceeding anyway (>= LONG_OP_FLOOR_CONN_TIMEOUT) or rejecting with 0xE1.
 #define LONG_OP_PARAM_WAIT_MS     3000
 // Re-check interval while waiting (TMOS ticks; 625us each → ~500ms)
 #define LONG_OP_PARAM_POLL_TICKS  800
+
+// KEY_SIGN(ECDSA ~2s)专用:等待长 supervision timeout 落地的上限。
+// macOS 27 重连后强制 latency=22/timeout=2000ms(override 窗口),比 2s 签名短 →
+// 签名阻塞期 LL 不发包 → supervision 超时断链,签名 100% 失败。故 KEY_SIGN 也
+// 必须先把 timeout 谈到 6000ms 再签 —— 这推翻了上面 PAIR_PREFERRED 注释
+// "KEY_SIGN 不能加等待"的旧结论:实测不加就必断,~1s 等待是签名可用的必要代价。
+// 2026-08-04 实机:签名当下主动申请 latency=20/timeout=6000ms,macOS 在 override
+// 窗口内也接受,~1s grant(且 latency=20 本身省电,签名全程低功耗、无需事后恢复)。
+// 5000ms 上限留足余量;超时则按操作类型回错误(签名 0xE1/配对 SEC_ERR)。
+#define KEY_SIGN_PARAM_WAIT_MS    5000
+
+// 长 ECC 门等待期内**最多**发几次参数请求(含首发)。BLE central 对短时间内
+// 反复的 conn param update 请求会 ban(Apple 明确"不应持续重协商")。实测 ~1s
+// grant,首发 + 2 次重发(共 3 次,间隔 ~500ms 覆盖到 ~1s)足够;之后只 poll 等
+// grant,不再发。
+#define LONG_OP_MAX_PARAM_REQ     3
+
+// 认为 slave latency"够省电"的下限。低于此(尤其被 central 压成 0)虽不影响功能
+// (timeout 够就能跑),但唤醒频率高、费电,应继续在后台把 latency 谈回
+// DEFAULT_DESIRED_SLAVE_LATENCY。判据从"latency>0 即满意"收紧到">=5",让
+// latency=1..4 也继续协商(latency=0 现有代码已会继续谈)。
+#define MIN_ACCEPTABLE_SLAVE_LATENCY  5
 
 /*********************************************************************
  * POST-OVERRIDE PARAM RE-REQUEST

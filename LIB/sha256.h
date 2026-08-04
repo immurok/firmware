@@ -38,4 +38,12 @@ void sha256_final(sha256_ctx_t *ctx, uint8_t *digest);
  */
 void sha256(const uint8_t *data, size_t len, uint8_t *digest);
 
+/**
+ * HMAC-SHA256。内部用静态缓冲区（从 BLE 回调调用，栈仅 512B），
+ * 因此不可重入 —— 单线程 TMOS 下没问题。
+ */
+void hmac_sha256(const uint8_t *key, size_t key_len,
+                 const uint8_t *data, size_t data_len,
+                 uint8_t *out);
+
 #endif // SHA256_H

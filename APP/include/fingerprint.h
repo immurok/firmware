@@ -18,9 +18,15 @@
 
 // Single-slot fingerprint configuration
 // Each slot uses 12 GenChar buffers; R559S stores max 100 templates → 8 slots max, limit to 5
-#define FP_USER_MAX             5       // Max user-visible fingerprints
+// 5 认证指纹 + 1 专用切换指纹。R559S 最多 100 个模板，容量充裕；
+// 6 位仍然塞得进 fp_user_bitmap() 返回的 1 字节。
+#define FP_USER_MAX             6       // Max user-visible fingerprints
 #define FP_SLOTS_PER_FINGER     1       // Physical slots per fingerprint
-#define FP_SLOT_MAX             FP_USER_MAX  // 5
+#define FP_SLOT_MAX             FP_USER_MAX  // 6
+
+// 双主机切换指纹：page_id 5 只做主机切换，绝不参与认证 ——
+// 否则触摸解锁会误切主机。见 spec §7。
+#define FP_SWITCH_SLOT          5
 #define FP_ENROLL_CAPTURES      6       // Captures per enrollment (mode-1 broad coverage)
 
 // R559S enrollment logic mode (system register 3, via PS_WriteReg 0x0E):
@@ -283,7 +289,10 @@ void fp_power_on(void);
  * lift has been confirmed; see fp_finish_off + async retry in hidkbd.c
  * for the held-finger case.
  */
-void fp_power_off(void);
+// 返回 sleep 是否成功 ack(R599S 是否真的进了 wake-on-touch standby)。
+// false 表示 CMD_SLEEP 没被确认、已强切 VCC,touch-wake 会失效,调用方
+// (抬指路径)应据此跑 touch-reset 恢复。非 R599S 恒返回 true。
+bool fp_power_off(void);
 
 /**
  * Cut VCC + GPIO without sending PS_Sleep. Used by the async retry path

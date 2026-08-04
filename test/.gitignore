@@ -1,0 +1,5 @@
+test_smoke
+test_slots
+test_pin_crypto
+test_slot_meta
+*.dSYM/

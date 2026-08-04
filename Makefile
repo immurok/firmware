@@ -39,6 +39,9 @@ C_SOURCES = \
 	$(APP_DIR)/immurok_keystore.c \
 	$(APP_DIR)/tamper.c \
 	$(APP_DIR)/ws2812.c \
+	$(APP_DIR)/immurok_slots.c \
+	$(APP_DIR)/slot_meta.c \
+	$(APP_DIR)/immurok_ble_init.c \
 	LIB/sha1.c \
 	LIB/sha256.c \
 	LIB/aes128.c \
@@ -97,9 +100,9 @@ HW_VER ?= 6
 BLE_MEMHEAP = 5632
 
 # Firmware version from version.h
-FW_VER_MAJOR := $(shell grep 'FW_VERSION_MAJOR' APP/include/version.h | awk '{print $$3}')
-FW_VER_MINOR := $(shell grep 'FW_VERSION_MINOR' APP/include/version.h | awk '{print $$3}')
-FW_VER_PATCH := $(shell grep 'FW_VERSION_PATCH' APP/include/version.h | awk '{print $$3}')
+FW_VER_MAJOR := $(shell grep 'FW_VERSION_MAJOR ' APP/include/version.h | awk '{print $$3}')
+FW_VER_MINOR := $(shell grep 'FW_VERSION_MINOR ' APP/include/version.h | awk '{print $$3}')
+FW_VER_PATCH := $(shell grep 'FW_VERSION_PATCH ' APP/include/version.h | awk '{print $$3}')
 
 # Build number from git: short hash → 16-bit integer (e.g. "a3f1" → 0xa3f1)
 GIT_HASH := $(shell git rev-parse --short=4 HEAD 2>/dev/null || echo "0000")
@@ -123,6 +126,7 @@ C_DEFS_COMMON = \
 	-DHARDWARE_VER$(HW_VER) \
 	-DCH592 \
 	-DBLE_MAC=FALSE \
+	-DBLE_SNV_NUM=2 \
 	-DDCDC_ENABLE=TRUE \
 	-DBLE_MEMHEAP_SIZE=$(BLE_MEMHEAP) \
 	-DBLE_BUFF_MAX_LEN=251 \
