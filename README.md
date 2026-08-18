@@ -121,9 +121,9 @@ Production devices expose a serial debug header with a **BOOT** pad. There are t
 
 ### Serial ISP via the debug header (production devices)
 
-The CH592F ROM bootloader accepts firmware over **UART1 (PA8 = RX, PA9 = TX)** when the **BOOT** pin (PB22) is held low at power-on. The debug header exposes UART1, BOOT and GND. UART1 is shared with the fingerprint sensor, but the sensor is unpowered while the bootloader runs, so the lines are free during ISP.
+The CH592F ROM bootloader accepts firmware over **UART1 (PA8 = RX, PA9 = TX)** when the **BOOT** pin (PB22) is held low at power-on. The production PCB exposes pads labeled **VCC5 / TXD1 / RXD1 / DEBUG / GND** on the back side, plus a separate **BOOT** pad with its own **GND** next to the power switch. UART1 is shared with the fingerprint sensor, but the sensor is unpowered while the bootloader runs, so the lines are free during ISP.
 
-1. Connect a 3.3 V USB-serial adapter: adapter TX → device RX (PA8), adapter RX ← device TX (PA9), GND ↔ GND. The serial pins of a WCH-LinkE work fine as the adapter.
+1. Connect a 3.3 V USB-serial adapter: adapter TX → **RXD1**, adapter RX → **TXD1**, GND ↔ **GND**. The serial pins of a WCH-LinkE work fine as the adapter.
 2. Short **BOOT to GND**, then power the device on. BOOT is sampled only at power-up; it shares PB22 with the blue LED, so the LED may glow faintly while held — harmless.
 3. Flash with [`wchisp`](https://github.com/ch32-rs/wchisp) (`cargo install wchisp`):
 
@@ -136,9 +136,9 @@ The CH592F ROM bootloader accepts firmware over **UART1 (PA8 = RX, PA9 = TX)** w
 
 USB ISP is **not** available on this hardware: the USB-C port is power-only, with no data lines.
 
-### 2-wire debug interface (WCH-LinkE + wlink)
+### 2-wire debug interface (WCH-LinkE + wlink, development boards)
 
-PB14/PB15 (TIO/TCK) PCB test points carry the WCH 2-wire debug interface. This requires a **WCH-LinkE** — specifically the "E" model; the original WCH-Link does not support the CH59x family:
+The WCH 2-wire debug interface lives on PB14 (SWDIO) / PB15 (SWCLK) and requires **both** lines plus GND, with a **WCH-LinkE** — specifically the "E" model; the original WCH-Link does not support the CH59x family. The production PCB does not expose PB14/PB15 (the DEBUG pad is the log serial, not SWDIO), so on production devices use serial ISP instead; this path is for development boards with both test points wired out:
 
 ```bash
 cargo install --git https://github.com/ch32-rs/wlink
@@ -148,7 +148,7 @@ cargo install --git https://github.com/ch32-rs/wlink
 
 ### Debug serial output
 
-`debug` and `release-debug` builds print logs on **UART3 TX (PA5), 115200 8N1**, also exposed on the debug header. Connect it to any serial adapter's RX to watch the log stream (a WCH-LinkE's RX pin works).
+`debug` and `release-debug` builds print logs on **UART3 TX (PA5), 115200 8N1** — the pad labeled **DEBUG** on the production PCB. Connect it to any serial adapter's RX to watch the log stream (a WCH-LinkE's RX pin works).
 
 ## Documentation
 
