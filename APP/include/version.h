@@ -2,8 +2,8 @@
 #define _VERSION_H_
 
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 6
-#define FW_VERSION_PATCH 20
+#define FW_VERSION_MINOR 7
+#define FW_VERSION_PATCH 1
 
 // OTA security version (SVN) for anti-rollback. Bump ONLY when shipping a
 // fix for a security issue — not on every release. The device persists a
