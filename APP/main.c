@@ -21,6 +21,8 @@
 #include "immurok_ble_init.h"
 #include "immurok_slots.h"
 #include "hardware_pins.h"
+#include "factory_test.h"
+#include "qc_test.h"
 #include "ws2812.h"
 
 #ifdef DEBUG
@@ -171,6 +173,11 @@ void Main_Circulation()
         if(g_touch_irq_flag)
         {
             g_touch_irq_flag = 0;
+#if HAS_FACTORY_TEST
+            if(g_factory_case_open)
+                ;                                // hold: ignore
+            else
+#endif
             tmos_set_event(hidEmuTaskId, TOUCH_SCAN_EVT);
         }
         if(g_btn_irq_flag)
@@ -182,8 +189,20 @@ void Main_Circulation()
         if(g_tamper_irq_flag)
         {
             g_tamper_irq_flag = 0;
-            tamper_run_cleanup();   // never returns (halts blinking red)
+            PRINT("TAMPER: ANTI_OPEN rising edge\n");
+            if(tamper_should_wipe())
+                tamper_run_cleanup();   // never returns (halts blinking red)
+            else
+                factory_case_open_enter();   // unpaired: hold (adv off, red slow blink)
         }
+#endif
+#if HAS_QC_TEST
+        if(g_qc_start_req)
+        {
+            g_qc_start_req = 0;
+            qc_test_run();   // 跑自动项后返回，进等触摸态
+        }
+        qc_test_tick();      // 事件式处理等触摸/结果/关机（BLE 稳定）
 #endif
 
         WWDG_SetCounter(0);  // 喂狗：计数器清零

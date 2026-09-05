@@ -26,12 +26,11 @@ extern "C" {
  */
 
 // Device Information Service Parameters
-#define DEVINFO_SYSTEM_ID              0
+// (System ID / Hardware Rev / Software Rev 特征已于 2026-08-22 删除——
+//  从未维护的占位值，零信息量端点；参数 ID 保号不复用)
 #define DEVINFO_MODEL_NUMBER           1
 #define DEVINFO_SERIAL_NUMBER          2
 #define DEVINFO_FIRMWARE_REV           3
-#define DEVINFO_HARDWARE_REV           4
-#define DEVINFO_SOFTWARE_REV           5
 #define DEVINFO_MANUFACTURER_NAME      6
 #define DEVINFO_11073_CERT_DATA        7
 #define DEVINFO_PNP_ID                 8
@@ -41,9 +40,6 @@ extern "C" {
 #define DEVINFO_11073_BODY_IEEE        1
 #define DEVINFO_11073_BODY_CONTINUA    2
 #define DEVINFO_11073_BODY_EXP         254
-
-// System ID length
-#define DEVINFO_SYSTEM_ID_LEN          8
 
 // PnP ID length
 #define DEVINFO_PNP_ID_LEN             7

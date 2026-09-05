@@ -196,6 +196,16 @@ extern void ImmurokNotify_ConnParams(void);
 // Max re-requests per connection. Beyond this we accept whatever the central
 // insists on rather than keep fighting it.
 #define POST_OVERRIDE_RETRY_MAX   5
+
+// 常规参数更新请求的上限：**连续没有任何回应**的请求次数（主机一旦回调、
+// 计数清零）。原来两个阶段都无上限，主机侧栈卡住不回 L2CAP 响应时固件每
+// 5s/30s 无休止地请求，与 Apple「持续重协商有害」的要求相悖。超过上限就停，
+// 等下一次断连重连或长操作（ECDH/签名）显式再要一次。
+#define PARAM_UPDATE_PHASE1_MAX   6      // ×5s  = 30s
+#define PARAM_UPDATE_PHASE2_MAX   3      // ×30s = 90s
+// 主机明确拒绝（GAP_LINK_PARAM_UPDATE_EVENT status != SUCCESS）：直接停，
+// 不再等到上限。主机之后自己改参数（回调进来）会清零重新开放。
+#define PARAM_UPDATE_GIVEN_UP     0xFF
 #define FP_GATE_EXEC_EVT          OTA_FLASH_ERASE_EVT  // reuse: signing and OTA are mutually exclusive
 
 /*********************************************************************
@@ -228,6 +238,10 @@ extern volatile uint8_t g_btn_irq_flag;
 #if HAS_TAMPER_DETECT
 extern volatile uint8_t g_tamper_irq_flag;
 extern void tamper_run_cleanup(void) __attribute__((noreturn));   // implemented in hidkbd.c
+// True when a tamper event must wipe: any slot paired. Unpaired devices
+// (production line, assembly, flashing) ignore both the rising edge and a
+// static-high ANTI_OPEN at boot.
+extern int tamper_should_wipe(void);   // bool; hidkbd.h is included before stdbool in main.c
 #endif
 
 /*********************************************************************

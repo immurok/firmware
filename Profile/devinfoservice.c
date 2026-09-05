@@ -36,9 +36,10 @@
 const uint8_t devInfoServUUID[ATT_BT_UUID_SIZE] = {
     LO_UINT16(DEVINFO_SERV_UUID), HI_UINT16(DEVINFO_SERV_UUID)};
 
-// System ID
-const uint8_t devInfoSystemIdUUID[ATT_BT_UUID_SIZE] = {
-    LO_UINT16(SYSTEM_ID_UUID), HI_UINT16(SYSTEM_ID_UUID)};
+/* System ID / Hardware Revision / Software Revision 三个特征已删除
+ * (2026-08-22)：System ID 从未填充（恒为全 0），HW/SW Rev 是从未维护的
+ * "001" 占位——三个都是零信息量端点，不如不暴露。固件版本走
+ * Firmware Revision（由 version.h 派生）与自定义 GET_STATUS。 */
 
 // Model Number String
 const uint8_t devInfoModelNumberUUID[ATT_BT_UUID_SIZE] = {
@@ -51,14 +52,6 @@ const uint8_t devInfoSerialNumberUUID[ATT_BT_UUID_SIZE] = {
 // Firmware Revision String
 const uint8_t devInfoFirmwareRevUUID[ATT_BT_UUID_SIZE] = {
     LO_UINT16(FIRMWARE_REV_UUID), HI_UINT16(FIRMWARE_REV_UUID)};
-
-// Hardware Revision String
-const uint8_t devInfoHardwareRevUUID[ATT_BT_UUID_SIZE] = {
-    LO_UINT16(HARDWARE_REV_UUID), HI_UINT16(HARDWARE_REV_UUID)};
-
-// Software Revision String
-const uint8_t devInfoSoftwareRevUUID[ATT_BT_UUID_SIZE] = {
-    LO_UINT16(SOFTWARE_REV_UUID), HI_UINT16(SOFTWARE_REV_UUID)};
 
 // Manufacturer Name String
 const uint8_t devInfoMfrNameUUID[ATT_BT_UUID_SIZE] = {
@@ -87,10 +80,6 @@ const uint8_t devInfoPnpIdUUID[ATT_BT_UUID_SIZE] = {
 // Device Information Service attribute
 static const gattAttrType_t devInfoService = {ATT_BT_UUID_SIZE, devInfoServUUID};
 
-// System ID characteristic
-static uint8_t devInfoSystemIdProps = GATT_PROP_READ;
-static uint8_t devInfoSystemId[DEVINFO_SYSTEM_ID_LEN] = {0, 0, 0, 0, 0, 0, 0, 0};
-
 // Model Number String characteristic. Default build leaves FW_VARIANT undefined
 // → "IK-1" (general SKU, declared 2026-05-14). Color-specific builds opt in
 // with -DFW_VARIANT=\"W\" (or B / G) and produce "IK-1-W"/"IK-1-B"/"IK-1-G"
@@ -110,14 +99,6 @@ static uint8_t       devInfoSerialNumber[13] = "000000000000"; // 6-byte MAC as 
 // Firmware Revision String characteristic
 static uint8_t       devInfoFirmwareRevProps = GATT_PROP_READ;
 static const uint8_t devInfoFirmwareRev[] = FW_VERSION_STRING;
-
-// Hardware Revision String characteristic
-static uint8_t       devInfoHardwareRevProps = GATT_PROP_READ;
-static const uint8_t devInfoHardwareRev[] = "001";
-
-// Software Revision String characteristic
-static uint8_t       devInfoSoftwareRevProps = GATT_PROP_READ;
-static const uint8_t devInfoSoftwareRev[] = "001";
 
 // Manufacturer Name String characteristic
 static uint8_t       devInfoMfrNameProps = GATT_PROP_READ;
@@ -144,20 +125,6 @@ static gattAttribute_t devInfoAttrTbl[] = {
         0,                                      /* handle */
         (uint8_t *)&devInfoService              /* pValue */
     },
-
-    // System ID Declaration
-    {
-        {ATT_BT_UUID_SIZE, characterUUID},
-        GATT_PERMIT_READ,
-        0,
-        &devInfoSystemIdProps},
-
-    // System ID Value
-    {
-        {ATT_BT_UUID_SIZE, devInfoSystemIdUUID},
-        GATT_PERMIT_READ,
-        0,
-        (uint8_t *)devInfoSystemId},
 
     // Model Number String Declaration
     {
@@ -200,34 +167,6 @@ static gattAttribute_t devInfoAttrTbl[] = {
         GATT_PERMIT_READ,
         0,
         (uint8_t *)devInfoFirmwareRev},
-
-    // Hardware Revision String Declaration
-    {
-        {ATT_BT_UUID_SIZE, characterUUID},
-        GATT_PERMIT_READ,
-        0,
-        &devInfoHardwareRevProps},
-
-    // Hardware Revision Value
-    {
-        {ATT_BT_UUID_SIZE, devInfoHardwareRevUUID},
-        GATT_PERMIT_READ,
-        0,
-        (uint8_t *)devInfoHardwareRev},
-
-    // Software Revision String Declaration
-    {
-        {ATT_BT_UUID_SIZE, characterUUID},
-        GATT_PERMIT_READ,
-        0,
-        &devInfoSoftwareRevProps},
-
-    // Software Revision Value
-    {
-        {ATT_BT_UUID_SIZE, devInfoSoftwareRevUUID},
-        GATT_PERMIT_READ,
-        0,
-        (uint8_t *)devInfoSoftwareRev},
 
     // Manufacturer Name String Declaration
     {
@@ -318,10 +257,6 @@ bStatus_t DevInfo_SetParameter(uint8_t param, uint8_t len, void *value)
 
     switch(param)
     {
-        case DEVINFO_SYSTEM_ID:
-            tmos_memcpy(devInfoSystemId, value, len);
-            break;
-
         case DEVINFO_SERIAL_NUMBER:
             if(len <= sizeof(devInfoSerialNumber) - 1)
             {
@@ -357,10 +292,6 @@ bStatus_t DevInfo_GetParameter(uint8_t param, void *value)
 
     switch(param)
     {
-        case DEVINFO_SYSTEM_ID:
-            tmos_memcpy(value, devInfoSystemId, sizeof(devInfoSystemId));
-            break;
-
         case DEVINFO_MODEL_NUMBER:
             tmos_memcpy(value, devInfoModelNumber, sizeof(devInfoModelNumber));
             break;
@@ -370,14 +301,6 @@ bStatus_t DevInfo_GetParameter(uint8_t param, void *value)
 
         case DEVINFO_FIRMWARE_REV:
             tmos_memcpy(value, devInfoFirmwareRev, sizeof(devInfoFirmwareRev));
-            break;
-
-        case DEVINFO_HARDWARE_REV:
-            tmos_memcpy(value, devInfoHardwareRev, sizeof(devInfoHardwareRev));
-            break;
-
-        case DEVINFO_SOFTWARE_REV:
-            tmos_memcpy(value, devInfoSoftwareRev, sizeof(devInfoSoftwareRev));
             break;
 
         case DEVINFO_MANUFACTURER_NAME:
@@ -418,22 +341,6 @@ static bStatus_t devInfo_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
 
     switch(uuid)
     {
-        case SYSTEM_ID_UUID:
-            // verify offset
-            if(offset >= sizeof(devInfoSystemId))
-            {
-                status = ATT_ERR_INVALID_OFFSET;
-            }
-            else
-            {
-                // determine read length
-                *pLen = MIN(maxLen, (sizeof(devInfoSystemId) - offset));
-
-                // copy data
-                tmos_memcpy(pValue, &devInfoSystemId[offset], *pLen);
-            }
-            break;
-
         case MODEL_NUMBER_UUID:
             // verify offset
             if(offset >= (sizeof(devInfoModelNumber) - 1))
@@ -479,38 +386,6 @@ static bStatus_t devInfo_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
 
                 // copy data
                 tmos_memcpy(pValue, &devInfoFirmwareRev[offset], *pLen);
-            }
-            break;
-
-        case HARDWARE_REV_UUID:
-            // verify offset
-            if(offset >= (sizeof(devInfoHardwareRev) - 1))
-            {
-                status = ATT_ERR_INVALID_OFFSET;
-            }
-            else
-            {
-                // determine read length (exclude null terminating character)
-                *pLen = MIN(maxLen, ((sizeof(devInfoHardwareRev) - 1) - offset));
-
-                // copy data
-                tmos_memcpy(pValue, &devInfoHardwareRev[offset], *pLen);
-            }
-            break;
-
-        case SOFTWARE_REV_UUID:
-            // verify offset
-            if(offset >= (sizeof(devInfoSoftwareRev) - 1))
-            {
-                status = ATT_ERR_INVALID_OFFSET;
-            }
-            else
-            {
-                // determine read length (exclude null terminating character)
-                *pLen = MIN(maxLen, ((sizeof(devInfoSoftwareRev) - 1) - offset));
-
-                // copy data
-                tmos_memcpy(pValue, &devInfoSoftwareRev[offset], *pLen);
             }
             break;
 

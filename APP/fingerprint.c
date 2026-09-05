@@ -710,6 +710,19 @@ bool fp_power_off(void)
         }
     }
     slept = (got == FP_OK && ack == FP_ACK_SUCCESS);
+#ifdef FP_FORCE_SLEEP_NOACK
+    /* 测试专用（TEST_DEFS=-DFP_FORCE_SLEEP_NOACK）：把「sleep 没被 ack」这个
+     * 概率性 race 变成必现。no-ack 会让调用方走抬指 touch-reset 恢复路径，
+     * 而那条路径正是 fp_gate_enter 忙门要保护的窗口 —— 不强制的话跑十遍
+     * 也可能一次都没进去，测出来的 PASS 毫无意义。
+     * 只影响返回值：CMD_SLEEP 照发、ack 照收，真进了 standby 也当没进，
+     * 所以最坏情况只是多跑一次无害的 power-cycle。 */
+    if (slept) {
+        PRINT("*** FP_FORCE_SLEEP_NOACK: reporting no-ack (TEST BUILD) ***\n");
+    }
+    slept = false;
+#warning "FP_FORCE_SLEEP_NOACK enabled - TEST BUILD ONLY, never ship this"
+#endif
     if (slept) {
         PRINT("R599S sleep OK, cutting VCC-MCU\n");
     } else {

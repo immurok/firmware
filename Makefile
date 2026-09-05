@@ -38,6 +38,8 @@ C_SOURCES = \
 	$(APP_DIR)/immurok_security.c \
 	$(APP_DIR)/immurok_keystore.c \
 	$(APP_DIR)/tamper.c \
+	$(APP_DIR)/factory_test.c \
+	$(APP_DIR)/qc_test.c \
 	$(APP_DIR)/ws2812.c \
 	$(APP_DIR)/immurok_slots.c \
 	$(APP_DIR)/slot_meta.c \
@@ -182,6 +184,11 @@ MCU_FLAGS = -march=rv32imac_zicsr -mabi=ilp32 -msmall-data-limit=8
 CFLAGS = $(MCU_FLAGS) $(C_DEFS) $(C_INCLUDES)
 CFLAGS += -std=gnu99 -Os -ffunction-sections -fdata-sections -fno-common
 CFLAGS += -Wall -Wno-unused-function
+
+# 测试专用注入点。正常构建和 ota/build-ota.sh 一概不传 TEST_DEFS，
+# 只有 firmware/tools/ 下的测试脚本会手工塞 -D。用来把概率性 race
+# （比如 R599S sleep no-ack）变成必现，否则「跑一遍没复现」什么都证明不了。
+CFLAGS += $(TEST_DEFS)
 ifndef RELEASE
     CFLAGS += -g
 endif
@@ -218,7 +225,7 @@ vpath %.S $(sort $(dir $(ASM_SOURCES)))
 
 # Track build flags — auto-clean when flags change
 BUILD_FLAGS_FILE = $(BUILD_DIR)/.build_flags
-CURRENT_FLAGS = $(BUILD_MODE) HW_VER=$(HW_VER) FW=$(FW_VERSION)
+CURRENT_FLAGS = $(BUILD_MODE) HW_VER=$(HW_VER) FW=$(FW_VERSION) TEST_DEFS=$(TEST_DEFS)
 $(shell mkdir -p $(BUILD_DIR))
 $(shell if [ ! -f $(BUILD_FLAGS_FILE) ] || [ "$$(cat $(BUILD_FLAGS_FILE))" != "$(CURRENT_FLAGS)" ]; then \
 	rm -f $(BUILD_DIR)/*.o; \

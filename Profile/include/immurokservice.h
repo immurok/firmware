@@ -27,6 +27,12 @@ extern "C" {
 // Command codes (v3.0 protocol — ECDH pairing)
 #define IMMUROK_CMD_GET_STATUS      0x01
 #define IMMUROK_CMD_GET_BATT_RAW    0x02    // returns [OK, mv_lo, mv_hi, pct, adc_lo, adc_hi]
+// 实际连接参数（链路层当前生效值，非 PPCP 愿望值）。
+// -> [0x03][0x00][interval:2 BE][latency:2 BE][timeout:2 BE]
+// 单位与 BLE 原生一致：interval ×1.25ms、latency 事件数、timeout ×10ms。
+// 字节序与 0xF0 PARAM_UPDATE 通知一致（BE）；响应采用 [cmd][status][data]
+// 双前缀风格（同 SLOT_STATUS，新命令一律用这个格式）。
+#define IMMUROK_CMD_GET_CONN_PARAMS 0x03
 #define IMMUROK_CMD_ENROLL_START    0x10
 #define IMMUROK_CMD_ENROLL_CANCEL  0x11
 #define IMMUROK_CMD_DELETE_FP       0x12
@@ -56,6 +62,13 @@ extern "C" {
 #define IMMUROK_CMD_SLOT_PAIR      0x3B  // 主机2 提交: [host_pub:33][proof:8]
 #define IMMUROK_CMD_SLOT_CLEAR     0x3C  // 清除调用方自己所在的槽
 
+// QC 量产自检（qc/ik1-selftest-proposal.md v2；qc-firmware qc_proto.h 对齐）
+#define IMMUROK_CMD_QC_SELFTEST    0x40  // 未配对且未过检才接受
+#define IMMUROK_NTF_QC_RESULT      0x41  // [0x41][pass][bitmap][mv:2][fw:3]
+#define IMMUROK_CMD_QC_GET         0x42  // -> [0x42][0x00][qc_done]
+#define IMMUROK_CMD_QC_CLEAR       0x43  // 返修复测清标志（仅未配对）
+#define IMMUROK_CMD_QC_SHUTDOWN    0x44  // QC 板已读结果，请设备收尾关机
+
 // Keystore commands
 #define IMMUROK_CMD_KEY_COUNT      0x60
 #define IMMUROK_CMD_KEY_READ       0x61
@@ -81,6 +94,9 @@ extern "C" {
 #define IMMUROK_RSP_SLOT_FULL       0xF5  // 两个槽都已占用
 #define IMMUROK_RSP_PIN_BAD         0xF6  // proof 不符，响应第 3 字节为剩余次数
 #define IMMUROK_RSP_PIN_NONE        0xF7  // 无有效 PIN / 已过期
+
+// QC
+#define IMMUROK_RSP_QC_REFUSED      0xF0  // 已配对/已过检，拒绝 QC 命令
 
 // Callback function types
 typedef void (*immurokCommandCB_t)(uint16_t connHandle, uint8_t *pData, uint8_t len);

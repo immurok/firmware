@@ -34,7 +34,9 @@
 #include "version.h"
 #if HAS_TAMPER_DETECT
 #include "tamper.h"
+#include "factory_test.h"
 #endif
+#include "qc_test.h"
 #if HAS_VBAT_ADC
 #include "CH59x_adc.h"
 #endif
@@ -323,6 +325,78 @@ static uint16_t fp_user_bitmap(void)
 // Called: once from init (after immurok_security_init), and from
 // EEPROM_SAVE_EVT after PAIR_CONFIRM saves the new shared_key. After
 // FACTORY_RESET we reboot, so init re-applies the (now-unpaired) state.
+/* 把 SNV 里的 bond 主记录逐条打出来（地址、类型、标志、待删标记、序号）。
+ * 2026-09-05 真机：Linux 对端 own 解绑时 ERASE_SINGLEBOND 后 bond_count 2->2，
+ * 公有地址也擦不掉；要看记录里到底存了什么才能定位。只在有日志的构建里有用。 */
+static void bond_dump(const char *tag)
+{
+    gapBondRec_t rec;
+    uint8_t i;
+    for(i = 0; i < BLE_SNV_NUM; i++) {
+        if(tmos_snv_read(mainRecordNvID(i), sizeof(rec), &rec) != SUCCESS) {
+            PRINT("b%d %s: -\n", i, tag);
+            continue;
+        }
+        PRINT("b%d %s: t%d %02X%02X%02X%02X%02X%02X f=%X d=%d s=%u\n",
+              i, tag, rec.publicAddrType,
+              rec.publicAddr[5], rec.publicAddr[4], rec.publicAddr[3],
+              rec.publicAddr[2], rec.publicAddr[1], rec.publicAddr[0],
+              rec.stateFlags, rec.bondsToDelete, (unsigned)rec.bondSeq);
+    }
+}
+
+/* 按 (类型, 地址) 精确擦一条 SNV bond，返回 bond 数是否真的减了。
+ * 三个调用点（own 解绑 / other 解绑 / 空槽回收）共用。
+ *
+ * 2026-09-05 真机：记录里的地址就是链路地址（Mac/Linux 都是公有地址、
+ * 类型 0），参数一字不差却 2->2、bondsToDelete 也不变，BOND_UPDATE 也
+ * 无效。库里有 GAPBondMgr_LinkTerm / ResolveAddr，与 TI 同源：对端**正
+ * 连着**时只做标记，链路终止事件里才真删。own 解绑原来擦完 50ms 就复位，
+ * 终止事件从没被处理 → bond 永远留着。所以 own 路径必须：擦 → 主动断链
+ * → 等 TMOS 处理完终止 → 再复位（见 FP_POWER_OFF_EVT 里的两段式）。 */
+static bool bond_erase_peer(uint8_t type, const uint8_t *addr, const char *tag)
+{
+    uint8_t eb[7];
+    uint8_t bcBefore = 0, bcAfter = 0;
+    eb[0] = type;
+    tmos_memcpy(&eb[1], addr, 6);
+    GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bcBefore);
+    GAPBondMgr_SetParameter(GAPBOND_ERASE_SINGLEBOND, sizeof(eb), eb);
+    GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bcAfter);
+    PRINT("%s: bonds %d->%d\n", tag, bcBefore, bcAfter);
+    return bcAfter < bcBefore;
+}
+
+/* 空槽收到新连接时回收该槽上一位对端残留的 SNV bond。
+ *
+ * 场景：主机 B 在槽 2 只做了 BLE bond、没做 app 配对就走了。SLOT_STATUS
+ * 只报 app 配对，app 两边都看不见这条 bond，也没有入口能清它；SNV 却已
+ * 被 A + B 占满。之后新主机 C 来槽 2 bond：ERASE_AUTO 已关（见 init），
+ * 第三条会直接失败——C 永远配不上。一个槽只该有一条合法 bond，所以
+ * 空槽来了不同对端、且 SNV 已满，就按 slot_meta 记的旧对端精确擦掉。
+ *
+ * 只在 SNV 满时动手，把误伤面压到最小：B 在 BLE bond 与 app 配对之间
+ * RPA 轮换重连（bond 数 2、地址变了）会被当作「不同对端」擦掉自己的
+ * bond——若 SDK 能按 IRK 解析 RPA，B 重新 bond 一次即可（槽仍是
+ * WAIT_FOR_REQ）；若不能，擦除是空操作，与改前一样。两种情况都不碰
+ * 另一台主机的记录。
+ *
+ * 必须在 slot_meta_set_peer() 之前调用——它会把旧地址覆盖掉。 */
+static void reclaim_stale_slot_bond(uint8_t slot, uint8_t newType,
+                                    const uint8_t *newAddr)
+{
+    uint8_t oldType, oldAddr[6];
+    if(immurok_security_slot_occupied(slot)) return;          /* 已配对槽不动 */
+    if(slot_meta_get_peer(slot, &oldType, oldAddr) != 0) return; /* 无记录 */
+    if(oldType == newType && tmos_memcmp(oldAddr, newAddr, 6)) return; /* 同一对端 */
+
+    uint8_t bc = 0;
+    GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bc);
+    if(bc < BLE_SNV_NUM) return;                               /* 还有位子，不必回收 */
+
+    bond_erase_peer(oldType, oldAddr, "reclaim");
+}
+
 static void apply_ble_pairing_mode(void)
 {
     /* 按**活动槽**决定，不是按整机。
@@ -355,12 +429,22 @@ static uint8_t s_ble_connected = 0;
 static uint8_t s_app_connected = 0;
 // Touch-reset: power cycle FP module just to send sleep and reset touch GPIO
 static uint8_t s_touch_reset = 0;
+// Touch-reset 内部重试次数。fp_power_off() 返回 slept=false 表示 R599S 没进
+// wake-on-touch standby —— 恢复流程本身失败了，直接放手就等于把传感器留在
+// 死状态（触摸中断不再触发）。重试一次完整的 power-cycle + PS_Sleep。
+static uint8_t s_touch_reset_retry = 0;
+#define FP_TOUCH_RESET_MAX_RETRY 2
 
 // PAIR_INIT received, waiting for the user to physically press the button to
 // confirm. ECDH key generation does NOT start until the button is pressed or
 // a 30s timeout fires (whichever comes first). Set by the GATT handler,
 // cleared by the button handler / timeout / disconnect / factory reset.
 static uint8_t s_pair_wait_button = 0;
+
+// 按键当前按住（BUTTON_SCAN_EVT 每次扫描直接镜像 GPIO 电平）。长按计时
+// （1s 黄灯警告 → 3s 出厂重置）期间指纹触摸必须整体屏蔽：触摸认证分支
+// 会用绿/蓝/红把黄/红警告灯盖掉，还可能顺带发解锁通知——两者都不该发生。
+static uint8_t s_btn_hold_active = 0;
 
 // Advertising phase tracking
 static uint8_t s_adv_phase = ADV_PHASE_OFF;
@@ -467,6 +551,8 @@ static uint8_t s_led_task_id;
  */
 #define LED_BLINK_EVT       0x0001
 #define LED_OFF_EVT         0x0002
+#define CASE_OPEN_POLL_EVT  0x0200   // factory hold: poll ANTI_OPEN for case closed
+#define CASE_OPEN_POLL_TICKS 320     // 200ms
 // LOCK_HOLD_EVT: scheduled on TOUCH rising edge; fires LOCK_HOLD_TICKS later.
 // If touch is still active and the timer wasn't cancelled, sends a long-press
 // lock notification to the App. Independent of the FP search state machine —
@@ -700,6 +786,19 @@ static uint16_t LED_ProcessEvent(uint8_t task_id, uint16_t events)
         s_led_color = 0;
         return events ^ LED_OFF_EVT;
     }
+#if HAS_FACTORY_TEST
+    if(events & CASE_OPEN_POLL_EVT)
+    {
+        if(g_factory_case_open)
+        {
+            if(!ANTI_OPEN_ReadPin())
+                factory_case_open_exit();
+            else
+                tmos_start_task(s_led_task_id, CASE_OPEN_POLL_EVT, CASE_OPEN_POLL_TICKS);
+        }
+        return events ^ CASE_OPEN_POLL_EVT;
+    }
+#endif
     if(events & LED_ACCESS_OFF_EVT)
     {
         // Bulk-read access indicator's trailing-edge off. Touches only R+G
@@ -1064,9 +1163,9 @@ static uint8_t scanRspData[] = {
     // connection interval range
     0x05, // length of this data
     GAP_ADTYPE_SLAVE_CONN_INTERVAL_RANGE,
-    LO_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL), // 100ms
+    LO_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL), // 24 × 1.25ms = 30ms
     HI_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL),
-    LO_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL), // 1s
+    LO_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL), // 48 × 1.25ms = 60ms
     HI_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL),
 
     // service UUIDs
@@ -1094,10 +1193,23 @@ static uint8_t advertData[] = {
     0x03, // length of this data
     GAP_ADTYPE_APPEARANCE,
     LO_UINT16(GAP_APPEARE_HID_KEYBOARD),
-    HI_UINT16(GAP_APPEARE_HID_KEYBOARD)};
+    HI_UINT16(GAP_APPEARE_HID_KEYBOARD),
 
-// Device name attribute value
+    // manufacturer data: CID 0xFFFF(测试保留值) + type 0x01 + flags
+    // flags bit0 = qc_done（QC 板据此只连未质检设备）
+    0x05, // length of this data
+    GAP_ADTYPE_MANUFACTURER_SPECIFIC,
+    0xFF, 0xFF,   // company id
+    0x01,         // immurok 内部 type
+    0x00};        // flags，开机由 qc_done_read() 刷新
+
+#define ADV_QC_FLAGS_IDX  (sizeof(advertData) - 1)
+
+// Device name attribute value（GAP Device Name 特征）。槽 2 带 "(2)" 后缀，
+// 让用户在系统蓝牙列表里分得清是哪个身份；广播/扫描响应里的名字不变
+// （scanRspData），两台主机扫到的都还是 "immurok IK-1"。
 static CONST uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "immurok IK-1";
+static CONST uint8_t attDeviceName2[GAP_DEVICE_NAME_LEN] = "immurok IK-1 (2)";
 
 // HID Dev configuration
 static hidDevCfg_t hidEmuCfg = {
@@ -1359,29 +1471,51 @@ void HidEmu_Init()
     immurok_keystore_init();
 
 #if HAS_TAMPER_DETECT
-    // Resume an interrupted tamper wipe: if case_opened is still set, a previous
-    // wipe lost power mid-way — finish it now (never returns). Boot does NOT
-    // check the live ANTI_OPEN level, so an open case during assembly/flashing
-    // (static high, no rising edge) boots normally.
+    // (a) Resume an interrupted tamper wipe: if case_opened is still set, a
+    // previous wipe lost power mid-way — finish it now (never returns). This
+    // is unconditional: factory_reset already cleared `paired`, so gating on
+    // tamper_should_wipe() here would leave the second half undone.
     if(tamper_is_flagged()) {
         PRINT("TAMPER: case_opened set at boot, resuming wipe\n");
         tamper_run_cleanup();
+    }
+    // (b) Static level. Opening the case with SW2 off powers the board up via
+    // Q2/D1, so PB10 is already high when we boot and no rising edge ever
+    // fires. Sample twice 5ms apart to ride out the VSUPPLY ramp through D1.
+    // Unpaired devices (assembly / flashing with the lid off) are ignored by
+    // tamper_should_wipe(), so no production-line exception is needed here.
+    if(ANTI_OPEN_ReadPin()) {
+        DelayMs(5);
+        if(ANTI_OPEN_ReadPin()) {
+            if(tamper_should_wipe()) {
+                PRINT("TAMPER: case open at boot, paired -> wipe\n");
+                tamper_run_cleanup();
+            }
+            factory_case_open_enter();   // unpaired: hold, no advertising
+        }
     }
 #endif
 
     // Setup the GAP Peripheral Role Profile
     {
         uint8_t initial_advertising_enable = TRUE;
+#if HAS_FACTORY_TEST
+        if(g_factory_case_open) initial_advertising_enable = FALSE;
+#endif
 
         // Set the GAP Role Parameters
         GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &initial_advertising_enable);
 
+        advertData[ADV_QC_FLAGS_IDX] = qc_done_read() ? 0x01 : 0x00;
         GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
         GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData), scanRspData);
     }
 
     // Set the GAP Characteristics
-    GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, (void *)attDeviceName);
+    // 按标记页直接读活动槽（immurok_slots_active），不依赖 security init 顺序。
+    GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN,
+                     (void *)((immurok_slots_active() == IMMUROK_SLOT_2) ? attDeviceName2
+                                                                       : attDeviceName));
 
     // Setup the GAP Bond Manager
     {
@@ -1393,6 +1527,14 @@ void HidEmu_Init()
         GAPBondMgr_SetParameter(GAPBOND_PERI_MITM_PROTECTION, sizeof(uint8_t), &mitm);
         GAPBondMgr_SetParameter(GAPBOND_PERI_IO_CAPABILITIES, sizeof(uint8_t), &ioCap);
         GAPBondMgr_SetParameter(GAPBOND_PERI_BONDING_ENABLED, sizeof(uint8_t), &bonding);
+        // SNV 满（BLE_SNV_NUM=2，稳态 A+B 占满）时 SDK 默认 ERASE_AUTO=1
+        // 是「全擦」：第三条 bond 进来会把还在用的主机一起清掉——那台
+        // 主机手里的 LTK 设备侧没了，重连加密失败；它的槽又是 NO_PAIRING
+        // 不许重新 bond，只剩 factory reset。关掉：满了就让新 bond 失败，
+        // 失败可见、在用主机不受伤。残留 bond 的回收见
+        // reclaim_stale_slot_bond()。
+        uint8_t eraseAuto = 0;
+        GAPBondMgr_SetParameter(GAPBOND_ERASE_AUTO, sizeof(uint8_t), &eraseAuto);
         // Pairing mode is set by apply_ble_pairing_mode() based on whether
         // the device already has a saved ECDH shared_key — once claimed, new
         // BLE bond requests are refused so a thief can't bond it elsewhere.
@@ -1401,11 +1543,18 @@ void HidEmu_Init()
     {
         // Preferred connection parameters (advertised to central)
         gapPeriConnectParams_t ConnectParams;
-        ConnectParams.intervalMin = DEFAULT_DESIRED_MIN_CONN_INTERVAL;  // 100ms
-        ConnectParams.intervalMax = DEFAULT_DESIRED_MAX_CONN_INTERVAL;  // 200ms
+        ConnectParams.intervalMin = DEFAULT_DESIRED_MIN_CONN_INTERVAL;  // 24 × 1.25ms = 30ms
+        ConnectParams.intervalMax = DEFAULT_DESIRED_MAX_CONN_INTERVAL;  // 48 × 1.25ms = 60ms
         ConnectParams.latency = DEFAULT_DESIRED_SLAVE_LATENCY;          // 20
-        ConnectParams.timeout = DEFAULT_DESIRED_CONN_TIMEOUT;           // 5000ms
+        ConnectParams.timeout = DEFAULT_DESIRED_CONN_TIMEOUT;           // 600 × 10ms = 6000ms
         GGS_SetParameter(GGS_PERI_CONN_PARAM_ATT, sizeof(gapPeriConnectParams_t), &ConnectParams);
+    }
+    {
+        // GAP Appearance 特征与广播数据保持一致（0x03C1 HID Keyboard）。
+        // 不设置的话 GATT 读出来是栈默认 0x0000 Unknown，与 ADV 里声明的
+        // appearance 自相矛盾。
+        uint16_t appearance = GAP_APPEARE_HID_KEYBOARD;
+        GGS_SetParameter(GGS_APPEARANCE_ATT, sizeof(uint16_t), &appearance);
     }
     // Setup Battery Characteristic Values
     {
@@ -1476,6 +1625,23 @@ void HidEmu_Init()
 
 #if HAS_TAMPER_DETECT
 /*********************************************************************
+ * @fn      tamper_should_wipe
+ *
+ * @brief   Tamper policy gate. Any slot paired -> wipe. Uses is_paired()
+ *          (either slot), not active_slot_paired(): a device parked on an
+ *          empty slot still holds the other slot's keys and fingerprints.
+ *          Keystore entries only exist alongside a pairing, so an unpaired
+ *          device has nothing to protect and tamper is ignored.
+ */
+int tamper_should_wipe(void)
+{
+    uint8_t s1 = immurok_security_slot_occupied(IMMUROK_SLOT_1) ? 1 : 0;
+    uint8_t s2 = immurok_security_slot_occupied(IMMUROK_SLOT_2) ? 1 : 0;
+    PRINT("TAMPER: should_wipe? slot1=%d slot2=%d\n", s1, s2);
+    return s1 || s2;
+}
+
+/*********************************************************************
  * @fn      tamper_run_cleanup
  *
  * @brief   Wipe everything, then halt blinking red until power cycle.
@@ -1535,6 +1701,73 @@ __attribute__((noreturn)) void tamper_run_cleanup(void)
     }
 }
 #endif
+
+#if HAS_FACTORY_TEST
+/*********************************************************************
+ * Factory self-test glue (state lives in factory_test.c)
+ */
+void HidEmu_CaseOpenHold(void)
+{
+    uint8_t off = FALSE;
+    tmos_stop_task(hidEmuTaskId, SLOW_ADV_EVT);
+    GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &off);
+    s_adv_phase = ADV_PHASE_OFF;
+    if(s_ble_connected) GAPRole_TerminateLink(hidEmuConnHandle);   // hold = no host
+#if HAS_RGB_LED
+    led_blink_start_ex('R', 1600, 1600);   // red 1s on / 1s off
+#endif
+    tmos_start_task(s_led_task_id, CASE_OPEN_POLL_EVT, CASE_OPEN_POLL_TICKS);
+}
+
+void HidEmu_CaseOpenResume(void)
+{
+    tmos_stop_task(s_led_task_id, CASE_OPEN_POLL_EVT);
+#if HAS_RGB_LED
+    led_stop();   // so adv_restart_fast_cycle's led_blink_start takes effect
+#endif
+    adv_restart_fast_cycle();
+}
+
+#endif // HAS_FACTORY_TEST
+
+uint16_t HidEmu_LastBattMv(void)
+{
+#if HAS_VBAT_ADC
+    return s_last_batt_mv;
+#else
+    return 3700;
+#endif
+}
+
+int HidEmu_IsConnected(void)
+{
+    return s_ble_connected ? 1 : 0;
+}
+
+// 刷新广播 manufacturer data 里的 qc_done 位（QC_CLEAR 后立即生效）
+void HidEmu_QcAdvFlagUpdate(uint8_t qc_done)
+{
+    advertData[ADV_QC_FLAGS_IDX] = qc_done ? 0x01 : 0x00;
+    GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
+}
+
+// QC 失败停机前：断链 + 停广播（"蓝牙关闭"）。
+void HidEmu_QcBleOff(void)
+{
+    uint8_t off = FALSE;
+    if(s_ble_connected) GAPRole_TerminateLink(hidEmuConnHandle);
+    GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &off);
+    s_adv_phase = ADV_PHASE_OFF;
+    tmos_stop_task(hidEmuTaskId, SLOW_ADV_EVT);
+}
+
+/* 长操作（ECDH / 签名）显式要参数：用户动作，允许重新开放一轮请求
+ * （计数清零后再受上限约束），即便之前已放弃或被拒绝。 */
+static void param_update_kick(void)
+{
+    s_param_update_retries = 0;
+    tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+}
 
 /*********************************************************************
  * @fn      HidEmu_ProcessEvent
@@ -1610,7 +1843,18 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             req_latency = DEFAULT_DESIRED_SLAVE_LATENCY;
             retry_delay = PARAM_UPDATE_RETRY_DELAY;
         }
-        s_param_update_retries++;
+        if(!s_post_override_retry_armed)
+        {
+            // 常规轮询受上限约束；post-override 支路自带 POST_OVERRIDE_RETRY_MAX。
+            uint8_t max = (req_latency == 0) ? PARAM_UPDATE_PHASE1_MAX
+                                             : PARAM_UPDATE_PHASE2_MAX;
+            if(s_param_update_retries >= max)
+            {
+                PRINT("Param update: giving up (%d)\n", s_param_update_retries);
+                return (events ^ START_PARAM_UPDATE_EVT);
+            }
+            s_param_update_retries++;
+        }
         PRINT("Requesting param update (attempt %d): interval=%d-%d, latency=%d, timeout=%d\n",
               s_param_update_retries,
               DEFAULT_DESIRED_MIN_CONN_INTERVAL, DEFAULT_DESIRED_MAX_CONN_INTERVAL,
@@ -1650,6 +1894,9 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
     if(events & SLOW_ADV_EVT)
     {
+#if HAS_FACTORY_TEST
+        if(g_factory_case_open || g_qc_finished) return (events ^ SLOW_ADV_EVT);   // hold/qc-done: stay off
+#endif
         if(s_adv_phase == ADV_PHASE_FAST)
         {
             // FAST → SLOW: 500ms ADV interval, LED 0.5s on / 10s off
@@ -1707,7 +1954,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         if(s_ota_active) return (events ^ BUTTON_SCAN_EVT);
 
         uint8_t btn = (BTN_ReadPin() == 0);  // Active low
-
+        s_btn_hold_active = btn;  // 镜像给 TOUCH_SCAN_EVT 的触摸屏蔽用
         static uint8_t lastBtn = 0;
         static uint32_t pressStart = 0;
         // 0=idle/no-warning, 1=≥1s yellow warning, 2=≥3s red triggered (reboot pending)
@@ -1719,6 +1966,9 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             pressStart = TMOS_GetSystemClock();
             btnStage = 0;
             // Restart fast advertising if in slow/deep-sleep phase
+#if HAS_FACTORY_TEST
+            if(g_factory_case_open) { /* hold: no adv restart */ } else
+#endif
             if(s_adv_phase >= ADV_PHASE_SLOW) {
                 adv_restart_fast_cycle();
             }
@@ -1806,6 +2056,10 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     uint8_t err[2] = { IMMUROK_CMD_PAIR_INIT, SEC_ERR_INTERNAL };
                     ImmurokService_SendResponse(err, 2);
                 }
+#if HAS_FACTORY_TEST
+            } else if(elapsed < 1000 && g_factory_case_open) {
+                PRINT("Short press ignored (case-open hold)\n");
+#endif
             } else if(elapsed < 1000) {
                 // Short press: full FP sensor reset to recover from stuck
                 // states (e.g., previous power-off skipped PS_Sleep so the
@@ -1818,10 +2072,24 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 //   3. ADV restart from slow phase already handled at
                 //      press-start.
                 PRINT("Short press: FP touch reset + batt refresh\n");
+                // 按键是最后的逃生口，必须独占 UART。先停掉可能还在跑的
+                // 搜索 / 异步 PS_Sleep：否则 fp_power_on() 之后它们会立刻
+                // 插进 GET_IMAGE，把下面 touch-reset 的 0x55 等待和 CMD_SLEEP
+                // 再撞一次——按几次都救不回来的直接原因。
+                s_search_active = 0;
+                s_search_substate = 0;
+                s_wait_finger_lift = 0;
+                s_sleep_retry_active = 0;
+                s_sleep_retry_substate = 0;
+                tmos_stop_task(hidEmuTaskId, FP_SEARCH_EVT);
+                tmos_stop_task(hidEmuTaskId, FP_AUTH_EVT);
+                tmos_stop_task(hidEmuTaskId, FP_WAKE_DONE_EVT);
+                tmos_stop_task(s_led_task_id, FP_SLEEP_RETRY_EVT);
                 if(fp_is_powered()) {
                     fp_finish_off();
                 }
                 s_touch_reset = 1;
+                s_touch_reset_retry = 0;
                 s_pending_batt_check = 1;
                 fp_power_on();
                 s_fp_power_on_tick = RTC_GetCycle32k();
@@ -1863,7 +2131,12 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 // Skip - enrollment handles touch internally
             }
             else if(s_search_active) {
-                // Skip - search already in progress
+                // 搜索已在跑，这一次触摸不另开搜索——但也不能就这么丢掉。
+                // 一旦搜索状态机因为 UART 撞车 / 被别的路径切电而卡住，
+                // s_search_active 会滞留为 1，之后每一次触摸都在这里被静默
+                // 吞掉，用户看到的就是「怎么按都没反应」。重排一次轮询，
+                // 搜索一结束就能接上（100ms 周期，相对 FP 的 30mA 可忽略）。
+                tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 160);  // 100ms
             }
             else if(s_sleep_retry_active) {
                 // Async PS_Sleep retry is in flight (after a no-match search
@@ -1882,6 +2155,31 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             else if(s_wait_finger_lift) {
                 // Wait for finger to be lifted before allowing new search
                 tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 48);  // poll 30ms
+            }
+            /* 配对等待按键（白灯慢闪）/ 按键长按计时（黄→红警告）期间，
+             * 指纹触摸整体屏蔽：认证分支会用绿/蓝/红盖掉流程指示灯，
+             * 还会附带发解锁通知、arm 锁屏长按计时——配对/重置流程中
+             * 这些全是异常行为。屏蔽 = 只复位 DETECT latch（不复位的话
+             * 下次触摸不再产生 IRQ），LED 一概不碰，归各自流程所有。
+             * 放在上面几个「流程已在跑」分支之后：slot2 登记的指纹门
+             * 搜索还在 WAIT_LIFT 时不能被这里的 touch-reset 切电。 */
+            else if(s_pair_wait_button || s_btn_hold_active) {
+                PRINT("Touch ignored: %s\n",
+                      s_pair_wait_button ? "pair-wait" : "button-hold");
+                s_wait_finger_lift = 1;
+                s_touch_reset = 1;
+                s_touch_reset_retry = 0;
+                if(!fp_is_powered()) {
+                    fp_power_on();
+                    s_fp_power_on_tick = RTC_GetCycle32k();
+                    tmos_start_task(hidEmuTaskId, FP_WAKE_DONE_EVT, 48);
+                } else {
+                    // fp_power_off 内部完成 CMD_SLEEP+ACK+清理；不可先发
+                    // fp_sleep（双 CMD_SLEEP 嵌套 TMOS_SystemProcess 会爆栈）
+                    fp_power_off();
+                    s_touch_reset = 0;
+                    tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 160);
+                }
             }
             // 双主机例外（同下面 !s_app_connected 那道门，两道必须一起放行）：
             // 停在空槽时根本没有任何 BLE 连接 —— 没人 bond 过那个地址 ——
@@ -1907,6 +2205,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 #endif
                 // Power cycle FP module to reset latched touch GPIO
                 s_touch_reset = 1;
+                s_touch_reset_retry = 0;
                 if(!fp_is_powered()) {
                     fp_power_on();
                     s_fp_power_on_tick = RTC_GetCycle32k();
@@ -1950,6 +2249,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 // a sleep command; without this reset, subsequent touches
                 // won't generate a rising-edge IRQ.
                 s_touch_reset = 1;
+                s_touch_reset_retry = 0;
                 if(!fp_is_powered()) {
                     fp_power_on();
                     s_fp_power_on_tick = RTC_GetCycle32k();
@@ -2037,6 +2337,29 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         // Touch-reset path: module was powered only to send sleep and
         // reset the touch GPIO.  Wait for 0x55, send sleep, power off.
         if(s_touch_reset) {
+#ifdef FP_TEST_TOUCH_RESET_HOLD_MS
+            /* 测试专用（TEST_DEFS=-DFP_TEST_TOUCH_RESET_HOLD_MS=4000）：
+             * 把 touch-reset 窗口从 30-200ms 撑到几秒，好让第 2 个
+             * AUTH_REQUEST 必然落进来。正常构建下这个窗口太窄，靠人手抬指
+             * 的时机去碰它纯属撞运气 —— 撞不到就跑出一个「全 PASS 但根本
+             * 没执行到修复代码」的假阳性。配 FP_FORCE_SLEEP_NOACK 使用。 */
+            /* 只套第一次尝试：重试也套的话 4s×3 = 12s 触摸全被
+             * TOUCH_SCAN_EVT 的 s_touch_reset 门吞掉，测出来的「迟滞」
+             * 全是脚手架自己造的，跟真实固件（3×140ms≈0.5s）差 20 倍，
+             * 反而掩盖了真实手感。窗口撑开的目的只是让第 2 个
+             * AUTH_REQUEST 撞得进来，第一次尝试就够了。 */
+            if(s_touch_reset_retry == 0)
+            {
+                uint32_t held_ms = (RTC_GetCycle32k() - s_fp_power_on_tick) / 33;
+                if(held_ms < (FP_TEST_TOUCH_RESET_HOLD_MS)) {
+                    tmos_start_task(hidEmuTaskId, FP_WAKE_DONE_EVT, 160);  // 100ms
+                    return (events ^ FP_WAKE_DONE_EVT);
+                }
+                PRINT("*** FP_TEST_TOUCH_RESET_HOLD: window held %ums (TEST BUILD) ***\n",
+                      (unsigned)held_ms);
+            }
+#warning "FP_TEST_TOUCH_RESET_HOLD_MS enabled - TEST BUILD ONLY, never ship this"
+#endif
             bool got_ready = false;
             int b;
             while((b = uart_rx_pop()) >= 0) {
@@ -2056,7 +2379,24 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             // dispatch overflows CH592F's 512B stack and reboots the device
             // (observed 2026-05-11: PRINT output garbled mid-line, WDT reset).
             PRINT("Touch reset: power off\n");
-            fp_power_off();
+            bool reset_slept = fp_power_off();
+            // slept=false → R599S 没进 wake-on-touch standby，恢复流程本身
+            // 失败了。直接放手 = 传感器留在死状态（触摸中断不再触发），正是
+            // 「按按键也救不回来」的最后一环。重跑完整 power-cycle + PS_Sleep。
+            if(!reset_slept && s_touch_reset_retry < FP_TOUCH_RESET_MAX_RETRY) {
+                s_touch_reset_retry++;
+                PRINT("Touch reset: sleep no-ack, retry %d/%d\n",
+                      s_touch_reset_retry, FP_TOUCH_RESET_MAX_RETRY);
+                fp_power_on();
+                s_fp_power_on_tick = RTC_GetCycle32k();
+                tmos_start_task(hidEmuTaskId, FP_WAKE_DONE_EVT, 48);  // 30ms
+                return (events ^ FP_WAKE_DONE_EVT);  // s_touch_reset 保持 1
+            }
+            if(!reset_slept) {
+                PRINT("Touch reset: still no-ack after %d retries, giving up\n",
+                      s_touch_reset_retry);
+            }
+            s_touch_reset_retry = 0;
             s_touch_reset = 0;
             s_wait_finger_lift = 0;
             if(s_pending_batt_check) {
@@ -2201,6 +2541,14 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
     {
         if(s_ota_active) return (events ^ FP_AUTH_EVT);
 
+        // 纵深防御（配 fp_gate_enter 的同名门）：touch-reset / 异步 PS_Sleep
+        // 期间 UART 归它们所有，开搜索必然撞车并把传感器留在非 standby。
+        if(s_touch_reset || s_sleep_retry_active) {
+            PRINT("FP_AUTH_EVT: FP busy (reset=%d sleep=%d), skip\n",
+                  s_touch_reset, s_sleep_retry_active);
+            return (events ^ FP_AUTH_EVT);
+        }
+
         // Module should already be awake at this point
         if(!fp_is_powered())
         {
@@ -2243,6 +2591,17 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
         if(!s_search_active)
         {
+            return (events ^ FP_SEARCH_EVT);
+        }
+
+        // 同上的忙门。这里额外把 s_search_active 清掉：否则搜索状态机被
+        // touch-reset / 异步 sleep 切电后会滞留为 1，TOUCH_SCAN_EVT 的
+        // 「search already in progress」分支就会把之后每一次触摸静默吞掉。
+        if(s_touch_reset || s_sleep_retry_active) {
+            PRINT("FP_SEARCH_EVT: FP busy (reset=%d sleep=%d), abort search\n",
+                  s_touch_reset, s_sleep_retry_active);
+            s_search_active = 0;
+            s_search_substate = 0;
             return (events ^ FP_SEARCH_EVT);
         }
 
@@ -2694,7 +3053,12 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     // white-then-off or hit its suppressed-cleanup path —
                     // LED should be off. Defensive clear in case anything
                     // re-armed the persistent red in between.
-                    led_stop();
+                    // 例外：pair-wait 白闪仍在等按键，恢复而非熄灭。
+                    if(s_pair_wait_button) {
+                        led_blink_start_ex('W', 320, 320);
+                    } else {
+                        led_stop();
+                    }
 #endif
                     fp_async_off_start();
                     tmos_start_task(hidEmuTaskId, TOUCH_SCAN_EVT, 48);
@@ -2740,7 +3104,15 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     // the non-gate ack==0x00 branch above).
                     s_lock_pending = 0;
                     tmos_stop_task(s_led_task_id, LOCK_HOLD_EVT);
-                    led_stop();
+                    if(s_pair_wait_button) {
+                        /* slot2 登记：指纹门通过时白闪已启动，但手指还压在
+                         * 传感器上，这里抬指若照常 led_stop 会把它杀掉——
+                         * 用户看到的就是「第二台 host 配对从不闪白灯」。
+                         * 恢复白闪，参数与 PAIR_INIT 启动处一致。 */
+                        led_blink_start_ex('W', 320, 320);
+                    } else {
+                        led_stop();
+                    }
 #endif
                     if(!s_enroll_active) {
                         bool slept = fp_power_off();
@@ -2758,6 +3130,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                             PRINT("post-lift touch recovery (DETECT=%d slept=%d)\n",
                                   TOUCH_ReadPin(), slept);
                             s_touch_reset = 1;
+                            s_touch_reset_retry = 0;
                             fp_power_on();
                             s_fp_power_on_tick = RTC_GetCycle32k();
                             tmos_start_task(hidEmuTaskId,
@@ -3046,18 +3419,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                         {
                             uint8_t ptype, paddr[6];
                             if(slot_meta_get_peer(target, &ptype, paddr) == 0) {
-                                uint8_t eb[7];
-                                eb[0] = ptype;
-                                tmos_memcpy(&eb[1], paddr, 6);
-                                uint8_t bcBefore = 0, bcAfter = 0;
-                                GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bcBefore);
-                                GAPBondMgr_SetParameter(GAPBOND_ERASE_SINGLEBOND, sizeof(eb), eb);
-                                GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bcAfter);
-                                PRINT("SLOT_CLEAR other: SNV reclaim bond_count %d->%d\n", bcBefore, bcAfter);
-                                if(bcAfter >= bcBefore) {
-                                    PRINT("SLOT_CLEAR other: WARNING SNV reclaim may have failed "
-                                          "(peer addr may be RPA, not identity addr)\n");
-                                }
+                                bond_erase_peer(ptype, paddr, "CLR other");
                             } else {
                                 PRINT("SLOT_CLEAR other: no stored peer for slot %d, skip SNV reclaim\n",
                                       target);   /* 迁移降级,spec §7.3 */
@@ -3899,6 +4261,31 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             ota_abort_to_idle();
             return (events ^ FP_POWER_OFF_EVT);
         }
+        // own SLOT_CLEAR 阶段 1：应答已发出。擦本槽对端的 bond（连着时只是
+        // 标记）、主动断链，再等 800ms 让 TMOS 处理链路终止（真删发生在此）。
+        if(s_factory_reset_pending == 2) {
+            uint8_t ptype, paddr[6];
+            uint8_t slot = immurok_security_active_slot();
+            s_factory_reset_pending = 3;
+            if(slot_meta_get_peer(slot, &ptype, paddr) == 0) {
+                bond_erase_peer(ptype, paddr, "CLR own");
+            }
+            if(s_ble_connected) GAPRole_TerminateLink(hidEmuConnHandle);
+            tmos_start_task(hidEmuTaskId, FP_POWER_OFF_EVT, MS1_TO_SYSTEM_TIME(800));
+            return (events ^ FP_POWER_OFF_EVT);
+        }
+        // own SLOT_CLEAR 阶段 2：看回收结果，复位换地址。
+        if(s_factory_reset_pending == 3) {
+            uint8_t bc = 0;
+            GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bc);
+            bond_dump("term");
+            PRINT("CLR own: bonds after term=%d\n", bc);
+#if HAS_RGB_LED
+            led_stop();
+#endif
+            DelayMs(50);
+            SYS_ResetExecute();
+        }
         // Deferred factory reset: erase bonds + system reset
         // (OK response already sent, 200ms delay for BLE transmission)
         if(s_factory_reset_pending) {
@@ -3923,9 +4310,27 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         // (a) requires async VCC cut. (b) only requires gate cleanup.
         // Both cases share the same gate-cleanup logic, gated on the time
         // elapsed since the gate was opened (s_pending_cmd_start).
-        if(fp_is_powered() && !s_enroll_active) {
+        /* touch-reset 期间模块归恢复流程所有，它自己会 PS_Sleep + 断电。
+         * 这里再插一脚 fp_async_off_start() 会把 VCC 从它脚下抽走：
+         * 之后 fp_power_off() 撞上 !s_powered_on 早退返回 true，恢复逻辑
+         * 收到一个「睡好了」的假信号（其实只是电已经断了），重试永远不会
+         * 触发。1.7.7 实测（16:34:16.091）确实打进来了，那次靠异步 sleep
+         * 恰好成功才没出事 —— 不能留着靠运气。
+         * 窗口本来只有 ~330ms 够不到 500ms 空闲计时器，但 no-ack 重试最多
+         * 跑 3 轮 ≈ 900ms，真实固件里也够得着。 */
+        if(fp_is_powered() && !s_enroll_active && !s_touch_reset) {
             PRINT("FP idle timeout - async power off\n");
             fp_async_off_start();
+        } else if(s_touch_reset) {
+            /* touch-reset 自己会断电。但这个空闲看门狗是模块「永远开着」的
+             * 唯一兜底，光跳过就等于把事件吃掉 —— touch-reset 万一卡死，
+             * 30mA 会一直烧到按按键为止。所以要把事件续上。
+             * 有 pending gate 时下面的分支会用剩余 gate 时间自己续，
+             * 这里只管没有 gate 的情况，避免两处互相覆盖。 */
+            PRINT("FP idle timeout deferred (touch-reset owns module)\n");
+            if(s_pending_cmd == 0 && !immurok_security_has_pending_auth()) {
+                fp_reset_power_timer();
+            }
         }
 
         // Gate-pending decision: re-arm watchdog if still within the window,
@@ -4104,7 +4509,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     // (proceed) or clears it (reject); GAP_LINK_TERMINATED
                     // clears it too, so a disconnect mid-wait cannot strand it.
                     s_long_op_busy = 1;
-                    tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                    param_update_kick();
                     PRINT("Long op: timeout=%dms too short, requesting update\n",
                           s_conn_timeout * 10);
                 }
@@ -4506,11 +4911,28 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
  */
 static void hidEmu_ProcessTMOSMsg(tmos_event_hdr_t *pMsg)
 {
-    switch(pMsg->event)
+    // 本任务没有订阅任何 TMOS 消息，能到这里的只有库主动投递的。已知一条：
+    // 0xA2 = GAPRole_PeripheralConnParamUpdateReq 的 L2CAP 信令响应。
+    // 2026-09-05 真机核对的布局（与 TI l2capSignalEvent_t 同源）：
+    //   hdr(2) connHandle(2) id(1) [5]=0x13 pad(2) cmd(4 字节对齐 → 偏移 8)
+    // cmd 联合体里有 32 位成员所以 4 字节对齐；偏移 6-7 是填充垃圾（实测每次
+    // 不同：07 00 / 05 00 / 00 20 / 65 BE），**不要**从那里取值。偏移 8 起是
+    // l2capParamUpdateRsp_t.result：0 接受 / 1 拒绝。主机「接受」不等于参数
+    // 已生效——那要等控制器的更新完成回调；Linux 实测接受后不生效也有，
+    // 仍受上限约束。
+    const uint8_t *b = (const uint8_t *)pMsg;
+    if(pMsg->event == 0xA2 && b[5] == 0x13)
     {
-        default:
-            break;
+        uint16_t result = b[8] | ((uint16_t)b[9] << 8);
+        PRINT("L2CAP param rsp: %d\n", result);
+        if(result == 1)
+        {
+            s_param_update_retries = PARAM_UPDATE_GIVEN_UP;
+            tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+        }
+        return;
     }
+    PRINT("msg%02X\n", pMsg->event);
 }
 
 /*********************************************************************
@@ -4607,6 +5029,18 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
             break;
 
         case GAPROLE_CONNECTED:
+            // 参数更新请求被主机明确拒绝（或控制器报错）：停下，不再等上限。
+            // 成功的那条走 hiddev.c 的 hidDevParamUpdateCB，这里只看失败。
+            if(pEvent->gap.opcode == GAP_LINK_PARAM_UPDATE_EVENT)
+            {
+                gapLinkUpdateEvent_t *ev = (gapLinkUpdateEvent_t *)pEvent;
+                if(ev->status != SUCCESS)
+                {
+                    PRINT("Param update rejected: %d\n", ev->status);
+                    s_param_update_retries = PARAM_UPDATE_GIVEN_UP;
+                    tmos_stop_task(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                }
+            }
             if(pEvent->gap.opcode == GAP_LINK_ESTABLISHED_EVENT)
             {
                 gapEstLinkReqEvent_t *event = (gapEstLinkReqEvent_t *)pEvent;
@@ -4630,6 +5064,8 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 // rotating addresses can force 0x6300 page writes, but only
                 // that page (never SSH keys), and dedup prevents writes on
                 // unchanged address (spec §5.3).
+                reclaim_stale_slot_bond(immurok_security_active_slot(),
+                                        event->devAddrType, event->devAddr);
                 slot_meta_set_peer(immurok_security_active_slot(),
                                     event->devAddrType, event->devAddr);
                 tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, START_PARAM_UPDATE_EVT_DELAY);
@@ -4678,6 +5114,9 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
             {
                 PRINT("Advertising timeout (phase %d)\n", s_adv_phase);
                 // Initial advertising timed out (no bond) → start fast cycle
+#if HAS_FACTORY_TEST
+                if(g_factory_case_open || g_qc_finished) { /* hold/qc-done: stay off */ } else
+#endif
                 if(s_adv_phase == ADV_PHASE_OFF)
                 {
                     s_adv_phase = ADV_PHASE_FAST;
@@ -4695,6 +5134,9 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 s_touch_reset = 0;
                 PRINT("Disconnected.. Reason:%x\n", pEvent->linkTerminate.reason);
 #if HAS_RGB_LED
+#if HAS_FACTORY_TEST
+                if(g_factory_case_open) led_blink_start_ex('R', 1600, 1600); else
+#endif
                 led_blink_start(adv_led_color());
 #endif
                 // Clear ALL session state for clean reconnect
@@ -4711,7 +5153,8 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 s_param_replay_done = 0;
                 tmos_stop_task(s_led_task_id, PARAM_NOTIFY_EVT);
                 extern volatile uint8_t g_sleep_inhibit;
-                g_sleep_inhibit = 0;  // Reset all sleep inhibit holds on disconnect
+                // QC 自检持有一个 ref，测试中的断链不能把它清掉
+                g_sleep_inhibit = g_qc_running ? 1 : 0;
                 s_long_op_param_requested = 0;
                 s_long_op_wait_start = 0;
                 s_long_op_busy = 0;
@@ -4779,7 +5222,17 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
             {
                 PRINT("Advertising timeout..\n");
             }
-            // Enable advertising
+            // Enable advertising. Unconditional re-enable on every WAITING
+            // event — including the END_DISCOVERABLE_DONE that our own
+            // "adv off" produces — so the factory hold / self-test must opt
+            // out here or the radio comes straight back on.
+#if HAS_FACTORY_TEST
+            if(g_factory_case_open || g_qc_finished)
+            {
+                PRINT("ADV: re-enable skipped (hold/qc-done)\n");
+            }
+            else
+#endif
             {
                 uint8_t adv_enable = TRUE;
                 GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &adv_enable);
@@ -4950,7 +5403,7 @@ static void fp_gate_enter(void)
     // Done now (before the touch) so params are likely accepted by the time
     // FP_GATE_EXEC_EVT fires, avoiding a blocking wait there.
     if(!s_latency_accepted) {
-        tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+        param_update_kick();
     }
 
     // LED tells the user we're waiting for their finger.
@@ -4960,7 +5413,23 @@ static void fp_gate_enter(void)
     fp_led_flash(FP_LED_GREEN, 20, 0);
 #endif
 
-    if(fp_is_powered()) {
+    /* 「模块还开着」不等于「模块空闲」。1.3.9 (a58a652) 加的复用分支只看
+     * fp_is_powered()，于是这三种「VCC 开着但 UART 已有主」的状态下，一个
+     * AUTH_REQUEST 就能抢跑一次搜索：
+     *   (1) s_touch_reset     —— 模块只是为了补发 PS_Sleep 才上电
+     *   (2) s_sleep_retry_active —— 异步 PS_Sleep 重试中，正在发 0x33
+     *   (3) s_enroll_active   —— 登记流程占着 UART
+     * 抢跑的后果（真机现象「连发两个授权申请，触摸第一个之后指纹失效」）：
+     * FP_AUTH_EVT 发出 GET_IMAGE，30ms 后 touch-reset 的 fp_power_off() 发
+     * CMD_SLEEP，100ms 等待里解出来的却是 GET_IMAGE 的 ack=0x02 → 判 no-ack
+     * → 照样切 VCC → R599S 没进 wake-on-touch standby → 触摸中断永久不再
+     * 触发；且 s_search_active 滞留为 1，之后按按键的恢复也会被同一场撞车
+     * 反复打断（按几次都救不回来）。
+     * 这里一律不抢：挂起 gate、武装 25s 看门狗，等这几条流程自己收尾后由
+     * 用户的下一次触摸走正常冷启动路径。 */
+    uint8_t fp_busy = (s_touch_reset || s_sleep_retry_active || s_enroll_active);
+
+    if(fp_is_powered() && !fp_busy) {
         // Module already on from a previous op — let it serve this gate too.
         fp_reset_power_timer();
 #if HAS_R599S
@@ -4970,6 +5439,11 @@ static void fp_gate_enter(void)
         }
 #endif
         return;
+    }
+
+    if(fp_busy) {
+        PRINT("Gate: FP busy (reset=%d sleep=%d enroll=%d), defer to touch\n",
+              s_touch_reset, s_sleep_retry_active, s_enroll_active);
     }
 
     // Arm gate-pending watchdog. FP_POWER_OFF_EVT handler clears
@@ -5056,10 +5530,15 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
         switch(cmd) {
         case IMMUROK_CMD_GET_STATUS:    // App probes "am I paired?"
         case IMMUROK_CMD_GET_BATT_RAW:  // read-only batt calibration data
+        case IMMUROK_CMD_GET_CONN_PARAMS: // 链路层参数对连接对端本就可见，零泄露
         case IMMUROK_CMD_PAIR_INIT:     // start ECDH
         case IMMUROK_CMD_PAIR_CONFIRM:  // exchange App pubkey
         case IMMUROK_CMD_PAIR_STATUS:   // read pairing flag
         case IMMUROK_CMD_SLOT_STATUS:   // 新主机据此得知自己是第几台
+        case IMMUROK_CMD_QC_SELFTEST:   // QC 自检（内部还有 未配对+未质检 门）
+        case IMMUROK_CMD_QC_GET:        // 读 qc_done 标志
+        case IMMUROK_CMD_QC_CLEAR:      // 返修复测清标志（仅未配对，内部拒）
+        case IMMUROK_CMD_QC_SHUTDOWN:   // QC 板读完结果请求关机
             break;  // allowed pre-pair
         default:
             PRINT("  Rejected (slot unpaired): cmd=0x%02X\n", cmd);
@@ -5086,6 +5565,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
         switch(cmd) {
         case IMMUROK_CMD_GET_STATUS:
         case IMMUROK_CMD_GET_BATT_RAW:    // read-only batt data, no FP gate needed
+        case IMMUROK_CMD_GET_CONN_PARAMS: // read-only link params, no FP gate needed
         case IMMUROK_CMD_FP_LIST:
         case IMMUROK_CMD_ENROLL_START:    // first-time enrollment must be allowed
         case IMMUROK_CMD_ENROLL_CANCEL:
@@ -5099,6 +5579,10 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
         case IMMUROK_CMD_CHALLENGE:       // device authenticity check, no secrets
         case IMMUROK_CMD_KEY_GETPUB:      // public keys are not secret
         case IMMUROK_CMD_KEY_RESULT:      // empty buffer (KEY_SIGN/GENERATE were rejected)
+        case IMMUROK_CMD_QC_GET:          // read-only qc_done flag
+        case IMMUROK_CMD_QC_SELFTEST:     // 量产自检本就在无指纹的出厂态运行
+        case IMMUROK_CMD_QC_CLEAR:        // 返修复测清标志（内部仍要求未配对）
+        case IMMUROK_CMD_QC_SHUTDOWN:     // QC 板读完结果请求关机
             break;  // allowed without enrolled fingerprint
         default:
             PRINT("  Rejected (no FP enrolled): cmd=0x%02X\n", cmd);
@@ -5160,6 +5644,54 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
 #endif
 
     switch(cmd) {
+    case IMMUROK_CMD_QC_SELFTEST:
+        PRINT("  QC_SELFTEST\n");
+        rspBuf[0] = IMMUROK_CMD_QC_SELFTEST;
+        if(g_qc_running || g_qc_start_req)
+            rspBuf[1] = IMMUROK_RSP_BUSY;
+        else if(immurok_security_is_paired() || qc_done_read())
+            rspBuf[1] = IMMUROK_RSP_QC_REFUSED;   // 已出货/已过检设备一律拒
+        else {
+            rspBuf[1] = IMMUROK_RSP_OK;
+            g_qc_start_req = 1;   // 主循环消费，回调里绝不跑自检
+        }
+        rspLen = 2;
+        break;
+
+    case IMMUROK_CMD_QC_SHUTDOWN:
+        rspBuf[0] = IMMUROK_CMD_QC_SHUTDOWN;
+        rspBuf[1] = IMMUROK_RSP_OK;
+        rspLen = 2;
+        if(g_qc_running) g_qc_shutdown_req = 1;   // 主循环 tick 收尾关机
+        break;
+
+    case IMMUROK_CMD_QC_GET:
+        // [0x42][OK][qc_done][phase][bitmap][mv_lo][mv_hi]
+        // QC 板据此轮询自检状态与结果（phase=DONE 时 bitmap/mv 有效）。
+        rspBuf[0] = IMMUROK_CMD_QC_GET;
+        rspBuf[1] = IMMUROK_RSP_OK;
+        rspBuf[2] = qc_done_read();
+        rspBuf[3] = g_qc_phase;
+        rspBuf[4] = g_qc_result_bitmap;
+        rspBuf[5] = g_qc_result_mv & 0xFF;
+        rspBuf[6] = (g_qc_result_mv >> 8) & 0xFF;
+        rspBuf[7] = g_qc_fail_code;   // fail-fast 首个失败项，0=无（1.7.6+）
+        rspLen = 8;
+        if(g_qc_phase == QC_PHASE_DONE) g_qc_read_done = 1;  // QC 板已读到结果
+        break;
+
+    case IMMUROK_CMD_QC_CLEAR:
+        rspBuf[0] = IMMUROK_CMD_QC_CLEAR;
+        if(immurok_security_is_paired())
+            rspBuf[1] = IMMUROK_RSP_QC_REFUSED;
+        else {
+            qc_done_clear();
+            HidEmu_QcAdvFlagUpdate(0);
+            rspBuf[1] = IMMUROK_RSP_OK;
+        }
+        rspLen = 2;
+        break;
+
     case IMMUROK_CMD_GET_STATUS:
         PRINT("  GET_STATUS\n");
         {
@@ -5257,6 +5789,25 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
         }
         break;
 #endif
+
+    case IMMUROK_CMD_GET_CONN_PARAMS:
+        // 实际连接参数：s_conn_* 在 GAP 链路建立事件时用 central 给的初始值
+        // 填充（hiddev.c），此后每次 param update 刷新，所以任何时刻读到的
+        // 都是链路层当前生效值，与 PPCP（0x2A04 愿望值）无关。
+        {
+            rspBuf[0] = IMMUROK_CMD_GET_CONN_PARAMS;
+            rspBuf[1] = IMMUROK_RSP_OK;
+            rspBuf[2] = (uint8_t)(s_conn_interval >> 8);
+            rspBuf[3] = (uint8_t)(s_conn_interval & 0xFF);
+            rspBuf[4] = (uint8_t)(s_conn_latency >> 8);
+            rspBuf[5] = (uint8_t)(s_conn_latency & 0xFF);
+            rspBuf[6] = (uint8_t)(s_conn_timeout >> 8);
+            rspBuf[7] = (uint8_t)(s_conn_timeout & 0xFF);
+            rspLen = 8;
+            PRINT("  GET_CONN_PARAMS: interval=%d latency=%d timeout=%dms\n",
+                  s_conn_interval, s_conn_latency, s_conn_timeout * 10);
+        }
+        break;
 
     case IMMUROK_CMD_ENROLL_START:
         // Payload: [fingerId:1]
@@ -5406,7 +5957,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             // 算完随即 supervision timeout 断开。配对后面还有指纹 + 按键两道
             // 人类操作，请求早发出去有的是时间落地。
             if(s_conn_timeout < PAIR_PREFERRED_CONN_TIMEOUT) {
-                tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                param_update_kick();
             }
 
             /* 登记第二台主机：先指纹（证明是物主），再按键（证明在场）。
@@ -5555,39 +6106,20 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
              * 时已经用 slot_meta_set_peer() 记过（见 GAP_LINK_ESTABLISHED_
              * EVENT 处理），active 槽此刻就是这条连接，理论上必中；仍做
              * -1 兜底防御性跳过，不让一次读失败拖累 slot_clear 本身。 */
-            {
-                uint8_t ptype, paddr[6];
-                if(slot_meta_get_peer(active, &ptype, paddr) == 0) {
-                    uint8_t eb[7];
-                    eb[0] = ptype;
-                    tmos_memcpy(&eb[1], paddr, 6);
-                    uint8_t bcBefore = 0, bcAfter = 0;
-                    GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bcBefore);
-                    GAPBondMgr_SetParameter(GAPBOND_ERASE_SINGLEBOND, sizeof(eb), eb);
-                    GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bcAfter);
-                    PRINT("  SLOT_CLEAR own: SNV reclaim bond_count %d->%d\n", bcBefore, bcAfter);
-                    if(bcAfter >= bcBefore) {
-                        PRINT("  SLOT_CLEAR own: WARNING SNV reclaim may have failed "
-                              "(peer addr may be RPA, not identity addr)\n");
-                    }
-                } else {
-                    PRINT("  SLOT_CLEAR own: no stored peer for slot %d, skip SNV reclaim\n", active);
-                }
-            }
             int ret = immurok_security_slot_clear(active);
             PRINT("  SLOT_CLEAR slot=%d (own) ret=%d\n", active, ret);
             rspBuf[0] = IMMUROK_CMD_SLOT_CLEAR;
             rspBuf[1] = (ret == 0) ? IMMUROK_RSP_OK : IMMUROK_RSP_INVALID_PARAM;
             ImmurokService_SendResponse(rspBuf, 2);
             if(ret == 0) {
-                /* 本槽密钥已失效：bump gen 让重启后广播新地址，再复位回到
-                 * 干净状态。沿用本文件既有的延迟复位写法。 */
+                /* 密钥已清、bump gen 换地址；SNV bond 的回收和复位交给
+                 * FP_POWER_OFF_EVT 两段式（借 s_factory_reset_pending=2/3
+                 * 表达阶段，不新增 RAM）：阶段 1 擦 bond + 主动断链，阶段 2
+                 * 等终止事件处理完再复位。直接在这里复位，bond 永远擦不掉
+                 * （见 bond_erase_peer 注释）。 */
                 slot_meta_bump_gen(active);
-#if HAS_RGB_LED
-                led_stop();
-#endif
-                DelayMs(50);
-                SYS_ResetExecute();
+                s_factory_reset_pending = 2;
+                tmos_start_task(hidEmuTaskId, FP_POWER_OFF_EVT, MS1_TO_SYSTEM_TIME(200));
             }
             return;
         }
@@ -5858,7 +6390,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
                     PRINT("  KEY_SIGN cooldown, deferred to TMOS\n");
                     // Pre-request param update if needed (no FP wait to buy time)
                     if(!s_latency_accepted) {
-                        tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                        param_update_kick();
                     }
                     uint8_t fpApproved[1] = { 0x10 };
                     ImmurokService_SendResponse(fpApproved, 1);
@@ -5915,7 +6447,7 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             } else {
                 PRINT("  KEY_GENERATE deferred to TMOS\n");
                 if(!s_latency_accepted) {
-                    tmos_set_event(hidEmuTaskId, START_PARAM_UPDATE_EVT);
+                    param_update_kick();
                 }
                 tmos_set_event(hidEmuTaskId, FP_GATE_EXEC_EVT);
                 return;  // Response sent from TMOS event handler
@@ -6027,7 +6559,16 @@ static void HidEmu_ImmurokCommandCB(uint16_t connHandle, uint8_t *pData, uint8_t
             s_wait_finger_lift = 0;
             tmos_stop_task(hidEmuTaskId, FP_SEARCH_EVT);
             tmos_stop_task(hidEmuTaskId, FP_AUTH_EVT);
-            tmos_stop_task(hidEmuTaskId, FP_WAKE_DONE_EVT);
+            /* touch-reset 不是 gate 活动，是传感器卫生 —— 它正驱动着
+             * FP_WAKE_DONE_EVT 去补发 PS_Sleep。在这里停掉会让
+             * s_touch_reset 永远停在 1：TOUCH_SCAN_EVT 从此吞掉每一次触摸，
+             * 而 FP_POWER_OFF_EVT 的空闲断电又被上面那道 !s_touch_reset
+             * 门跳过 → 模块 30mA 一直烧着。让它自己跑完。 */
+            if(!s_touch_reset) {
+                tmos_stop_task(hidEmuTaskId, FP_WAKE_DONE_EVT);
+            } else {
+                PRINT("  GATE_CANCEL: touch-reset in flight, left running\n");
+            }
 #if HAS_RGB_LED
             // Red "cancelled" flash only when a gate was truly pending and we
             // are not mid-enrollment — otherwise leave the LED alone so the
@@ -6506,6 +7047,13 @@ static void OTA_IAPWriteData(uint8_t paramID, uint8_t *pData, uint8_t len)
         PRINT("OTA write: data too long\n");
         return;
     }
+#if HAS_QC_TEST
+    if(g_qc_running)
+    {
+        PRINT("OTA write: rejected (qc test)\n");
+        return;
+    }
+#endif
 
     tmos_memcpy((uint8_t *)&s_ota_iap_data, pData, len);
     OTA_IAP_DataDeal();

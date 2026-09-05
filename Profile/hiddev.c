@@ -789,6 +789,13 @@ static void hidDevGapStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
         // get connection handle
         gapConnHandle = event->connectionHandle;
 
+        // 用建链事件携带的初始参数填充 s_conn_* 缓存。此前缓存只在
+        // param update 回调里赋值，建链后到首次 update 之间是 0 ——
+        // GET_CONN_PARAMS / 0xF0 replay 在这个窗口会报假值。
+        s_conn_interval = event->connInterval;
+        s_conn_latency = event->connLatency;
+        s_conn_timeout = event->connTimeout;
+
         // connection not secure yet
         hidDevConnSecure = FALSE;
 
@@ -854,6 +861,10 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
     // s_conn_* / s_latency_accepted / s_post_discovery / s_post_override_*
     // are declared in hidkbd.h.
     extern uint8_t hidEmuTaskId;
+    extern uint8_t s_param_update_retries;
+    // 主机回应了（不管给的是什么），「连续无回应」计数清零，上限重新算。
+    uint8_t had_retries = s_param_update_retries;
+    s_param_update_retries = 0;
     s_conn_timeout = connTimeout;
     s_conn_interval = connInterval;
     s_conn_latency = connSlaveLatency;
@@ -880,7 +891,6 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
     // macOS periodic param resets set timeout to ~720ms; deep sleep wake
     // latency can cause supervision timeout and disconnect.
     extern volatile uint8_t g_sleep_inhibit;
-    extern uint8_t s_param_update_retries;
     if(connTimeout >= PARAM_OK_CONN_TIMEOUT) {
         if(g_sleep_inhibit > 0) g_sleep_inhibit--;  // Release BLE-timeout hold
         if(connSlaveLatency >= MIN_ACCEPTABLE_SLAVE_LATENCY) {
@@ -920,7 +930,7 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
         g_sleep_inhibit++;  // Suppress sleep until params restored
         // Timeout inadequate — retry Phase 1 quickly. Phase 1 (latency=0) is
         // rarely rejected so REREQUEST_DELAY isn't gated on retries like before.
-        uint32_t delay = s_param_update_retries > 0
+        uint32_t delay = had_retries > 0
             ? PARAM_UPDATE_REREQUEST_DELAY : PARAM_UPDATE_PHASE1_RETRY;
         tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, delay);
     }
