@@ -44,6 +44,10 @@ C_SOURCES = \
 	$(APP_DIR)/immurok_slots.c \
 	$(APP_DIR)/slot_meta.c \
 	$(APP_DIR)/immurok_ble_init.c \
+	$(APP_DIR)/immurok_snv.c \
+	$(APP_DIR)/immurok_rng.c \
+	$(APP_DIR)/immurok_entropy.c \
+	$(APP_DIR)/totp_core.c \
 	LIB/sha1.c \
 	LIB/sha256.c \
 	LIB/aes128.c \
@@ -90,7 +94,8 @@ C_INCLUDES = \
 	-I$(APP_DIR)/include \
 	-I$(PROFILE_DIR)/include \
 	-I$(SRC_PATH)/StdPeriphDriver/inc \
-	-I$(SRC_PATH)/RVMSIS
+	-I$(SRC_PATH)/RVMSIS \
+	-ILIB
 
 # Hardware version (default: latest = 6)
 # Usage: make VER=0 / VER=1 / VER=2 / VER=3 / VER=5 / VER=6
@@ -150,6 +155,7 @@ C_DEFS_COMMON = \
 C_DEFS_DEBUG = \
 	$(C_DEFS_COMMON) \
 	-DDEBUG=3 \
+	-DLOG_VERBOSE=1 \
 	-DHAL_SLEEP=FALSE \
 	-DBLE_TX_POWER=LL_TX_POWEER_4_DBM
 
@@ -163,6 +169,7 @@ C_DEFS_RELEASE = \
 C_DEFS_RELEASE_DEBUG = \
 	$(C_DEFS_COMMON) \
 	-DDEBUG=3 \
+	-DLOG_VERBOSE=0 \
 	-DHAL_SLEEP=TRUE \
 	-DBLE_TX_POWER=LL_TX_POWEER_0_DBM
 
@@ -253,9 +260,19 @@ $(BUILD_DIR)/$(TARGET).hex: $(BUILD_DIR)/$(TARGET).elf
 	@echo "HEX $@"
 	@$(OBJCOPY) -O ihex $< $@
 
+# OTA 镜像槽位 216K（Image A/B 各 216K，布局已用满 448K，见 CLAUDE.md）。
+# 不带 OTA=1 时链接脚本是 448K，链接器不报错，1.8.0 的 release-debug 就这样
+# 超限到打包才发现。这里对 bin 统一断言，超了直接失败。
+FW_MAX_SIZE = 221184
+
 $(BUILD_DIR)/$(TARGET).bin: $(BUILD_DIR)/$(TARGET).elf
 	@echo "BIN $@"
 	@$(OBJCOPY) -O binary -S $< $@
+	@sz=$$(wc -c < $@ | tr -d ' '); \
+	if [ $$sz -gt $(FW_MAX_SIZE) ]; then \
+	  echo "ERROR: $@ is $$sz bytes, exceeds OTA image slot $(FW_MAX_SIZE) by $$((sz - $(FW_MAX_SIZE)))"; \
+	  rm -f $@; exit 1; \
+	else echo "SIZE $$sz / $(FW_MAX_SIZE) ($$(($(FW_MAX_SIZE) - sz)) bytes free)"; fi
 
 $(BUILD_DIR):
 	@mkdir -p $@

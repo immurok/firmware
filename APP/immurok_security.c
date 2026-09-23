@@ -4,6 +4,8 @@
  */
 
 #include "immurok_security.h"
+#include "immurok_entropy.h"
+#include "immurok_scratch.h"
 #include "immurok_keystore.h"
 #include "immurok_slots.h"
 #include "slot_meta.h"
@@ -271,6 +273,7 @@ int immurok_security_pair_make_key(void)
     PRINT("ECDH make_key start...\n");
     uECC_Curve curve = uECC_secp256r1();
 
+    immurok_entropy_reseed();   // 临时私钥前重新采一轮硬件熵（审计 H4）
     WWDG_SetCounter(0);
     int ret = uECC_make_key(s_ecdh_pub, s_ecdh_priv, curve);
     WWDG_SetCounter(0);
@@ -557,11 +560,19 @@ extern uint8_t immurok_keystore_work_buf[4096];
 
 static int save_security_data(void)
 {
-    /* 槽 2 登记扣住期间，s_data.shared_key 装的是槽 2 的新密钥。
-     * 此时写 block 0 会覆盖槽 1 的密钥 —— 直接拒绝，把脚枪变成可捕获的
-     * 错误。正常流程里这一条永不触发（提交/放弃都会先复原 s_data）。 */
-    if (s_pair_target_slot == IMMUROK_SLOT_2) {
-        PRINT("!! refusing save_security_data: slot 2 enrollment in flight\n");
+    immurok_scratch_assert_free("security save");
+    /* 槽 2 配对的 compute_secret 之后、slot2_commit 之前，s_data.shared_key
+     * 装的是槽 2 的新密钥。此时写 block 0 会覆盖槽 1 的密钥 —— 直接拒绝，
+     * 把脚枪变成可捕获的错误。
+     *
+     * 1.8.3：条件加上 pair_save_pending。它在 compute_secret 末尾置 1、在
+     * EEPROM_SAVE_EVT 里清 0，恰好就是「s_data 被临时改写、尚未提交」的
+     * 窗口。原来只看 target==2：目标槽改为恒取活动槽后（审计 M2），主机 2
+     * 每次 PAIR_INIT 都会把 target 置 2，按键超时 / 长按取消 / make_key 失败
+     * 这些中止路径不复位它，会把之后所有 block 0 写入拒到重启（审计 L28）。
+     * 中止在 compute_secret 之前发生时 s_data 根本没被动过，无需拒。 */
+    if (s_pair_target_slot == IMMUROK_SLOT_2 && immurok_security_pair_save_pending) {
+        PRINT("!! refusing save_security_data: slot 2 key in RAM, not yet committed\n");
         return -1;
     }
     uint8_t ret;

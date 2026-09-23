@@ -22,6 +22,8 @@
 #include "immurok_slots.h"
 #include "hardware_pins.h"
 #include "factory_test.h"
+#include "immurok_snv.h"
+#include "immurok_scratch.h"
 #include "qc_test.h"
 #include "ws2812.h"
 
@@ -170,20 +172,29 @@ void Main_Circulation()
 
         // Check GPIO interrupt flags and fire TMOS events immediately.
         // Safe to call tmos_set_event here (main context, not ISR).
-        if(g_touch_irq_flag)
-        {
-            g_touch_irq_flag = 0;
-#if HAS_FACTORY_TEST
-            if(g_factory_case_open)
-                ;                                // hold: ignore
-            else
+        // QC 自检期间触摸/按键标志留给 qc_test_tick 消费：走正常流程的话
+        // 触摸会起一次指纹搜索、按键长按 3s 会触发出厂重置，都不是自检要的。
+#if HAS_QC_TEST
+        if(g_qc_running)
+            ;
+        else
 #endif
-            tmos_set_event(hidEmuTaskId, TOUCH_SCAN_EVT);
-        }
-        if(g_btn_irq_flag)
         {
-            g_btn_irq_flag = 0;
-            tmos_set_event(hidEmuTaskId, BUTTON_SCAN_EVT);
+            if(g_touch_irq_flag)
+            {
+                g_touch_irq_flag = 0;
+#if HAS_FACTORY_TEST
+                if(g_factory_case_open)
+                    ;                                // hold: ignore
+                else
+#endif
+                tmos_set_event(hidEmuTaskId, TOUCH_SCAN_EVT);
+            }
+            if(g_btn_irq_flag)
+            {
+                g_btn_irq_flag = 0;
+                tmos_set_event(hidEmuTaskId, BUTTON_SCAN_EVT);
+            }
         }
 #if HAS_TAMPER_DETECT
         if(g_tamper_irq_flag)
@@ -200,9 +211,9 @@ void Main_Circulation()
         if(g_qc_start_req)
         {
             g_qc_start_req = 0;
-            qc_test_run();   // 跑自动项后返回，进等触摸态
+            qc_test_run();   // 跑自动项后返回，进人工阶段（等触摸+按键）
         }
-        qc_test_tick();      // 事件式处理等触摸/结果/关机（BLE 稳定）
+        qc_test_tick();      // 事件式处理等触摸+按键/结果/关机（BLE 稳定）
 #endif
 
         WWDG_SetCounter(0);  // 喂狗：计数器清零
@@ -226,12 +237,17 @@ int main(void)
     GPIOA_ModeCfg(GPIO_Pin_All, GPIO_ModeIN_PU);
     GPIOB_ModeCfg(GPIO_Pin_All, GPIO_ModeIN_PU);
 #if HAS_VBAT_ADC
-    // Pull-down on VBAT divider pin: floating leaves PA14 at ~VCC/2 (near GPIO
-    // threshold) causing constant RB_SLP_GPIO_WAKE false wakeups from noise.
-    // Pull-down stabilizes at ~0.2V; adds ~1.5uA vs floating but saves ~55uA
-    // from eliminated spurious wakeups. ADC settles in <10us after switching
-    // to floating in battSetupCB.
-    GPIOA_ModeCfg(PIN_VBAT, GPIO_ModeIN_PD);
+    // VBAT divider pin (AIN4) sits at VBAT/4 ≈ 0.9-1.05V, right in the CMOS
+    // input buffer's shoot-through band. Left as a plain floating digital input
+    // that costs ~30µA (measured 2026-09-21: shorting R2 so the pin sits at
+    // VBAT dropped the sleep floor by 30µA; the old "~55µA vs IN_PD" note here
+    // was the same effect, misattributed to spurious wakeups). IN_PD avoids it
+    // but discharges C7 every time, forcing a 500ms RC settle per measurement.
+    // Instead: keep the pin floating for the ADC and switch off its digital
+    // input buffer (R32_PIN_CONFIG2 / RB_PIN_PA4_15_DIS) — no shoot-through,
+    // C7 stays charged, no settle.
+    GPIOA_ModeCfg(PIN_VBAT, GPIO_ModeIN_Floating);
+    GPIOA_PinCfg(PIN_VBAT, DISABLE);
 #endif
 #ifdef PIN_ANTI_OPEN
 #if HAS_TAMPER_DETECT
@@ -300,13 +316,25 @@ int main(void)
     // Touch INT input (active high). Idle default is IN_PD for all HW revs —
     // fp_power_on() toggles to Floating for R599S during active sensor use.
     TOUCH_SetMode(GPIO_ModeIN_PD);
-    PRINT("%s [fw:" FW_VERSION_STRING ".%04X build:%s %s]\n", VER_LIB, FW_BUILD_NUMBER, __DATE__, __TIME__);
+    // chip id 低 8 位：9 = CH592A，SDK 的 SNV 写回调对它走整块 4KB 读改写，
+    // 与按槽分区的 SNV（immurok_snv.h）冲突；真机上必须看到不是 9。
+    PRINT("%s [fw:" FW_VERSION_STRING ".%04X build:%s %s chip:%02X]\n", VER_LIB, FW_BUILD_NUMBER,
+          __DATE__, __TIME__, (unsigned)((*(volatile uint32_t *)ROM_CFG_VERISON) & 0xFF));
     // 双主机：每个槽用不同的 BLE 地址，两台主机各自维护独立 bond。
     // 空白标记页 = 槽 1 = 出厂 MAC，与出货固件行为一致。
+    // bond 存储（SNV）也按槽分区，见 immurok_snv.h。老设备两槽的 bond 都在
+    // 槽 1 的区里，首次开机搬一份到槽 2 的区；必须在库初始化之前做。借
+    // work_buf 的 1024 偏移当缓冲：immurok_slots_slot2_occupied() 自己用
+    // 头 64B，两者不能重叠。
     {
+        uint8_t slot = immurok_slots_active();
         uint8_t slot_mac[6];
-        immurok_ble_slot_mac(immurok_slots_active(), slot_mac);
-        immurok_BLEInit(slot_mac);
+        int mig = immurok_snv_migrate(immurok_slots_slot2_occupied(),
+                                      immurok_keystore_work_buf + 1024,
+                                      sizeof(immurok_keystore_work_buf) - 1024);
+        if(mig) PRINT("SNV migrate: %d\n", mig);
+        immurok_ble_slot_mac(slot, slot_mac);
+        immurok_BLEInit(slot, slot_mac);
     }
     HAL_Init();
     GAPRole_PeripheralInit();

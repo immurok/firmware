@@ -3,3 +3,10 @@ test_slots
 test_pin_crypto
 test_slot_meta
 *.dSYM/
+test_snv
+test_tick
+test_fp_policy
+test_sha256
+test_rng
+test_pair_policy
+test_totp

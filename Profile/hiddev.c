@@ -246,7 +246,8 @@ uint16_t HidDev_ProcessEvent(uint8_t task_id, uint16_t events)
 
     if(events & BATT_PERIODIC_EVT)
     {
-        // Perform periodic battery task
+        // Perform periodic battery task（低电判定已挪进 hidDevBattPeriodicTask
+        // 的真正测量分支，只在新鲜读数后判一次，不在每个 tick 上用缓存判）。
         hidDevBattPeriodicTask();
 
         return (events ^ BATT_PERIODIC_EVT);
@@ -1011,15 +1012,11 @@ static void hidDevPasscodeCB(uint8_t *deviceAddr, uint16_t connectionHandle,
  */
 static void hidDevBattCB(uint8_t event)
 {
-    if(event == BATT_LEVEL_NOTI_ENABLED)
-    {
-        tmos_start_task(hidDevTaskId, BATT_PERIODIC_EVT, DEFAULT_BATT_PERIOD);
-    }
-    else if(event == BATT_LEVEL_NOTI_DISABLED)
-    {
-        // stop periodic measurement
-        tmos_stop_task(hidDevTaskId, BATT_PERIODIC_EVT);
-    }
+    // 周期测量的启停已改为连接期常驻（HidDev_Start/StopBattMonitor，连上启动、
+    // 断开停止），不再随主机订阅/退订 BAS notify 而启停——否则 mac app「连上一次性
+    // 读+主动退订」会把测量停掉，低电模式在连接态永不触发。notify 推送仍由 CCCD
+    // 门控（battNotifyCB 查 GATT_CLIENT_CFG_NOTIFY），退订的主机不会收到推送。
+    (void)event;
 }
 
 /*********************************************************************
@@ -1068,11 +1065,29 @@ static void hidDevBattPeriodicTask(void)
         {
             battTickCount = 0;
             Batt_MeasLevel();
+            // 低电判定只在真正测量之后做（新鲜读数），不在每个周期 tick 上用
+            // 缓存值判——否则每 37.5s 拿陈旧电量判断，刚连上就可能被误断。
+            extern void HidEmu_CheckLowBatt(void);
+            HidEmu_CheckLowBatt();
         }
     }
 
     // Restart timer
     tmos_start_task(hidDevTaskId, BATT_PERIODIC_EVT, DEFAULT_BATT_PERIOD);
+}
+
+void HidDev_StartBattMonitor(void)
+{
+    // 连上即启动：battTickCount 从 0 数起，第一次真正测量在 BATT_MEASURE_INTERVAL
+    // 个周期后。连接初值由 app 的 GET_BATT_RAW(forceFresh) 已取到。
+    battTickCount = 0;
+    tmos_stop_task(hidDevTaskId, BATT_PERIODIC_EVT);
+    tmos_start_task(hidDevTaskId, BATT_PERIODIC_EVT, DEFAULT_BATT_PERIOD);
+}
+
+void HidDev_StopBattMonitor(void)
+{
+    tmos_stop_task(hidDevTaskId, BATT_PERIODIC_EVT);
 }
 
 void HidDev_BattForceUpdate(void)

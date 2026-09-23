@@ -12,7 +12,7 @@
 #define EEPROM_PAGE_SIZE   256
 #define EEPROM_BLOCK_SIZE  4096
 #define FAKE_EEPROM_BASE   0x6000
-#define FAKE_EEPROM_SIZE   0x1000   /* 只模拟 block 6 */
+#define FAKE_EEPROM_SIZE   0x2000   /* 模拟 block 6 + block 7（SNV） */
 
 uint8_t fake_EEPROM_READ(uint32_t addr, void *buf, uint32_t len);
 uint8_t fake_EEPROM_WRITE(uint32_t addr, void *buf, uint32_t len);

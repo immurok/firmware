@@ -411,6 +411,18 @@ extern void HidDev_PasscodeRsp(uint8_t status, uint32_t passcode);
 extern void HidDev_BattForceUpdate(void);
 
 /*********************************************************************
+ * @fn      HidDev_StartBattMonitor / HidDev_StopBattMonitor
+ *
+ * @brief   连接期常驻电池周期测量的启停。连上时启动、断开时停止，与主机是否
+ *          订阅 BAS notify 无关（低电模式需要设备自己按节奏测量并判阈值；notify
+ *          推送仍由 CCCD 门控）。断开后停掉，深睡/低电态不残留定时器。
+ *
+ * @return  none
+ */
+extern void HidDev_StartBattMonitor(void);
+extern void HidDev_StopBattMonitor(void);
+
+/*********************************************************************
  * @fn          HidDev_ReadAttrCB
  *
  * @brief       HID Dev attribute read callback.

@@ -30,7 +30,9 @@ extern "C" {
 #define START_DEVICE_EVT          0x0001
 #define START_REPORT_EVT          0x0002
 #define START_PARAM_UPDATE_EVT    0x0004
-#define START_PHY_UPDATE_EVT      0x0008
+// 0x0008 曾是 START_PHY_UPDATE_EVT（PHY 2M 切换），全工程从不调度，
+// 复用为 PEER_RECORD_EVT：链路加密后再把对端地址落盘（审计 M9）。
+#define PEER_RECORD_EVT           0x0008
 #define BUTTON_SCAN_EVT           0x0010
 #define TOUCH_SCAN_EVT            0x0020
 #define FP_AUTH_EVT               0x0040
@@ -229,6 +231,10 @@ extern void HidEmu_Init(void);
  * Task Event Processor for the BLE Application
  */
 extern uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events);
+
+/* 连接中低电检查（hiddev 的 BATT_PERIODIC 调用）：电量低于进入阈值就主动断开
+ * 进低电深睡。见 hidkbd.c 的低电模式（2026-09-20 用户设计）。 */
+extern void HidEmu_CheckLowBatt(void);
 
 /*
  * GPIO interrupt flags (set in ISR, consumed in TMOS event loop)

@@ -97,6 +97,8 @@ static void sha256_transform(sha256_ctx_t *ctx, const uint8_t *block)
     ctx->state[7] += h;
 }
 
+sha256_ctx_t sha256_scratch_ctx;
+
 void sha256_init(sha256_ctx_t *ctx)
 {
     memcpy(ctx->state, H0, sizeof(H0));
@@ -193,7 +195,7 @@ void hmac_sha256(const uint8_t *key, size_t key_len,
                         const uint8_t *data, size_t data_len,
                         uint8_t *out)
 {
-    static sha256_ctx_t ctx;           // 104B → BSS (stack-critical path)
+    sha256_ctx_t *ctx = &sha256_scratch_ctx;  // 104B 共享 BSS 上下文，见 sha256.h
     static uint8_t k_pad[SHA256_BLOCK_SIZE];  // 64B → BSS (called from BLE callback, 512B stack)
     static uint8_t tk[SHA256_DIGEST_SIZE];    // 32B → BSS
 
@@ -208,18 +210,18 @@ void hmac_sha256(const uint8_t *key, size_t key_len,
     for (size_t i = 0; i < key_len; i++)
         k_pad[i] ^= key[i];
 
-    sha256_init(&ctx);
-    sha256_update(&ctx, k_pad, SHA256_BLOCK_SIZE);
-    sha256_update(&ctx, data, data_len);
-    sha256_final(&ctx, tk);
+    sha256_init(ctx);
+    sha256_update(ctx, k_pad, SHA256_BLOCK_SIZE);
+    sha256_update(ctx, data, data_len);
+    sha256_final(ctx, tk);
 
     // Outer hash: H((K ^ opad) || inner)
     memset(k_pad, 0x5c, SHA256_BLOCK_SIZE);
     for (size_t i = 0; i < key_len; i++)
         k_pad[i] ^= key[i];
 
-    sha256_init(&ctx);
-    sha256_update(&ctx, k_pad, SHA256_BLOCK_SIZE);
-    sha256_update(&ctx, tk, SHA256_DIGEST_SIZE);
-    sha256_final(&ctx, out);
+    sha256_init(ctx);
+    sha256_update(ctx, k_pad, SHA256_BLOCK_SIZE);
+    sha256_update(ctx, tk, SHA256_DIGEST_SIZE);
+    sha256_final(ctx, out);
 }

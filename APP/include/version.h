@@ -2,14 +2,18 @@
 #define _VERSION_H_
 
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 7
-#define FW_VERSION_PATCH 10
+#define FW_VERSION_MINOR 8
+#define FW_VERSION_PATCH 4
 
 // OTA security version (SVN) for anti-rollback. Bump ONLY when shipping a
 // fix for a security issue — not on every release. The device persists a
 // monotonic floor in DataFlash (OTA_SVN_FLOOR_ADDR) and rejects any package
-// with a lower SVN. 1.6.0 = first ECDSA-verified (v2) firmware = SVN 1.
-#define FW_SEC_VERSION 1
+// with a lower SVN. The packager (ota/build-ota.sh) reads THIS macro; the
+// firmware C code never uses it.
+//   SVN 1 = 1.6.0, first ECDSA-verified (v2) firmware
+//   SVN 2 = 1.8.3, fingerprint-gate cooldown uint32 wrap (audit H1). Devices
+//           that install this refuse every earlier package from then on.
+#define FW_SEC_VERSION 2
 
 // FW_BUILD_NUMBER: set by Makefile via -D (git short hash as uint17_t)
 // Fallback to 0 for IDE builds without Makefile

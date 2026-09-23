@@ -30,6 +30,7 @@
 #include "HAL.h"
 #include "immurok_ble_init.h"
 #include "slot_meta.h"
+#include "immurok_snv.h"
 
 // Defined in main.c
 extern __attribute__((aligned(4))) uint32_t MEM_BUF[BLE_MEMHEAP_SIZE / 4];
@@ -39,7 +40,7 @@ extern uint32_t g_LLE_IRQLibHandlerLocation;
 extern uint32_t Lib_Read_Flash(uint32_t addr, uint32_t num, uint32_t *pBuf);
 extern uint32_t Lib_Write_Flash(uint32_t addr, uint32_t num, uint32_t *pBuf);
 
-void immurok_BLEInit(const uint8_t mac[6])
+void immurok_BLEInit(uint8_t slot, const uint8_t mac[6])
 {
     uint8_t     i;
     bleConfig_t cfg;
@@ -63,12 +64,16 @@ void immurok_BLEInit(const uint8_t mac[6])
     cfg.TxNumEvent = (uint32_t)BLE_TX_NUM_EVENT;
     cfg.TxPower = (uint32_t)BLE_TX_POWER;
 #if(defined(BLE_SNV)) && (BLE_SNV == TRUE)
-    if((BLE_SNV_ADDR + BLE_SNV_BLOCK * BLE_SNV_NUM) > (0x78000 - FLASH_ROM_MAX_SIZE))
+    // 按槽分区的 SNV（immurok_snv.h）：槽 1 = BLE_SNV_ADDR（0x7000，出货
+    // 位置），槽 2 紧接其后。两块都必须落在 DataFlash 末尾 0x8000 之内，
+    // 且不低于 block 7 起点（block 6 尾部是 SVN floor / 防拆标记页）。
+    if((immurok_snv_area_addr(IMMUROK_SLOT_2) + immurok_snv_area_size()) > (0x78000 - FLASH_ROM_MAX_SIZE)
+       || immurok_snv_area_addr(IMMUROK_SLOT_1) < (0x77000 - FLASH_ROM_MAX_SIZE))
     {
         PRINT("SNV config error...\n");
         while(1);
     }
-    cfg.SNVAddr = (uint32_t)BLE_SNV_ADDR;
+    cfg.SNVAddr = immurok_snv_area_addr(slot);
     cfg.SNVBlock = (uint32_t)BLE_SNV_BLOCK;
     cfg.SNVNum = (uint32_t)BLE_SNV_NUM;
     cfg.readFlashCB = Lib_Read_Flash;

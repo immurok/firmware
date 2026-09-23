@@ -10,8 +10,9 @@
 #include "immurok_slots.h"
 
 /* Replacement for the SDK's CH59x_BLEInit(): identical body, except the
- * device address comes in as a parameter. */
-void immurok_BLEInit(const uint8_t mac[6]);
+ * device address comes in as a parameter, and the bond storage (SNV) area
+ * is picked per host slot (see immurok_snv.h). */
+void immurok_BLEInit(uint8_t slot, const uint8_t mac[6]);
 
 /* Fill out_mac for the given host slot, starting from the chip's factory MAC.
  * Slot 1 = factory MAC unchanged (identical to shipped firmware). */

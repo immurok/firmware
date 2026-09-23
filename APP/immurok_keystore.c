@@ -8,16 +8,18 @@
  *   Block 4-5 (0x4000-0x5FFF): API section (51 entries)
  *   0x6000: OTA ImageFlag (page 0 of block 6, OTA_DATAFLASH_ADD)
  *   0x6F00: tamper case_opened flag (last page of block 6, see tamper.c)
- *   0x7000: BLE SNV (reserved)
+ *   0x7000-0x73FF: BLE SNV, per host slot (0x7000 slot 1, 0x7200 slot 2; immurok_snv.h)
  */
 
 #include "immurok_keystore.h"
+#include "immurok_rng.h"
+#include "immurok_entropy.h"
 #include "immurok_scratch.h"
 #include "CH59x_common.h"
 #include "CONFIG.h"
 #include "../LIB/uECC.h"
 extern void uECC_set_watchdog_cb(void (*cb)(void));
-#include "../LIB/sha1.h"
+#include "totp_core.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -98,16 +100,10 @@ static void keystore_watchdog_kick(void)
     }
 }
 
-// RNG function for uECC
-static int keystore_rng(uint8_t *dest, unsigned size)
-{
-    for (unsigned i = 0; i < size; i += 4) {
-        uint32_t r = tmos_rand();
-        unsigned copy = (size - i) < 4 ? (size - i) : 4;
-        tmos_memcpy(dest + i, &r, copy);
-    }
-    return 1;
-}
+// uECC 的随机源：1.8.3 起是 immurok_rng（SHA-256 池式 DRBG），熵由
+// immurok_entropy_reseed() 采集。原来直接用 tmos_rand()（种子 SysTick，
+// 开机几乎相同）——审计 H4。ECDH 临时私钥、SSH 私钥、ECDSA 的 k 都从这里取；
+// 每次用之前 reseed 一轮。（确定性签名 RFC 6979 评估过，2026-09-19 决定暂不做。）
 
 // ============================================================================
 // Internal Helpers
@@ -226,6 +222,7 @@ static int load_header(uint8_t cat)
 // Write header to DataFlash using read-modify-write on its block
 static int save_header(uint8_t cat)
 {
+    immurok_scratch_assert_free("keystore save_header");
     uint32_t h_addr, e_addr;
     uint16_t e_size, max_e;
     uint32_t magic;
@@ -261,6 +258,7 @@ static int save_header(uint8_t cat)
 // Also updates header count and checksum if needed.
 static int write_entry(uint8_t cat, uint16_t idx, const uint8_t *entry_data)
 {
+    immurok_scratch_assert_free("keystore write_entry");
     uint32_t h_addr, e_addr;
     uint16_t e_size, max_e;
     uint32_t magic;
@@ -330,8 +328,9 @@ void immurok_keystore_init(void)
 
     PRINT("Keystore init...\n");
 
-    uECC_set_rng(keystore_rng);
+    uECC_set_rng(immurok_rng_fill);
     uECC_set_watchdog_cb(keystore_watchdog_kick);
+    immurok_entropy_reseed();   // 开机播种；每次生成密钥前还会再采一轮
 
     for (uint8_t i = 0; i < KEYSTORE_CAT_COUNT; i++) {
         load_header(i);
@@ -568,6 +567,7 @@ int immurok_keystore_sign(uint8_t idx, const uint8_t *hash32, uint8_t *sig64)
     // OTA 之后 uECC_sign 裸跑 ~2s 无保活,重连后 supervision=2000ms 下必断链
     // (签名成功但结果发不回)。见 keng.md / project_macos27_conn_params。
     uECC_set_watchdog_cb(keystore_watchdog_kick);
+    immurok_entropy_reseed();   // k 取自 DRBG，签名前再采一轮硬件熵（审计 H4）
     WWDG_SetCounter(0);
     int ret = uECC_sign(s_ecc_privkey, hash_le, 32, sig64, curve);
     WWDG_SetCounter(0);
@@ -598,6 +598,7 @@ int immurok_keystore_generate_stage(const uint8_t *name16, uint8_t *pub64)
     memset(s_ecc_entry, 0, 112);
     memcpy(s_ecc_entry, name16, 16);
     PRINT("uECC_make_key...\n");
+    immurok_entropy_reseed();   // 新私钥前重新采一轮硬件熵（审计 H4）
     WWDG_SetCounter(0);
     // pub64 gets public key (also copied to entry), privkey goes to entry+80
     if (!uECC_make_key(pub64, &s_ecc_entry[80], curve)) {
@@ -654,91 +655,22 @@ void immurok_keystore_set_result(const uint8_t *data, uint8_t len)
 // HMAC-SHA1 + TOTP
 // ============================================================================
 
-static void hmac_sha1(const uint8_t *key, size_t key_len,
-                      const uint8_t *data, size_t data_len,
-                      uint8_t *out)
-{
-    sha1_ctx_t ctx;
-    uint8_t k_pad[SHA1_BLOCK_SIZE];
-    uint8_t tk[SHA1_DIGEST_SIZE];
-    int i;
-
-    // If key > block size, hash it first
-    if (key_len > SHA1_BLOCK_SIZE) {
-        sha1(key, key_len, tk);
-        key = tk;
-        key_len = SHA1_DIGEST_SIZE;
-    }
-
-    // Inner: SHA1(K ^ ipad || data)
-    memset(k_pad, 0x36, SHA1_BLOCK_SIZE);
-    for (i = 0; i < (int)key_len; i++)
-        k_pad[i] ^= key[i];
-
-    sha1_init(&ctx);
-    sha1_update(&ctx, k_pad, SHA1_BLOCK_SIZE);
-    sha1_update(&ctx, data, data_len);
-    sha1_final(&ctx, out);
-
-    // Outer: SHA1(K ^ opad || inner_hash)
-    memset(k_pad, 0x5C, SHA1_BLOCK_SIZE);
-    for (i = 0; i < (int)key_len; i++)
-        k_pad[i] ^= key[i];
-
-    sha1_init(&ctx);
-    sha1_update(&ctx, k_pad, SHA1_BLOCK_SIZE);
-    sha1_update(&ctx, out, SHA1_DIGEST_SIZE);
-    sha1_final(&ctx, out);
-}
-
 int immurok_keystore_totp(uint8_t idx, uint32_t unix_time, uint8_t *out6)
 {
-    // Read OTP secret (offset 60 = after name[30] + service[30])
-    uint8_t secret[32];
+    /* M12（2026-09-20）：secret 与全部 HMAC/SHA-1 工作缓冲放 work_buf 的 OTP
+     * 分区，不在栈上 —— 原来这条链吃 1024B 栈、溢出主栈砸进 work_buf。
+     * secret 读进分区末 32B；totp_compute 用分区头的 otp_work_t。两者不重叠。
+     * mark_busy 让 DEBUG 下 keystore 块操作若与此交错能被 assert_free 抓到
+     * （实际不会：命令串行、TOTP 不 yield，见 spec 前提）。 */
+    uint8_t *secret = SCRATCH_AT(SCRATCH_OTP_OFF + SCRATCH_OTP_LEN - 32);
     if (immurok_keystore_read(KEYSTORE_CAT_OTP, idx, 60, secret, 32) != 0)
         return -1;
 
-    // Trim trailing zero bytes
-    uint8_t sec_len = 32;
-    while (sec_len > 0 && secret[sec_len - 1] == 0)
-        sec_len--;
-    if (sec_len == 0) {
-        memset(secret, 0, 32);
-        return -1;
-    }
-
-    // time_step = unix_time / 30, big-endian 8 bytes
-    uint64_t step = (uint64_t)unix_time / 30;
-    uint8_t msg[8];
-    msg[0] = (uint8_t)(step >> 56);
-    msg[1] = (uint8_t)(step >> 48);
-    msg[2] = (uint8_t)(step >> 40);
-    msg[3] = (uint8_t)(step >> 32);
-    msg[4] = (uint8_t)(step >> 24);
-    msg[5] = (uint8_t)(step >> 16);
-    msg[6] = (uint8_t)(step >> 8);
-    msg[7] = (uint8_t)(step);
-
-    // HMAC-SHA1
-    uint8_t hmac[SHA1_DIGEST_SIZE];
-    hmac_sha1(secret, sec_len, msg, 8, hmac);
+    immurok_scratch_mark_busy(1);
+    int rc = totp_compute(secret, 32, unix_time, out6);
     memset(secret, 0, 32);
-
-    // Dynamic truncation (RFC 4226)
-    uint8_t offset = hmac[19] & 0x0F;
-    uint32_t code = ((uint32_t)(hmac[offset] & 0x7F) << 24)
-                  | ((uint32_t)hmac[offset + 1] << 16)
-                  | ((uint32_t)hmac[offset + 2] << 8)
-                  | ((uint32_t)hmac[offset + 3]);
-    code %= 1000000;
-
-    // Format as 6 ASCII digits
-    for (int i = 5; i >= 0; i--) {
-        out6[i] = '0' + (code % 10);
-        code /= 10;
-    }
-
-    return 0;
+    immurok_scratch_mark_busy(0);
+    return rc;
 }
 
 void immurok_keystore_reset(void)

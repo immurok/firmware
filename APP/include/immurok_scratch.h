@@ -31,7 +31,13 @@ extern uint8_t immurok_keystore_work_buf[4096];
  * 曾有 SCRATCH_PIN_OFF / SCRATCH_HIDKBD_OFF 两个分区，服务临时 PIN 的
  * 登记流程；2026-08-03 该流程移除后一并删除。 */
 #define SCRATCH_SLOTS_OFF   0     /* 64B  — immurok_slots 的页缓冲 */
-#define SCRATCH_TOTAL       64
+/* TOTP 计算工作区（M12，2026-09-20）：sha1 的 W[80]、hmac 的 sha1_ctx/k_pad/tk、
+ * hmac 结果，全放这里，把 1024B 栈拉回 512 内。只在 totp_compute 期间存活，
+ * 那时命令串行、TOTP 不 yield、work_buf 无其他用户（见 spec 前提 1-4）。
+ * otp_work_t 实际约 560B，留 1024 给足余量。 */
+#define SCRATCH_OTP_OFF     64
+#define SCRATCH_OTP_LEN     1024
+#define SCRATCH_TOTAL       1088
 
 #define SCRATCH_AT(off)  (&immurok_keystore_work_buf[(off)])
 

@@ -5,7 +5,7 @@
 // Block 6 (0x6000-0x6FFF) also holds the OTA ImageFlag at page 0 (0x6000, written
 // by hidkbd.c on OTA reboot). Use a SEPARATE 256B page (0x6F00, last page) + 256B
 // page-erase so set/clear never touches the OTA flag. Block 6 survives the tamper
-// wipe (which erases only keystore 0x0000-0x5FFF and BLE SNV 0x7000).
+// wipe (which erases only keystore 0x0000-0x5FFF and BLE SNV in block 7).
 #define TAMPER_FLAG_ADDR   0x6F00
 #define TAMPER_MAGIC       0x4F50454EUL   // "OPEN"
 
