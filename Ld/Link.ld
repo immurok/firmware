@@ -174,7 +174,7 @@ SECTIONS
      * During ECC operations (~2s), stack overflow goes into this area
      * rather than corrupting critical BLE state in .bss.
      * Only place buffers here that are NOT used during ECC/signing. */
-    .stack_guard :
+    .stack_guard (NOLOAD) :
     {
         . = ALIGN(4);
         *(.stack_guard)

@@ -1,0 +1,4 @@
+# 构建产物与 host 单测二进制不入库
+/build/
+/test/test_ftm_parse
+/test/test_ftm_parse.dSYM/

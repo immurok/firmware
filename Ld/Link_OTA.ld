@@ -165,7 +165,7 @@ SECTIONS
 
     /* Stack guard: large buffers placed between BSS and stack.
      * Stack overflow goes into this area rather than corrupting .bss. */
-    .stack_guard :
+    .stack_guard (NOLOAD) :
     {
         . = ALIGN(4);
         *(.stack_guard)

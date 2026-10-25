@@ -214,26 +214,76 @@ static uint8_t qc_test_flash(void)
     return 1;
 }
 
-// f) 32.768kHz 外部晶振（X2）：以主频（60MHz，独立于 32k 时钟域）为时间
-//    基准，测 RTC 32k 计数器在 100ms 窗口内的增量算实际频率。停振→增量 0；
-//    负载电容过大/虚焊→频偏。参考诊断固件 lse_probe.c 的 measure_hz 思路。
-//    合格窗口 32768Hz ±11%（约 2900-3600 计数/100ms）。
-#define QC_LSE_WINDOW_MS   100
-#define QC_LSE_CNT_MIN     2900   // 29.0 kHz
-#define QC_LSE_CNT_MAX     3600   // 36.0 kHz
-static uint8_t qc_test_lse(uint16_t *cnt_out)
+// f) 32.768kHz 外部晶振（X2）：以 SysTick（HCLK 60MHz，独立于 32k 时钟域）为时基开 1s
+//    窗口数 RTC 32k tick，期间泵 TMOS 不饿死 BLE。分辨率 1 tick ≈ 30ppm，合格窗 ±300ppm。
+//    只筛停振 / 虚焊 / 装错料：量产只用 9pF 与 12.5pF 标称负载的料（2026-10-25 决定），
+//    1.8.5 为 4pF 料加的「降驱动到 70% 测起振余量」已删。
+//    CH592 进 Sleep 后 SysTick 寄存器被硬件清零（CTLR=0，2026-10-25 真机确认；1.8.5 的
+//    实现假设它一直在跑，量产固件上 QC 永远卡在这一项），所以测量前必须重配 SysTick，
+//    测完校验它仍在跑；再加 RTC 3s 与迭代次数两道兜底，任何情况下都不会卡死。
+#define QC_LSE_WIN_CYC     FREQ_SYS            // 1s
+#define QC_LSE_DEV_MAX     10                  // ticks/1s ≈ ±305ppm
+#define QC_LSE_RTC_GUARD   (3u * 32768u)       // RTC 走过 3s 还没凑够 1s SysTick → 时基异常
+#define QC_LSE_ITER_GUARD  10000000u           // SysTick 与 32k 同时失效时的最后兜底
+
+// QC 期间把 SysTick 重新拉起来：64 位自由计数、HCLK 时基、清零、不开中断。
+// 与 immurok_BLEInit 的配置一致；只在 QC 测量前调用。
+static void qc_systick_arm(void)
 {
+    SysTick_Config(SysTick_LOAD_RELOAD_Msk);
+    PFIC_DisableIRQ(SysTick_IRQn);
+}
+
+static uint32_t qc_rtc_delta(uint32_t now, uint32_t then)
+{
+    return (now >= then) ? (now - then) : (now + (RTC_MAX_COUNT - then));   // 计数器自环
+}
+
+// 1s 窗口内数 32k tick，*dev_out = 相对 32768 的偏差（tick）。返回 1 成功，0 = 时基异常。
+// 只用 32 位除法：期望值 = 32768 + 超出部分/(FREQ_SYS/32768)（(uint64_t)/ 会拉进 ~1KB 库代码）。
+static uint8_t qc_lse_measure(int32_t *dev_out)
+{
+    volatile uint32_t *stk_lo = (volatile uint32_t *)&SysTick->CNT;   // 低 32 位，71s 才回绕
+    qc_systick_arm();
+    uint32_t c0 = *stk_lo;
     uint32_t r0 = RTC_GetCycle32k();
-    DelayMs(QC_LSE_WINDOW_MS);       // 主频忙等，不依赖 32k
-    WWDG_SetCounter(0);
-    uint32_t dr = RTC_GetCycle32k() - r0;   // 32k tick 增量（计数器自环，无符号差正确）
-    *cnt_out = (dr > 0xFFFF) ? 0xFFFF : (uint16_t)dr;
-    if(dr < QC_LSE_CNT_MIN || dr > QC_LSE_CNT_MAX) {
-        PRINT("QC: lse fail, %d ticks/100ms (want %d-%d)\n",
-              (int)dr, QC_LSE_CNT_MIN, QC_LSE_CNT_MAX);
+    uint32_t elapsed, iter = 0;
+    do {
+        TMOS_SystemProcess();
+        WWDG_SetCounter(0);
+        if(g_qc_phase == QC_PHASE_RUNNING)
+            qc_led((qc_ms_since(s_qc_run_start) / QC_SLOW_HALF_MS) & 1 ? 0 : 'W');
+        elapsed = *stk_lo - c0;
+        if(qc_rtc_delta(RTC_GetCycle32k(), r0) > QC_LSE_RTC_GUARD || ++iter > QC_LSE_ITER_GUARD) {
+            PRINT("QC: lse timebase fail, stk+%u iter=%u ctlr=%02X\n",
+                  (unsigned)elapsed, (unsigned)iter, (unsigned)SysTick->CTLR);
+            return 0;
+        }
+    } while(elapsed < QC_LSE_WIN_CYC);
+    uint32_t r1 = RTC_GetCycle32k();
+    if(!(SysTick->CTLR & SysTick_CTLR_STE)) {   // 测量中途被清零（不该发生：QC 持有 sleep_inhibit）
+        PRINT("QC: lse timebase lost\n");
         return 0;
     }
-    PRINT("QC: lse ok, %d ticks/100ms\n", (int)dr);
+    uint32_t dr = qc_rtc_delta(r1, r0);
+    uint32_t expect = 32768u + (elapsed - QC_LSE_WIN_CYC) / (FREQ_SYS / 32768u);
+    *dev_out = (int32_t)dr - (int32_t)expect;
+    return 1;
+}
+
+static uint8_t qc_test_lse(uint16_t *cnt_out)
+{
+    int32_t dev = 0;
+    if(!qc_lse_measure(&dev)) {
+        *cnt_out = 0;
+        return 0;
+    }
+    *cnt_out = (uint16_t)(32768 + dev);
+    if(dev < -QC_LSE_DEV_MAX || dev > QC_LSE_DEV_MAX) {
+        PRINT("QC: lse fail %d tick/1s (~%d ppm)\n", (int)dev, (int)dev * 30);
+        return 0;
+    }
+    PRINT("QC: lse ok %d tick/1s (~%d ppm)\n", (int)dev, (int)dev * 30);
     return 1;
 }
 

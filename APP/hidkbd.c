@@ -5375,8 +5375,13 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
                 s_param_replay_done = 0;
                 tmos_stop_task(s_led_task_id, PARAM_NOTIFY_EVT);
                 extern volatile uint8_t g_sleep_inhibit;
-                // QC 自检持有一个 ref，测试中的断链不能把它清掉
-                g_sleep_inhibit = g_qc_running ? 1 : 0;
+                // QC 自检持有一个 ref，测试中的断链不能把它清掉。
+                // 1.8.5 前这里直接覆写成 1/0：把 QC 的 +1 和 hiddev 参数协商期间的
+                // BLE-timeout hold（+1）一起抹平，随后协商成功那一路再 -1 就归零，
+                // QC 等触摸阶段 MCU 按 latency 20 每 1.3s 睡一次，短按按键漏检、
+                // 误判 btn 超时（2026-09-26 RF 板串口实测）。只在 QC 持有量丢失时补回。
+                if(g_qc_running) { if(g_sleep_inhibit == 0) g_sleep_inhibit = 1; }
+                else g_sleep_inhibit = 0;
                 s_long_op_param_requested = 0;
                 s_long_op_wait_start = 0;
                 s_long_op_busy = 0;

@@ -337,6 +337,14 @@ int main(void)
         immurok_BLEInit(slot, slot_mac);
     }
     HAL_Init();
+    // 32k 晶振的内置负载 / 驱动按 BOM 显式设置（LSE_LOAD_CAP 注释里有来龙去脉）。
+    // HAL_Init 已用复位默认值起振，这里只是换档，发生在任何 BLE 连接之前。
+    LSECFG_Capacitance(LSE_LOAD_CAP);
+    LSECFG_Current(LSE_DRIVE_CURRENT);
+    // 驱动常驻 200%，不按手册那样起振后自动降档（2026-09-27 决定：余量优先，待实测功耗后再议）。
+    // rd 版回读寄存器确认生效：C_LOAD 档 = 高 4 位（+12pF），I_TUNE = 低 2 位（3 = 200%）。
+    PRINT("X32K %02X %dpF i%d\n", R8_XT32K_TUNE,
+          (R8_XT32K_TUNE >> 4) + 12, R8_XT32K_TUNE & RB_XT32K_I_TUNE);
     GAPRole_PeripheralInit();
     HidDev_Init();
     HidEmu_Init();  // LED task registered here → blue blink starts
