@@ -284,6 +284,8 @@ static uint8_t s_wait_finger_lift = 0;  // Block new search until finger lifted
 // or the user lifting before 2s elapse. Cleared by the LED task's lock
 // handler (after the notify or the touch-released no-op) and on disconnect.
 static uint8_t s_lock_pending = 0;
+// 长按计时的起点（TOUCH 上升沿）。进入 WAIT_LIFT 时据此重排 LOCK_HOLD_EVT。
+static uint32_t s_lock_arm_tick = 0;
 
 // Async PS_Sleep retry state (driven by FP_SLEEP_RETRY_EVT in LED task).
 static uint32_t s_sleep_retry_start_tick = 0;
@@ -651,6 +653,13 @@ static uint8_t s_led_task_id;
 // actually receives it. Total user-perceived "press → lock" lands at ~2s.
 #define LOCK_HOLD_EVT       0x0004
 #define LOCK_HOLD_TICKS     1600    // 1s @ 625us/tick
+// 长按必须有「手指一直在」的证据。GEN_CHAR/SEARCH 期间传感器在算特征，
+// 既不采图、DETECT 也不可信，这段时间（未注册指纹 ~0.6-0.9s）固件看不到
+// 抬指。所以锁屏只能在 WAIT_LIFT 连续确认手指在位这么久之后才发：
+// 搜索期间抬起又按下的第二次短按，必须自己再按满这个窗口才算长按。
+#define LOCK_CONFIRM_TICKS  800     // 500ms
+// 搜索还没进 WAIT_LIFT 时 LOCK_HOLD_EVT 到点：顺延的轮询间隔
+#define LOCK_DEFER_TICKS    160     // 100ms
 // EEPROM_SAVE_EVT: deferred ECDH pairing data save. EEPROM_READ called
 // inline immediately after pair_compute_secret crashes the chip — see
 // immurok_security_pair_save_pending. Scheduled by the EXEC handler 200ms
@@ -841,6 +850,35 @@ static void fp_async_off_start(void)
     s_sleep_retry_start_tick = TMOS_GetSystemClock();
     s_sleep_retry_cycle_tick = s_sleep_retry_start_tick;
     tmos_set_event(s_led_task_id, FP_SLEEP_RETRY_EVT);
+}
+
+// 用户态搜索收尾的断电：fp_power_off() 之后检查传感器是否真进了
+// wake-on-touch standby，没进就跑 touch-reset 恢复（power on → 0x55 →
+// PS_Sleep → off，即按键恢复那套）。两种情况都会让下次触摸不再产生 IRQ：
+// (1) DETECT latch HIGH：PS_Sleep 撞上刚完成的 GET_IMAGE，VCC 一切芯片 MCU
+//     状态损坏。
+// (2) sleep no-ack(!slept)：CMD_SLEEP 没被确认。快速连按时最常见 —— 手指
+//     正好又落回传感器（按着时 R599S 不应答 PS_Sleep），或 BLE 高负载把
+//     100ms ack 窗口挤掉。此时 TOUCH 已被 IN_PD 拉低，只看 TOUCH_ReadPin()
+//     会漏判，必须靠 !slept 兜住。
+// 不要忽略 fp_power_off() 的返回值直接走人：那就是「连按几次后传感器锁死、
+// 只能按按键救」的来源。
+static void fp_power_off_recover(void)
+{
+    bool slept = fp_power_off();
+#if HAS_R599S
+    if(TOUCH_ReadPin() || !slept) {
+        PRINT("post-lift touch recovery (DETECT=%d slept=%d)\n",
+              TOUCH_ReadPin(), slept);
+        s_touch_reset = 1;
+        s_touch_reset_retry = 0;
+        fp_power_on();
+        s_fp_power_on_tick = RTC_GetCycle32k();
+        tmos_start_task(hidEmuTaskId, FP_WAKE_DONE_EVT, 48);  // 30ms
+    }
+#else
+    (void)slept;
+#endif
 }
 
 // Forward decls — ota_abort_to_idle and ota_kick_timeout are defined later
@@ -1149,6 +1187,26 @@ static uint16_t LED_ProcessEvent(uint8_t task_id, uint16_t events)
         // the user is holding *for* one of those flows; firing LOCK_REQUEST
         // in parallel pops a "lock screen?" dialog over the active sudo /
         // unlock / enroll guidance and is always wrong.
+#ifndef FP_USE_AUTO_IDENTIFY
+        // 搜索还在 GET_IMAGE/GEN_CHAR/SEARCH（state<3）：这期间没有任何抬指
+        // 采样，「到点了还 pending」不等于「一直按着」。未注册/识别不佳的
+        // 指纹搜索本身就可能超过 1s，此时直接发锁屏就是把两次短按（甚至一次
+        // 短按）当成长按。顺延到搜索出结果：进 WAIT_LIFT 时会重排本事件，
+        // 其余出口（false touch / 抬指）会清 pending。
+        //
+        // gate/auth/enroll 期间不顺延：gate 模式下 GET_IMAGE「无手指」会一直
+        // 重试到 25s，s_search_active 全程为 1，顺延下去 pending 就活过了
+        // gate —— GATE_CANCEL / gate 超时清掉 gate 标志的瞬间落到下面的
+        // 正常分支，误发锁屏。直接往下走，由 in_gate 分支抑制并清 pending。
+        if(s_lock_pending && s_search_active && s_search_state < 3
+           && s_pending_cmd == 0
+           && !immurok_security_has_pending_auth()
+           && !s_enroll_active)
+        {
+            tmos_start_task(s_led_task_id, LOCK_HOLD_EVT, LOCK_DEFER_TICKS);
+            return events ^ LOCK_HOLD_EVT;
+        }
+#endif
         {
             uint8_t in_gate = (s_pending_cmd != 0
                                || immurok_security_has_pending_auth()
@@ -1185,6 +1243,31 @@ static uint16_t LED_ProcessEvent(uint8_t task_id, uint16_t events)
 /*********************************************************************
  * LOCAL FUNCTIONS
  */
+
+// 进入 WAIT_LIFT / WAIT_LIFT 里看到一次「无手指」时调用：把长按锁屏的触发点
+// 推到「从现在起再连续按住 LOCK_CONFIRM_TICKS」之后（且不早于原定的 1s）。
+// from_touch=1 表示保留原 1s 起点（刚进 WAIT_LIFT）；0 表示中途出现过离手
+// 迹象，窗口整个重新计。
+static void lock_hold_rearm(uint8_t from_touch)
+{
+#if HAS_RGB_LED
+    if(!s_lock_pending) return;
+    uint32_t ticks = LOCK_CONFIRM_TICKS;
+    if(from_touch) {
+        uint32_t elapsed = TMOS_GetSystemClock() - s_lock_arm_tick;
+        if(elapsed < LOCK_HOLD_TICKS && (LOCK_HOLD_TICKS - elapsed) > ticks)
+            ticks = LOCK_HOLD_TICKS - elapsed;
+    }
+    tmos_stop_task(s_led_task_id, LOCK_HOLD_EVT);
+    // stop 只停定时器。事件若已到点置位、只是还没轮到 LED 任务派发，它会在
+    // 本函数返回后以 state==3 立即触发，把确认窗口整个跳过。这里是 hidEmu
+    // 任务上下文（不是 LOCK_HOLD_EVT 自己的处理函数），可以 clear。
+    tmos_clear_event(s_led_task_id, LOCK_HOLD_EVT);
+    tmos_start_task(s_led_task_id, LOCK_HOLD_EVT, ticks);
+#else
+    (void)from_touch;
+#endif
+}
 
 // Reset fingerprint power-off timer (call after any FP operation while module
 // is powered). State machine iterations refresh this on every step; once the
@@ -2476,6 +2559,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 // so a release before 2s naturally cancels (no explicit stop
                 // needed except on disconnect, where the timer is purged).
                 s_lock_pending = 1;
+                s_lock_arm_tick = TMOS_GetSystemClock();
                 tmos_start_task(s_led_task_id, LOCK_HOLD_EVT, LOCK_HOLD_TICKS);
 #endif
 
@@ -2490,6 +2574,14 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 {
                     PRINT_V("Waking FP module (async)...\n");
                     fp_power_on();
+                    // 上一次搜索收尾走同步 fp_power_off()，不会取消 500ms 空闲
+                    // 定时器（FP_POWER_OFF_EVT）。间隔 ~460ms 的连按里，它正好在
+                    // 这次上电后、等 0x55 的几十 ms 内到点：看到「模块有电」就
+                    // 启动异步 PS_Sleep，随后 FP_SEARCH_EVT 的忙门把刚开始的搜索
+                    // 掐掉 —— s_lock_pending 没人清（1s 后误发锁屏），GET_IMAGE 的
+                    // ack 还可能被异步机当成 sleep ack 而带着手指切电（传感器锁死）。
+                    // 上电即重排，把陈旧的定时器顶掉。2026-11-18 真机诊断确认。
+                    fp_reset_power_timer();
                     s_fp_power_on_tick = RTC_GetCycle32k();
                     tmos_start_task(hidEmuTaskId, FP_WAKE_DONE_EVT, 48);  // 30ms (poll for 0x55)
                 }
@@ -2591,8 +2683,28 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 return (events ^ FP_WAKE_DONE_EVT);  // s_touch_reset 保持 1
             }
             if(!reset_slept) {
-                PRINT("Touch reset: still no-ack after %d retries, giving up\n",
+                // 同步重试用尽还是没 ack：最可能是手指一直压着/反复落在传感器
+                // 上（按着时 R599S 不应答 PS_Sleep），每次重试都是「带着手指
+                // 切 VCC」。就此放手 = 传感器留在非 standby，触摸中断再也不来。
+                // 改交给异步 PS_Sleep 状态机：保持供电、每 1s 重发、等到抬指后
+                // 的 ack 再断电，期间新的触摸由 TOUCH_SCAN_EVT 的
+                // s_sleep_retry_active 分支挡住。
+                PRINT("Touch reset: still no-ack after %d retries, async sleep handoff\n",
                       s_touch_reset_retry);
+                s_touch_reset_retry = 0;
+                s_touch_reset = 0;
+                s_wait_finger_lift = 1;   // 异步 sleep ack（=抬指）时清
+                fp_power_on();
+                fp_async_off_start();
+                // 刚上电：先等 0x55 再发 PS_Sleep（事件尚未派发，此处改写安全）
+                s_sleep_retry_substate = 2;
+                // fp_async_off_start() 停掉了 FP_POWER_OFF_EVT，而它同时是 gate
+                // 的 25s 看门狗（touch-reset 期间进来的 gate 由 fp_gate_enter
+                // 的忙分支武装）。不续上的话设备侧 gate 永不超时。
+                if(s_pending_cmd != 0 || immurok_security_has_pending_auth()) {
+                    tmos_start_task(hidEmuTaskId, FP_POWER_OFF_EVT, 1600);  // 1s
+                }
+                return (events ^ FP_WAKE_DONE_EVT);
             }
             s_touch_reset_retry = 0;
             s_touch_reset = 0;
@@ -3001,7 +3113,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     if(TOUCH_ReadPin())
                     {
                         PRINT("DETECT latched after timeout, power-cycling FP\n");
-                        fp_power_off();
+                        fp_power_off_recover();
                         s_wait_finger_lift = 0;
                     }
 #endif
@@ -3101,7 +3213,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                         tmos_stop_task(s_led_task_id, LOCK_HOLD_EVT);
                         led_solid('R', 400);  // red 0.25s
 #endif
-                        fp_power_off();
+                        fp_power_off_recover();
                     }
                 }
                 else
@@ -3238,7 +3350,12 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 // long-press lock has already triggered (1s) and the user
                 // is no longer waiting on lift detection — switch to the
                 // async PS_Sleep path which is quiet on the UART.
-                if(s_wait_lift_no_match
+                // 长按锁屏还没出结论（s_lock_pending）时不收：软上限一停，抬指
+                // 采样就没了，而 LOCK_HOLD_EVT 仍会到点直接发 —— 搜索慢（>1.5s）
+                // 或窗口被 0x02 推后时，用户随后抬指也照锁不误。pending 最迟在
+                // 最后一次 0x02 之后 LOCK_CONFIRM_TICKS 内了结（发出或抬指取消），
+                // 多轮询的这一小段远低于 DETECT-latch 的阈值；60s 硬上限兜底。
+                if(s_wait_lift_no_match && !s_lock_pending
                    && lift_elapsed > FP_WAIT_LIFT_NOMATCH_SOFT_TMO_MS) {
                     PRINT("WAIT_LIFT no-match soft cap (%dms), async off\n",
                           (int)lift_elapsed);
@@ -3286,6 +3403,11 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 s_search_substate = 0;
                 if(ret == FP_OK && ack == 0x02) {
                     s_lift_confirm++;
+                    // 出现过一次「无手指」= 接触可能中断过（抬起后又按下的
+                    // 第二次短按会把 debounce 清零，看起来像一直按着）。
+                    // 不直接取消（R599S 按压中途偶发 0x02），而是让长按窗口
+                    // 从这里重新计。
+                    lock_hold_rearm(0);
                     if(s_lift_confirm < FP_WAIT_LIFT_CONFIRM_NEEDED) {
                         // Need another consecutive 0x02 to confirm lift.
                         tmos_start_task(hidEmuTaskId, FP_SEARCH_EVT, 32);  // 20ms
@@ -3313,28 +3435,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                     }
 #endif
                     if(!s_enroll_active) {
-                        bool slept = fp_power_off();
-#if HAS_R599S
-                        // 两种 race 都会让下次 touch-wake 失效,都要跑 touch-reset
-                        // 恢复(power on → 0x55 → PS_Sleep → off,即按钮恢复那套):
-                        // (1) DETECT latch HIGH：PS_Sleep 撞上刚完成的 GET_IMAGE,
-                        //     VCC 一切芯片 MCU 状态损坏,touch IRQ 不再触发。
-                        // (2) sleep no-ack(!slept)：CMD_SLEEP 没被确认,R599S 没进
-                        //     wake-on-touch standby;2-step pair 期间 BLE 高负载会把
-                        //     sleep 的 ack 窗口挤掉(TMOS_SystemProcess 阻塞几百 ms),
-                        //     是高发场景。此时 TOUCH 已被 IN_PD 拉低,只看
-                        //     TOUCH_ReadPin() 会漏判,必须靠 !slept 兜住。
-                        if(TOUCH_ReadPin() || !slept) {
-                            PRINT("post-lift touch recovery (DETECT=%d slept=%d)\n",
-                                  TOUCH_ReadPin(), slept);
-                            s_touch_reset = 1;
-                            s_touch_reset_retry = 0;
-                            fp_power_on();
-                            s_fp_power_on_tick = RTC_GetCycle32k();
-                            tmos_start_task(hidEmuTaskId,
-                                            FP_WAKE_DONE_EVT, 48);  // 30ms
-                        }
-#endif
+                        fp_power_off_recover();
                     } else {
                         fp_reset_power_timer();  // keep module alive for enrollment
                     }
@@ -3815,6 +3916,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             s_lift_confirm = 0;
             s_wait_finger_lift = 0;
             s_wait_lift_no_match = 0;  // match path: no soft cap
+            lock_hold_rearm(1);
             fp_reset_power_timer();
             tmos_start_task(hidEmuTaskId, FP_SEARCH_EVT, 32);  // 20ms
         } else if(fp_is_powered() && (s_pending_cmd != 0 || immurok_security_has_pending_auth())) {
@@ -3873,6 +3975,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 s_lift_confirm = 0;
                 s_wait_finger_lift = 0;
                 s_wait_lift_no_match = 1;
+                lock_hold_rearm(1);
                 fp_reset_power_timer();
                 tmos_start_task(hidEmuTaskId, FP_SEARCH_EVT, 32);  // 20ms
             } else {
@@ -4513,6 +4616,13 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         // power-off — skip to avoid running the synchronous path in parallel
         // (would issue a duplicate PS_Sleep and block ~4s on no-ack).
         if(s_sleep_retry_active) {
+            // 断电归异步机管，但本事件同时是 gate 的 25s 看门狗：直接吃掉
+            // 的话 gate 就再也不会在设备侧超时。有 gate 挂起时 1s 后再来，
+            // 等异步机收尾后走下面的 gate 判定。
+            if(!s_enroll_active &&
+               (s_pending_cmd != 0 || immurok_security_has_pending_auth())) {
+                tmos_start_task(hidEmuTaskId, FP_POWER_OFF_EVT, 1600);  // 1s
+            }
             return (events ^ FP_POWER_OFF_EVT);
         }
         // Two arming paths feed this event:
