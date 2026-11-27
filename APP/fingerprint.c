@@ -10,6 +10,7 @@
 #include "fingerprint.h"
 #include "hardware_pins.h"
 #include "ws2812.h"
+#include "immurok_scratch.h"
 #include <string.h>
 
 // Use SDK PRINT macro (requires DEBUG defined)
@@ -230,7 +231,7 @@ static int uart_recv(uint8_t *data, uint16_t max_len, uint32_t timeout_ms)
                 WWDG_SetCounter(0);
                 if(!s_in_uart_tmos_kick) {
                     s_in_uart_tmos_kick = 1;
-                    TMOS_SystemProcess();
+                    TMOS_NESTED_PUMP();
                     s_in_uart_tmos_kick = 0;
                 }
             }
@@ -705,7 +706,7 @@ bool fp_power_off(void)
         // Keep BLE alive during the wait. Reentrancy guard mirrors uart_recv.
         if (!s_in_uart_tmos_kick) {
             s_in_uart_tmos_kick = 1;
-            TMOS_SystemProcess();
+            TMOS_NESTED_PUMP();
             s_in_uart_tmos_kick = 0;
         }
     }

@@ -18,6 +18,7 @@
 #include "CH59x_common.h"
 #include "CONFIG.h"
 #include "../LIB/uECC.h"
+#include "immurok_ecc_fast.h"
 extern void uECC_set_watchdog_cb(void (*cb)(void));
 #include "totp_core.h"
 #include <string.h>
@@ -55,6 +56,36 @@ uint8_t immurok_keystore_work_buf[4096] __attribute__((section(".stack_guard"), 
 static uint8_t s_scratch_busy = 0;
 
 void immurok_scratch_mark_busy(uint8_t busy) { s_scratch_busy = busy; }
+int  immurok_scratch_is_busy(void) { return s_scratch_busy != 0; }
+
+/* 嵌套泵 TMOS 的深度，见 immurok_scratch.h。 */
+volatile uint8_t g_tmos_nested = 0;
+
+#ifdef TMOS_NESTED_DIAG
+immurok_nest_diag_t g_nest_diag;
+
+int immurok_tmos_nested_at(uint8_t site)
+{
+    static uint8_t streak[NEST_SITE_COUNT];
+    int yes = 0;
+
+    if (g_tmos_nested != 0) {
+        yes = 1;
+        if (g_nest_diag.hits[site] != 0xFF) g_nest_diag.hits[site]++;
+    } else if (g_nest_diag.force_left && (g_nest_diag.force_mask & (1u << site))) {
+        yes = 1;
+        g_nest_diag.force_left--;
+        if (g_nest_diag.forced[site] != 0xFF) g_nest_diag.forced[site]++;
+    }
+    if (yes) {
+        if (streak[site] != 0xFF) streak[site]++;
+        if (streak[site] > g_nest_diag.streak_max) g_nest_diag.streak_max = streak[site];
+    } else {
+        streak[site] = 0;
+    }
+    return yes;
+}
+#endif
 
 void immurok_scratch_assert_free(const char *who)
 {
@@ -84,20 +115,15 @@ static uint8_t s_result_len = 0;
 static uint8_t s_ecc_privkey[32] __attribute__((aligned(4)));
 static uint8_t s_ecc_entry[112] __attribute__((aligned(4)));  // 16B name + 64B pubkey + 32B privkey
 
-// Watchdog + TMOS kick during uECC long computations (~2s).
-// TMOS_SystemProcess() is required to keep BLE LL alive during blocking ECC.
-// Stack guard: immurok_keystore_work_buf[4096] sits between .bss and .stack,
-// so any overflow during TMOS processing goes into unused buffer, not BLE state.
-static volatile uint8_t s_in_tmos_kick = 0;
-static void keystore_watchdog_kick(void)
+// ECC 长循环里的喂狗回调（immurok_ecc_fast.c 用）。只喂狗，不泵 TMOS。
+//
+// 以前这里每次回调泵一次 TMOS_SystemProcess()，想在 ~2s 的阻塞里保住 BLE 链路。实测保不住
+// （2000ms 超时下算完即断），还带来嵌套派发的重入和栈深问题。现在标量乘从 RAM 执行，一次
+// 运算只有几百毫秒，远小于 supervision timeout，不需要中途服务链路；而且标量乘期间
+// work_buf 里放着正在执行的代码，绝不能让别的任务插进来用它。
+void immurok_wdt_kick(void)
 {
     WWDG_SetCounter(0);
-    if(!s_in_tmos_kick)
-    {
-        s_in_tmos_kick = 1;
-        TMOS_SystemProcess();
-        s_in_tmos_kick = 0;
-    }
 }
 
 // uECC 的随机源：1.8.3 起是 immurok_rng（SHA-256 池式 DRBG），熵由
@@ -233,12 +259,11 @@ static int save_header(uint8_t cat)
     // Determine which block the header lives in
     uint32_t block_base = h_addr & ~0xFFF;
 
-    // Read entire block
-    {
-        uint32_t saved = __risc_v_disable_irq();
-        EEPROM_READ(block_base, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
-        __risc_v_enable_irq(saved);
-    }
+    // 从读出整块到写回，全程关中断：这期间 work_buf 里是待写回的那一块，中断现场
+    // （LLE 一进来就压 128 字节）若落进 work_buf 顶部，会被原样写回 Flash。Flash 例程
+    // 自己本来就各自关着中断跑，这里只是把它们之间微秒级的空档也盖住。
+    uint32_t saved = __risc_v_disable_irq();
+    EEPROM_READ(block_base, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
 
     // Patch header in buffer
     uint16_t offset_in_block = h_addr - block_base;
@@ -249,6 +274,7 @@ static int save_header(uint8_t cat)
     EEPROM_ERASE(block_base, EEPROM_BLOCK_SIZE);
     WWDG_SetCounter(0);
     EEPROM_WRITE(block_base, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+    __risc_v_enable_irq(saved);
 
     return 0;
 }
@@ -274,11 +300,9 @@ static int write_entry(uint8_t cat, uint16_t idx, const uint8_t *entry_data)
     uint8_t  crosses_block = (first_chunk < e_size) ? 1 : 0;
 
     // --- First block (always needed) ---
-    {
-        uint32_t saved = __risc_v_disable_irq();
-        EEPROM_READ(entry_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
-        __risc_v_enable_irq(saved);
-    }
+    // 读改写全程关中断，理由同 save_header。
+    uint32_t saved = __risc_v_disable_irq();
+    EEPROM_READ(entry_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
     uint16_t copy1 = crosses_block ? first_chunk : e_size;
     memcpy(&immurok_keystore_work_buf[off_in_block], entry_data, copy1);
 
@@ -292,28 +316,25 @@ static int write_entry(uint8_t cat, uint16_t idx, const uint8_t *entry_data)
     EEPROM_ERASE(entry_block, EEPROM_BLOCK_SIZE);
     WWDG_SetCounter(0);
     EEPROM_WRITE(entry_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+    __risc_v_enable_irq(saved);
 
     // --- Second block (only if entry crosses boundary) ---
     if (crosses_block) {
         uint32_t next_block = entry_block + EEPROM_BLOCK_SIZE;
         uint16_t copy2 = e_size - first_chunk;
-        {
-            uint32_t saved = __risc_v_disable_irq();
-            EEPROM_READ(next_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
-            __risc_v_enable_irq(saved);
-        }
+        saved = __risc_v_disable_irq();
+        EEPROM_READ(next_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
         memcpy(&immurok_keystore_work_buf[0], entry_data + first_chunk, copy2);
         WWDG_SetCounter(0);
         EEPROM_ERASE(next_block, EEPROM_BLOCK_SIZE);
         WWDG_SetCounter(0);
         EEPROM_WRITE(next_block, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+        __risc_v_enable_irq(saved);
     }
 
-    // If header is in a different block, save it separately
-    if (entry_block != header_block) {
-        save_header(cat);
-    }
-
+    // header 在另一块时不在这里存：两个调用者（commit / delete）随后都会重算校验和
+    // 再调 save_header。原来这里嵌套调的那一次不但多擦一遍，还把调用栈又加深 48 字节，
+    // 正是它让 Flash 例程的栈帧落进 work_buf 末尾、写坏块尾 12 字节（2026-11-26 审计）。
     return 0;
 }
 
@@ -329,7 +350,7 @@ void immurok_keystore_init(void)
     PRINT("Keystore init...\n");
 
     uECC_set_rng(immurok_rng_fill);
-    uECC_set_watchdog_cb(keystore_watchdog_kick);
+    uECC_set_watchdog_cb(immurok_wdt_kick);
     immurok_entropy_reseed();   // 开机播种；每次生成密钥前还会再采一轮
 
     for (uint8_t i = 0; i < KEYSTORE_CAT_COUNT; i++) {
@@ -430,6 +451,11 @@ int immurok_keystore_commit(uint8_t cat, uint8_t idx)
     uint16_t e_size, max_e;
     uint32_t magic;
 
+    // 嵌套派发时栈太深，整块读改写会把栈帧写回 Flash（见 immurok_scratch.h）。
+    // 调用方应当先把自己重新排期；走到这里就拒绝，不改任何状态。
+    if (immurok_tmos_nested_at(NEST_SITE_KS))
+        return -1;
+
     if (get_section_params(cat, &h_addr, &e_addr, &e_size, &max_e, &magic) != 0)
         return -1;
 
@@ -490,6 +516,9 @@ int immurok_keystore_delete(uint8_t cat, uint8_t idx)
     uint32_t h_addr, e_addr;
     uint16_t e_size, max_e;
     uint32_t magic;
+
+    if (immurok_tmos_nested_at(NEST_SITE_KS))   // 同 commit
+        return -1;
 
     if (get_section_params(cat, &h_addr, &e_addr, &e_size, &max_e, &magic) != 0)
         return -1;
@@ -562,15 +591,21 @@ int immurok_keystore_sign(uint8_t idx, const uint8_t *hash32, uint8_t *sig64)
 
     uECC_Curve curve = uECC_secp256r1();
     PRINT("ECDSA sign...\n");
-    // 每次签名前重设 BLE 保活 kick —— OTA verify(hidkbd.c)会把它清成 NULL,
-    // 而 keystore_init 只在开机设一次(s_initialized 挡住重设)。不重设的话
-    // OTA 之后 uECC_sign 裸跑 ~2s 无保活,重连后 supervision=2000ms 下必断链
-    // (签名成功但结果发不回)。见 keng.md / project_macos27_conn_params。
-    uECC_set_watchdog_cb(keystore_watchdog_kick);
+    // 每次签名前重设喂狗回调 —— OTA verify(hidkbd.c)会把它清成 NULL,而 keystore_init
+    // 只在开机设一次。不重设的话 OTA 之后签名里的模逆等步骤不喂狗。
+    uECC_set_watchdog_cb(immurok_wdt_kick);
     immurok_entropy_reseed();   // k 取自 DRBG，签名前再采一轮硬件熵（审计 H4）
     WWDG_SetCounter(0);
+    // 里面的标量乘从 RAM 执行（immurok_ecc_fast.c），整次签名约 0.5s。
     int ret = uECC_sign(s_ecc_privkey, hash_le, 32, sig64, curve);
     WWDG_SetCounter(0);
+    if (immurok_ecc_fast_take_fault()) ret = 0;   // 栈写穿过保护带：结果不可信
+    if (!ret) {
+        // 失败时不留任何东西给 KEY_RESULT 读：sig64 通常就是结果缓冲本身，
+        // 里面可能是一份被判为不可信的签名，长度字段也可能还是上一次成功时的 64。
+        memset(sig64, 0, 64);
+        s_result_len = 0;
+    }
     PRINT("ECDSA sign done: %d\n", ret);
 
     memset(s_ecc_privkey, 0, 32);
@@ -601,7 +636,11 @@ int immurok_keystore_generate_stage(const uint8_t *name16, uint8_t *pub64)
     immurok_entropy_reseed();   // 新私钥前重新采一轮硬件熵（审计 H4）
     WWDG_SetCounter(0);
     // pub64 gets public key (also copied to entry), privkey goes to entry+80
-    if (!uECC_make_key(pub64, &s_ecc_entry[80], curve)) {
+    int mk_ok = uECC_make_key(pub64, &s_ecc_entry[80], curve);
+    // 故障标记读即清，必须无条件读：写成 `!make_key || take_fault()` 会在 make_key 失败时
+    // 短路，标记留到下一次无关的运算才被读到。
+    if (immurok_ecc_fast_take_fault()) mk_ok = 0;
+    if (!mk_ok) {
         PRINT("uECC_make_key failed\n");
         memset(s_ecc_entry, 0, 112);
         return -1;
@@ -684,6 +723,8 @@ void immurok_keystore_reset(void)
     }
 
     // Clear SSH header in block 0 (read-modify-write to preserve security data)
+    // 读改写全程关中断，理由同 save_header。
+    uint32_t saved = __risc_v_disable_irq();
     EEPROM_READ(0x0000, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
     memset(&immurok_keystore_work_buf[SSH_HEADER_ADDR], 0xFF,
            EEPROM_BLOCK_SIZE - SSH_HEADER_ADDR);
@@ -691,6 +732,7 @@ void immurok_keystore_reset(void)
     EEPROM_ERASE(0x0000, EEPROM_BLOCK_SIZE);
     WWDG_SetCounter(0);
     EEPROM_WRITE(0x0000, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+    __risc_v_enable_irq(saved);
 
     // Reset cached headers
     for (uint8_t i = 0; i < KEYSTORE_CAT_COUNT; i++) {

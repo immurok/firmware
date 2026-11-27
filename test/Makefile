@@ -4,7 +4,7 @@ CC      ?= cc
 CFLAGS  := -std=c11 -Wall -Wextra -Werror -g -O0 \
            -I. -I../APP/include -DIMMUROK_HOST_TEST
 SRC     := fake_eeprom.c
-TESTS   := test_smoke test_slots test_slot_meta test_snv test_tick test_fp_policy test_sha256 test_rng test_pair_policy test_totp
+TESTS   := test_smoke test_slots test_slot_meta test_snv test_tick test_fp_policy test_sha256 test_rng test_pair_policy test_totp test_ecc_ram_policy test_ecc_fast
 
 .PHONY: all clean
 all: $(TESTS)
@@ -40,5 +40,20 @@ test_pair_policy: test_pair_policy.c
 test_totp: test_totp.c ../APP/totp_core.c ../LIB/sha1.c
 	$(CC) $(CFLAGS) -I../LIB -o $@ $^
 
+test_ecc_ram_policy: test_ecc_ram_policy.c
+	$(CC) $(CFLAGS) -o $@ $^
+
+# micro-ecc 不是按 -Wextra -Werror 写的，两份拷贝单独用宽松选项编；宏定义与固件 Makefile 一致。
+UECC_DEFS := -DuECC_PLATFORM=uECC_arch_other -DuECC_WORD_SIZE=4 -DuECC_OPTIMIZATION_LEVEL=2 \
+             -DuECC_SUPPORTS_secp160r1=0 -DuECC_SUPPORTS_secp192r1=0 -DuECC_SUPPORTS_secp224r1=0 \
+             -DuECC_SUPPORTS_secp256r1=1 -DuECC_SUPPORTS_secp256k1=1 \
+             -DuECC_SUPPORT_COMPRESSED_POINT=1 -DuECC_VLI_NATIVE_LITTLE_ENDIAN=1
+UECC_CFLAGS := -std=gnu99 -w -g -O1 -I. -I../APP/include -I../LIB -DIMMUROK_HOST_TEST $(UECC_DEFS)
+
+test_ecc_fast: test_ecc_fast.c test_ecc_fast_ref.c ../APP/immurok_ecc_fast.c ../LIB/uECC.c
+	$(CC) $(UECC_CFLAGS) -c ../APP/immurok_ecc_fast.c -o test_ecc_fast.fast.o
+	$(CC) $(UECC_CFLAGS) -c test_ecc_fast_ref.c -o test_ecc_fast.ref.o
+	$(CC) $(CFLAGS) -I../LIB $(UECC_DEFS) -o $@ test_ecc_fast.c test_ecc_fast.fast.o test_ecc_fast.ref.o
+
 clean:
-	rm -f $(TESTS)
+	rm -f $(TESTS) *.o

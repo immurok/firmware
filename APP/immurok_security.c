@@ -13,12 +13,16 @@
 #include "CONFIG.h"
 #include "../LIB/sha256.h"
 #include "../LIB/uECC.h"
+#include "immurok_ecc_fast.h"
 #include <string.h>
 
 // ============================================================================
 // HKDF-SHA256 (Extract + Expand, single output block = 32 bytes)
 // ============================================================================
 
+// 不许内联：它只在 pair_compute_secret 里、标量乘算完之后才调用。内联进去的话，它的
+// 局部缓冲会算进调用者的栈帧，在标量乘期间白占约 100 字节栈（见 immurok_ecc_fast.c）。
+__attribute__((noinline))
 static void hkdf_sha256(const uint8_t *salt, size_t salt_len,
                         const uint8_t *ikm, size_t ikm_len,
                         const uint8_t *info, size_t info_len,
@@ -267,7 +271,16 @@ int immurok_security_pair_init(void)
     return 0;
 }
 
-// Step 2: Called from TMOS event — heavy computation (~2s)
+// 配对在运算开始前被放弃（链路条件不够等）：把状态机收回 IDLE、擦掉临时私钥。
+// 不复位的话，状态停在 MAKE_KEY / SHARED_SECRET，下一次执行事件会把别的操作当成
+// ECDH 来跑，切换指纹也会一直被「pairing in progress」挡住，直到重启。
+void immurok_security_pair_abort(void)
+{
+    memset(s_ecdh_priv, 0, 32);
+    s_ecdh_state = ECDH_STATE_IDLE;
+}
+
+// Step 2: Called from TMOS event — heavy computation
 int immurok_security_pair_make_key(void)
 {
     PRINT("ECDH make_key start...\n");
@@ -275,8 +288,10 @@ int immurok_security_pair_make_key(void)
 
     immurok_entropy_reseed();   // 临时私钥前重新采一轮硬件熵（审计 H4）
     WWDG_SetCounter(0);
+    // 里面的标量乘从 RAM 执行（immurok_ecc_fast.c）。
     int ret = uECC_make_key(s_ecdh_pub, s_ecdh_priv, curve);
     WWDG_SetCounter(0);
+    if (immurok_ecc_fast_take_fault()) ret = 0;   // 栈写穿过保护带：结果不可信
 
     if (!ret) {
         PRINT("ECDH make_key FAILED\n");
@@ -371,27 +386,35 @@ int immurok_security_pair_compute_secret(void)
     PRINT("ECDH shared_secret start...\n");
     uECC_Curve curve = uECC_secp256r1();
 
+    // 这三块缓冲（129 字节）原来在栈上。标量乘从 RAM 执行后，栈和搬进 work_buf 的代码
+    // 共用一段空间，放栈上白占余量（四个入口里现在最深的是签名），所以挪到 ECC 留出的借用区：
+    // 标量乘不会动那里，也没有别人在这期间用 work_buf（本函数不向分发器返回）。
+    uint8_t *scratch = immurok_ecc_fast_scratch();
+    uint8_t *app_pub = scratch;                 // 64B，4 字节对齐
+    uint8_t *secret = scratch + 64;             // 32B，4 字节对齐
+    uint8_t *compressed_le = scratch + 96;      // 33B
+
     // Convert App compressed pubkey from BE to LE
-    uint8_t compressed_le[33];
     compressed_le[0] = s_ecdh_app_compressed[0];  // prefix byte
     memcpy(&compressed_le[1], &s_ecdh_app_compressed[1], 32);
     reverse_32(&compressed_le[1]);  // x: BE → LE
 
     // Decompress to full public key (LE)
-    uint8_t app_pub[64] __attribute__((aligned(4)));
     uECC_decompress(compressed_le, app_pub, curve);
 
     // Compute shared secret (LE)
-    uint8_t secret[32] __attribute__((aligned(4)));
     WWDG_SetCounter(0);
+    // 里面的标量乘从 RAM 执行（immurok_ecc_fast.c）。
     int ret = uECC_shared_secret(app_pub, s_ecdh_priv, secret, curve);
     WWDG_SetCounter(0);
+    if (immurok_ecc_fast_take_fault()) ret = 0;   // 栈写穿过保护带：结果不可信
 
     // Clear private key immediately
     memset(s_ecdh_priv, 0, 32);
 
     if (!ret) {
         PRINT("ECDH shared_secret FAILED\n");
+        memset(secret, 0, 32);   // 借用区在 work_buf 里，失败也不能把共享密钥留在那儿
         s_ecdh_state = ECDH_STATE_IDLE;
         return -1;
     }
@@ -575,6 +598,9 @@ static int save_security_data(void)
         PRINT("!! refusing save_security_data: slot 2 key in RAM, not yet committed\n");
         return -1;
     }
+    // 嵌套派发时栈太深，整块读改写会把栈帧写回 Flash（见 immurok_scratch.h）。
+    if (immurok_tmos_nested_at(NEST_SITE_SEC))
+        return -1;
     uint8_t ret;
 
     s_data.magic = STORAGE_MAGIC_V3;
@@ -584,38 +610,35 @@ static int save_security_data(void)
     PRINT("save_security_data: magic=0x%08lX, paired=%d\n",
           s_data.magic, s_data.paired);
 
-    // Read-modify-write to preserve keystore data sharing Block 0. Wrap
-    // the READ in a global-IRQ disable as defense-in-depth — earlier
-    // testing showed inline calls right after ECC could fault into the
-    // IAP bootloader. Caller now defers this whole function via a TMOS
-    // event 200ms after the PAIR_CONFIRM response, so the call stack is
-    // fully unwound; the IRQ wrapper is belt-and-braces.
-    {
-        uint32_t saved = __risc_v_disable_irq();
-        EEPROM_READ(SECURITY_DATA_ADDR, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
-        __risc_v_enable_irq(saved);
-    }
+    // Read-modify-write to preserve keystore data sharing Block 0.
+    //
+    // 从读出整块到写回，全程关中断：这期间 work_buf 里是待写回的那一块，栈或中断现场
+    // 只要压进 work_buf 顶部，就会被原样写回 Flash。早年「ECC 之后内联保存会把芯片
+    // 打进 IAP」的现象，很可能就是这一类栈压进 work_buf 的问题（2026-11-26 审计的
+    // 推断，未单独验证）；延后 200ms 之所以有效，是因为那时调用栈浅了。
+    uint32_t saved = __risc_v_disable_irq();
+    EEPROM_READ(SECURITY_DATA_ADDR, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
     memcpy(immurok_keystore_work_buf, &s_data, sizeof(s_data));
 
     WWDG_SetCounter(0);
     ret = EEPROM_ERASE(SECURITY_DATA_ADDR, EEPROM_BLOCK_SIZE);
+    if (ret == 0) {
+        WWDG_SetCounter(0);
+        ret = EEPROM_WRITE(SECURITY_DATA_ADDR, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
+    }
+    __risc_v_enable_irq(saved);
     if (ret != 0) {
-        PRINT("save_security_data: EEPROM_ERASE failed\n");
+        PRINT("save_security_data: EEPROM_ERASE/WRITE failed\n");
         return -1;
     }
 
-    WWDG_SetCounter(0);
-    ret = EEPROM_WRITE(SECURITY_DATA_ADDR, immurok_keystore_work_buf, EEPROM_BLOCK_SIZE);
-    if (ret != 0) {
-        PRINT("save_security_data: EEPROM_WRITE failed\n");
-        return -1;
-    }
+    // Verify。读回到 work_buf（此刻已空闲），不在栈上放一份 112 字节的副本：
+    // 本函数从 GATT 回调里调用时（解绑本槽），那 112 字节正好把 Flash 例程的栈帧
+    // 顶进 work_buf。
+    storage_v3_t *verify = (storage_v3_t *)immurok_keystore_work_buf;
+    ret = EEPROM_READ(SECURITY_DATA_ADDR, verify, sizeof(*verify));
 
-    // Verify
-    storage_v3_t verify __attribute__((aligned(4)));
-    ret = EEPROM_READ(SECURITY_DATA_ADDR, &verify, sizeof(verify));
-
-    if (verify.magic != s_data.magic || verify.checksum != s_data.checksum) {
+    if (verify->magic != s_data.magic || verify->checksum != s_data.checksum) {
         PRINT("save_security_data: VERIFY FAILED!\n");
         return -1;
     }

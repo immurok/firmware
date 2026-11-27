@@ -61,6 +61,35 @@ SECTIONS
     {
         . = ALIGN(4);
         KEEP(*(SORT_NONE(.handle_reset)))
+        /* P-256 标量乘的热点函数排在一起：运算前整段拷进 RAM 执行（APP/immurok_ecc_fast.c）。
+           名字后带 .* 的是编译器可能生成的克隆（.constprop / .isra）。这里漏列的函数如果被
+           段内代码直接调用，搬走后会跳错地方——tools/ecc_fast/verify.py 每次构建都查，
+           查到就不出固件。三个链接脚本里的这一段必须保持一致。 */
+        . = ALIGN(4);
+        _ecc_hot_start = .;
+        *immurok_ecc_fast.o(.text.EccPoint_mult .text.EccPoint_mult.*)
+        *immurok_ecc_fast.o(.text.XYcZ_addC .text.XYcZ_addC.*)
+        *immurok_ecc_fast.o(.text.XYcZ_add .text.XYcZ_add.*)
+        *immurok_ecc_fast.o(.text.XYcZ_initial_double .text.XYcZ_initial_double.*)
+        *immurok_ecc_fast.o(.text.apply_z .text.apply_z.*)
+        *immurok_ecc_fast.o(.text.vli_mmod_fast_secp256r1 .text.vli_mmod_fast_secp256r1.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_modMult_fast .text.uECC_vli_modMult_fast.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_modSquare_fast .text.uECC_vli_modSquare_fast.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_mult .text.uECC_vli_mult.*)
+        *immurok_ecc_fast.o(.text.muladd .text.muladd.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_modAdd .text.uECC_vli_modAdd.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_modSub .text.uECC_vli_modSub.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_modInv .text.uECC_vli_modInv.*)
+        *immurok_ecc_fast.o(.text.vli_modInv_update .text.vli_modInv_update.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_add .text.uECC_vli_add.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_sub .text.uECC_vli_sub.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_cmp_unsafe .text.uECC_vli_cmp_unsafe.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_rshift1 .text.uECC_vli_rshift1.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_set .text.uECC_vli_set.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_clear .text.uECC_vli_clear.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_isZero .text.uECC_vli_isZero.*)
+        *immurok_ecc_fast.o(.text.uECC_vli_testBit .text.uECC_vli_testBit.*)
+        _ecc_hot_end = .;
         *(.text)
         *(.text.*)
         *(.rodata)
@@ -169,6 +198,18 @@ SECTIONS
 
     PROVIDE( _end = _ebss);
     PROVIDE( end = . );
+
+    /* Stack guard: large buffers placed between BSS and stack.
+     * Stack overflow goes into this area rather than corrupting .bss.
+     * （与 Link_OTA.ld / Link.ld 一致。这个脚本原来没有这一段，immurok_keystore_work_buf
+     *  成了孤儿段，被排到 .data 和 .bss 之间，栈下面紧挨着的是 BLE 库的状态。） */
+    .stack_guard (NOLOAD) :
+    {
+        . = ALIGN(4);
+        *(.stack_guard)
+        *(.stack_guard.*)
+        . = ALIGN(4);
+    } >RAM
 
     .stack ORIGIN(RAM) + LENGTH(RAM) - __stack_size :
     {

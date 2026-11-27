@@ -86,25 +86,21 @@ extern "C" {
 // Minimum supervision timeout required to start a blocking ECC operation
 // (ECDH make_key / shared_secret, ECDSA sign — each ~1.8-1.9s measured).
 //
-// This is NOT sized against the ECC duration. The link is serviced throughout:
-// uECC kicks its watchdog callback every 8 point-mult iterations
-// (LIB/uECC.c:897) and that callback pumps TMOS_SystemProcess()
-// (immurok_keystore.c:71-80, registered globally at keystore init). Measured
-// on VER=6 / 1.6.2: make_key 1783ms over ~32 kicks = one link service per
-// ~56ms. What must fit inside the supervision timeout is that ~56ms gap, not
-// the 1.8s total.
+// 2026-11-26 更正：这里原来的依据是「ECC 期间保活回调每 ~56ms 泵一次 TMOS，链路
+// 一直有人服务，所以要装进超时的只是 56ms 的间隙」。那是推断，不是测量，而且是错的：
+// 单次泵命中连接事件窗口的概率很低，2000ms 的链路上 1.8s 的运算算完即断
+// （2026-08-04 实机，见下面 PAIR_PREFERRED 的记录）。
 //
-// 100 (1000ms) is ~18x the observed kick interval, and leaves 2x headroom
-// under the 2000ms macOS 27 imposes on HID keyboards. The historical value was
-// 500 (5000ms), sized against the ECC total — wrong reference, and
-// unreachable on macOS 27, which ignores both our param request and the PPCP.
+// 现在站得住的依据是运算本身变短了：标量乘从 RAM 执行（immurok_ecc_fast.c），一次
+// 配对步骤或签名整体阻塞约 0.4–0.6s，期间不服务链路。加上从机 latency 允许的沉默
+// （15ms × 23 ≈ 0.35s），最长静默约 1s，所以 100（1000ms）是下限，macOS 27 强加的
+// 2000ms 有一倍余量。RAM 执行不可用时运算退回 Flash（~2s），那时由 hidkbd.c 里
+// 「先谈到 6000ms 再算」的门兜底，不靠这个值。
 #define LONG_OP_MIN_CONN_TIMEOUT  100
 
-// Absolute floor. Below this the link is too fragile to be worth attempting a
-// long op even after waiting for a param update; the request is rejected with
-// 0xE1. Still ~5x the kick interval, so this only rejects genuinely broken
-// links (e.g. the 720ms macOS uses before any param update lands).
-#define LONG_OP_FLOOR_CONN_TIMEOUT 30
+// （原来这里还有一个 LONG_OP_FLOOR_CONN_TIMEOUT = 300ms 的「绝对下限」：等完参数更新
+// 后只要高于它就照算。它的依据同样是「每 56ms 服务一次链路」，不成立——300–1000ms
+// 的链路上算完必断。2026-11-26 删除：等完仍低于 LONG_OP_MIN 就干净地拒绝。）
 
 // Supervision timeout at which hiddev.c stops re-requesting param updates.
 // Apple is explicit that the central may override at any time and that
@@ -127,7 +123,7 @@ extern "C" {
 #define PAIR_PREFERRED_CONN_TIMEOUT  600
 
 // How long a long op waits for a requested param update to land before either
-// proceeding anyway (>= LONG_OP_FLOOR_CONN_TIMEOUT) or rejecting with 0xE1.
+// giving up (still below LONG_OP_MIN_CONN_TIMEOUT → reject, see long_op_reject()).
 #define LONG_OP_PARAM_WAIT_MS     3000
 // Re-check interval while waiting (TMOS ticks; 625us each → ~500ms)
 #define LONG_OP_PARAM_POLL_TICKS  800

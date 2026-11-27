@@ -8,6 +8,13 @@ static void (*g_uECC_watchdog_cb)(void) = 0;
 void uECC_set_watchdog_cb(void (*cb)(void)) { g_uECC_watchdog_cb = cb; }
 #define uECC_KICK_WATCHDOG() do { if (g_uECC_watchdog_cb) g_uECC_watchdog_cb(); } while(0)
 
+/* make_key / shared_secret / sign 做标量乘的入口。默认就是下面的 EccPoint_mult。
+   固件不直接编译本文件，而是由 APP/immurok_ecc_fast.c 包含它，并把这个宏换成
+   「先把热点代码拷进 RAM 再执行」的跳板。uECC_verify 有自己的循环，不走这里。 */
+#ifndef uECC_POINT_MULT
+#define uECC_POINT_MULT EccPoint_mult
+#endif
+
 #ifndef uECC_RNG_MAX_TRIES
     #define uECC_RNG_MAX_TRIES 64
 #endif
@@ -976,7 +983,7 @@ static uECC_word_t EccPoint_compute_public_key(uECC_word_t *result,
         }
         initial_Z = p2[carry];
     }
-    EccPoint_mult(result, curve->G, p2[!carry], initial_Z, curve->num_n_bits + 1, curve);
+    uECC_POINT_MULT(result, curve->G, p2[!carry], initial_Z, curve->num_n_bits + 1, curve);
 
     if (EccPoint_isZero(result, curve)) {
         return 0;
@@ -1093,7 +1100,7 @@ int uECC_shared_secret(const uint8_t *public_key,
         initial_Z = p2[carry];
     }
 
-    EccPoint_mult(_public, _public, p2[!carry], initial_Z, curve->num_n_bits + 1, curve);
+    uECC_POINT_MULT(_public, _public, p2[!carry], initial_Z, curve->num_n_bits + 1, curve);
 #if uECC_VLI_NATIVE_LITTLE_ENDIAN
     uecc_bcopy((uint8_t *) secret, (uint8_t *) _public, num_bytes);
 #else
@@ -1290,7 +1297,7 @@ static int uECC_sign_with_k_internal(const uint8_t *private_key,
         }
         initial_Z = k2[carry];
     }
-    EccPoint_mult(p, curve->G, k2[!carry], initial_Z, num_n_bits + 1, curve);
+    uECC_POINT_MULT(p, curve->G, k2[!carry], initial_Z, num_n_bits + 1, curve);
     if (uECC_vli_isZero(p, num_words)) {
         return 0;
     }

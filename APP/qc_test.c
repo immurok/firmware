@@ -14,6 +14,7 @@
 #include "immurokservice.h"
 #include "version.h"
 #include "battservice.h"
+#include "immurok_scratch.h"
 
 #define QC_DONE_ADDR     0x6D00   // 独立页：避开 0x6000 ImageFlag / 0x6300
 #define QC_SCRATCH_ADDR  0x6C00   // slot_meta / 0x6E00 SVN / 0x6F00 tamper
@@ -88,7 +89,7 @@ static void qc_delay(uint32_t ms)
         DelayMs(chunk);
         ms -= chunk;
         WWDG_SetCounter(0);
-        TMOS_SystemProcess();
+        TMOS_NESTED_PUMP();
         if(g_qc_phase == QC_PHASE_RUNNING)
             qc_led((qc_ms_since(s_qc_run_start) / QC_SLOW_HALF_MS) & 1 ? 0 : 'W');
     }
@@ -249,7 +250,7 @@ static uint8_t qc_lse_measure(int32_t *dev_out)
     uint32_t r0 = RTC_GetCycle32k();
     uint32_t elapsed, iter = 0;
     do {
-        TMOS_SystemProcess();
+        TMOS_NESTED_PUMP();
         WWDG_SetCounter(0);
         if(g_qc_phase == QC_PHASE_RUNNING)
             qc_led((qc_ms_since(s_qc_run_start) / QC_SLOW_HALF_MS) & 1 ? 0 : 'W');

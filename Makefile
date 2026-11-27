@@ -51,7 +51,7 @@ C_SOURCES = \
 	LIB/sha1.c \
 	LIB/sha256.c \
 	LIB/aes128.c \
-	LIB/uECC.c \
+	$(APP_DIR)/immurok_ecc_fast.c \
 	$(PROFILE_DIR)/hidkbdservice.c \
 	$(PROFILE_DIR)/hiddev.c \
 	$(PROFILE_DIR)/battservice.c \
@@ -192,7 +192,8 @@ CFLAGS = $(MCU_FLAGS) $(C_DEFS) $(C_INCLUDES)
 CFLAGS += -std=gnu99 -Os -ffunction-sections -fdata-sections -fno-common
 CFLAGS += -Wall -Wno-unused-function
 
-# 测试专用注入点。正常构建和 ota/build-ota.sh 一概不传 TEST_DEFS，
+# 测试专用注入点。正常构建和 ota/build-ota.sh 一概不传 TEST_DEFS（build-ota.sh 发现
+# 带了会拒绝打包：查环境变量、下面的 .build_flags、以及 map 里的测试符号），
 # 只有 firmware/tools/ 下的测试脚本会手工塞 -D。用来把概率性 race
 # （比如 R599S sleep no-ack）变成必现，否则「跑一遍没复现」什么都证明不了。
 CFLAGS += $(TEST_DEFS)
@@ -230,6 +231,12 @@ vpath %.c $(sort $(dir $(C_SOURCES)))
 OBJECTS += $(addprefix $(BUILD_DIR)/,$(notdir $(ASM_SOURCES:.S=.o)))
 vpath %.S $(sort $(dir $(ASM_SOURCES)))
 
+# immurok_ecc_fast.c（内含 micro-ecc）有一段热点代码会在运行时拷进 RAM 执行，段内不能直接
+# 调用段外的函数。-Os 默认会把清零 / 拷贝循环换成对 libc 里 memset / memcpy 的调用
+# （uECC_vli_clear 就中过），所以对这个文件关掉。关了之后是否真的自包含，由下面的
+# verify.py 每次构建后检查。
+$(BUILD_DIR)/immurok_ecc_fast.o: CFLAGS += -fno-tree-loop-distribute-patterns
+
 # Track build flags — auto-clean when flags change
 BUILD_FLAGS_FILE = $(BUILD_DIR)/.build_flags
 CURRENT_FLAGS = $(BUILD_MODE) HW_VER=$(HW_VER) FW=$(FW_VERSION) TEST_DEFS=$(TEST_DEFS)
@@ -252,11 +259,25 @@ $(BUILD_DIR)/%.o: %.S Makefile | $(BUILD_DIR)
 	@echo "AS $<"
 	@$(CC) -c $(ASFLAGS) $< -o $@
 
-$(BUILD_DIR)/$(TARGET).elf: $(OBJECTS) Makefile
+# immurok_ecc_fast.c 是把 LIB/uECC.c 包含进来编的，模式规则只认 .c 本身；不写这条，改了 uECC
+# 增量 make 不重编。（这条规则必须放在 all 之后：放在前面会被 make 当成默认目标。）
+$(BUILD_DIR)/immurok_ecc_fast.o: LIB/uECC.c LIB/uECC.h LIB/uECC_vli.h LIB/types.h \
+	LIB/curve-specific.inc LIB/platform-specific.inc
+
+# 链接脚本里有 ECC 热点函数列表，改了它必须重新链接。
+$(BUILD_DIR)/$(TARGET).elf: $(OBJECTS) Makefile $(LDSCRIPT)
 	@echo "LD $@"
 	@$(CC) $(OBJECTS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/$(TARGET).hex: $(BUILD_DIR)/$(TARGET).elf
+# RAM 执行那段代码的布局 / 自包含 / 栈余量检查。hex 和 bin 都依赖它：不通过就不出固件。
+ECC_FAST_OK = $(BUILD_DIR)/.ecc_fast_ok
+$(ECC_FAST_OK): $(BUILD_DIR)/$(TARGET).elf tools/ecc_fast/verify.py
+	@rm -f $@
+	@python3 tools/ecc_fast/verify.py -q --elf $< --map $(BUILD_DIR)/$(TARGET).map \
+		--nm "$(TOOLCHAIN_BIN)/riscv-wch-elf-nm" --objdump $(OBJDUMP)
+	@touch $@
+
+$(BUILD_DIR)/$(TARGET).hex: $(BUILD_DIR)/$(TARGET).elf $(ECC_FAST_OK)
 	@echo "HEX $@"
 	@$(OBJCOPY) -O ihex $< $@
 
@@ -265,7 +286,7 @@ $(BUILD_DIR)/$(TARGET).hex: $(BUILD_DIR)/$(TARGET).elf
 # 超限到打包才发现。这里对 bin 统一断言，超了直接失败。
 FW_MAX_SIZE = 221184
 
-$(BUILD_DIR)/$(TARGET).bin: $(BUILD_DIR)/$(TARGET).elf
+$(BUILD_DIR)/$(TARGET).bin: $(BUILD_DIR)/$(TARGET).elf $(ECC_FAST_OK)
 	@echo "BIN $@"
 	@$(OBJCOPY) -O binary -S $< $@
 	@sz=$$(wc -c < $@ | tr -d ' '); \

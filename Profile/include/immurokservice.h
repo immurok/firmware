@@ -144,6 +144,14 @@ void ImmurokService_SetConnHandle(uint16_t connHandle);
 bStatus_t ImmurokService_SendResponse(uint8_t *pData, uint8_t len);
 
 /**
+ * 发送队列满时应答不丢，留在服务层等重发（说明见 immurokservice.c）。
+ *   ImmurokApp_RspDeferred     应用层实现：有一条应答排上了，请起重试事件
+ *   ImmurokService_FlushPending 重试事件里调；tick 非 0 计入次数上限；返回 1 = 稍后再来
+ */
+void    ImmurokApp_RspDeferred(void);
+uint8_t ImmurokService_FlushPending(uint8_t tick);
+
+/**
  * @fn      ImmurokService_HandleConnStatusCB
  * @brief   Handle connection status changes
  * @param   connHandle - connection handle

@@ -95,6 +95,7 @@ int  immurok_security_slot2_commit(void);
 int  immurok_security_pair_save(void);
 
 immurok_ecdh_state_t immurok_security_get_ecdh_state(void);
+void immurok_security_pair_abort(void);
 
 // ============================================================================
 // Public API — Auth State

@@ -27,16 +27,21 @@
 // 双主机切换指纹：page_id 5 只做主机切换，绝不参与认证 ——
 // 否则触摸解锁会误切主机。见 spec §7。
 #define FP_SWITCH_SLOT          5
-#define FP_ENROLL_CAPTURES      6       // Captures per enrollment (mode-1 broad coverage)
+// Captures 1..5 cover five distinct areas (center, left, right, fingertip,
+// wrist) under mode 1. Capture 6 is "back to center": it overlaps capture 1 on
+// purpose, so the enroll SM switches the module to FP_ENROLL_LAST_MODE for
+// that one capture (see hidkbd.c FP_ENROLL_EVT).
+#define FP_ENROLL_CAPTURES      6       // Captures per enrollment (5 spread + 1 center repeat)
 
 // R559S enrollment logic mode (system register 3, via PS_WriteReg 0x0E):
 //   0 = no area control (factory default)
 //   1 = require DIFFERENT area each capture (GenChar returns 0x28 if overlap too high)
 //   2 = require SIMILAR area each capture (GenChar returns 0x08 if not similar)
-// We use mode 1 so the 6 guided captures actually spread across the finger:
+// We use mode 1 so the guided captures actually spread across the finger:
 // broad coverage lowers single-tap FRR for our variable-pose handheld device
 // AND hardens against thin-template false-accept. See enroll-mode1 design doc.
 #define FP_ENROLL_LOGIC_MODE    1
+#define FP_ENROLL_LAST_MODE     0       // final capture: no area control
 
 // Mapping: user finger_id ↔ physical slot (identity)
 #define FP_SLOT(fid)            (fid)
@@ -101,8 +106,14 @@ typedef enum {
     FP_ENROLL_COMPLETE = 4,     // Enrollment complete
     FP_ENROLL_ADJUST = 5,       // (legacy dual-slot, unused) Adjust finger angle
     FP_ENROLL_OVERLAP = 6,      // (mode 1) too much overlap — shift finger, re-press
-    FP_ENROLL_FAILED = 0xFF,    // Enrollment failed
+    FP_ENROLL_FAILED = 0xFF,    // Enrollment failed; byte[2] = fp_enroll_fail_reason
 } fp_enroll_event_t;
+
+// Reason carried in byte[2] of an FP_ENROLL_FAILED frame. Apps that predate
+// it ignore the byte and show a generic failure.
+#define FP_ENROLL_FAIL_GENERIC    0
+#define FP_ENROLL_FAIL_DUPLICATE  1   // finger already enrolled in another slot
+
 
 // LED control modes
 typedef enum {
